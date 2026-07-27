@@ -25,6 +25,23 @@ from tools.computer_tool import (
     wait,
 )
 from tools.web_research import web_research
+from tools.file_ops import (
+    create_folder,
+    delete_folder,
+    copy_file,
+    move_file,
+    rename_file,
+    delete_file,
+    duplicate_file as file_ops_duplicate,
+    get_file_metadata as file_ops_metadata,
+    zip_archive,
+    unzip_archive,
+    tar_archive,
+    untar_archive,
+    extract_archive as file_ops_extract,
+    search_files,
+)
+from tools.screenshot import capture_screenshot as capture_screenshot_tool
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +469,7 @@ def reveal_in_explorer(path):
 
 
 def file_duplicate(path):
-    return {"success": True, "path": str(path), "duplicates": []}
+    return file_ops_duplicate(path)
 
 
 def file_sort(path):
@@ -465,6 +482,77 @@ def file_semantic_search(query, limit=10):
 
 def rebuild_file_index():
     return file_manager_service.rebuild_index()
+
+
+# ---------------- New Folder Management ---------------- #
+
+
+def file_ops_create_folder(path):
+    return create_folder(path)
+
+
+def file_ops_delete_folder(path, confirm=False):
+    return delete_folder(path, confirm=confirm)
+
+
+# ---------------- New File Management ---------------- #
+
+
+def file_ops_copy_file(source, destination):
+    return copy_file(source, destination)
+
+
+def file_ops_move_file(source, destination):
+    return move_file(source, destination)
+
+
+def file_ops_rename_file(source, destination):
+    return rename_file(source, destination)
+
+
+def file_ops_delete_file(path, confirm=False):
+    return delete_file(path, confirm=confirm)
+
+
+def file_ops_duplicate_file(path):
+    return file_ops_duplicate(path)
+
+
+def file_ops_get_file_metadata(path):
+    return file_ops_metadata(path)
+
+
+# ---------------- New Archive Management ---------------- #
+
+
+def file_ops_zip_archive(sources, destination):
+    return zip_archive(sources, destination)
+
+
+def file_ops_unzip_archive(archive_path, destination=None):
+    return unzip_archive(archive_path, destination)
+
+
+def file_ops_tar_archive(sources, destination, compression=None):
+    return tar_archive(sources, destination, compression=compression)
+
+
+def file_ops_untar_archive(archive_path, destination=None):
+    return untar_archive(archive_path, destination)
+
+
+# ---------------- File Searching ---------------- #
+
+
+def file_ops_search_files(query=None, extension=None, folder=None, recursive=True, limit=50):
+    return search_files(query=query, extension=extension, folder=folder, recursive=recursive, limit=limit)
+
+
+# ---------------- Screenshot ---------------- #
+
+
+def file_ops_capture_screenshot(directory=None):
+    return capture_screenshot_tool(directory=directory)
 
 
 def pause_indexing():
@@ -584,6 +672,30 @@ TOOLS = {
     "file_duplicate": file_duplicate,
     "file_sort": file_sort,
     "file_semantic_search": file_semantic_search,
+
+    # New folder management
+    "create_folder": file_ops_create_folder,
+    "delete_folder": file_ops_delete_folder,
+
+    # New file management (improved implementations)
+    "copy_file": file_ops_copy_file,
+    "move_file": file_ops_move_file,
+    "rename_file": file_ops_rename_file,
+    "delete_file": file_ops_delete_file,
+    "duplicate_file": file_ops_duplicate_file,
+    "get_file_metadata": file_ops_get_file_metadata,
+
+    # New archive management
+    "zip_archive": file_ops_zip_archive,
+    "unzip_archive": file_ops_unzip_archive,
+    "tar_archive": file_ops_tar_archive,
+    "untar_archive": file_ops_untar_archive,
+
+    # File searching
+    "search_files": file_ops_search_files,
+
+    # Screenshot
+    "capture_screenshot": file_ops_capture_screenshot,
     "rebuild_file_index": rebuild_file_index,
     "pause_indexing": pause_indexing,
     "resume_indexing": resume_indexing,

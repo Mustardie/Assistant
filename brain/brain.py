@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 TOOLS = """
 launch_app(query)
 
-File Management:
+File Management (search first, then act):
 - file_search(query, limit)   <- handles ALL of: open file, open folder,
   find a game/app install folder, list a folder, latest/oldest/biggest
   file, "where is X installed", etc. It does its own intent detection,
@@ -34,6 +34,35 @@ File Management:
 - file_duplicate(path)
 - file_sort(path)
 - file_semantic_search(query, limit)
+
+Folder Management:
+- create_folder(path)          <- create new folder(s); works like mkdir -p
+- delete_folder(path, confirm) <- delete folder (recursive); requires confirm
+- list_folder(path)            <- list folder contents
+
+File Operations (improved, cross-drive safe):
+- copy_file(source, destination)    <- copy files/folders with metadata
+- move_file(source, destination)    <- move files/folders (works across drives)
+- rename_file(source, destination)  <- rename in-place (same directory)
+- delete_file(path, confirm)        <- delete a single file; requires confirm
+- duplicate_file(path)              <- duplicate with timestamp suffix
+- get_file_metadata(path)           <- full metadata: size, dates, type, permissions
+
+Archive Management:
+- zip_archive(sources, destination)       <- create .zip archive
+- unzip_archive(archive_path, destination) <- extract .zip archive
+- tar_archive(sources, destination, compression) <- create .tar/.tar.gz
+- untar_archive(archive_path, destination) <- extract tar archives
+- extract_archive(archive_path, destination) <- auto-detect format and extract
+
+File Searching:
+- search_files(query, extension, folder, recursive, limit)
+  Search files by name and/or extension. Uses the indexed database
+  by default; falls back to filesystem walk for non-indexed folders.
+  Specify folder to limit scope, or omit for a broader index search.
+
+Screenshot:
+- capture_screenshot(directory)  <- capture full screen, save timestamped PNG
 
 Browser -- tabs (refer to tabs by purpose label, e.g. "Google Flights", not index):
 - browser_list_tabs()

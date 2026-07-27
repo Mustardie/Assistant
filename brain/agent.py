@@ -49,6 +49,7 @@ class Agent:
         self.brain = Brain(self.memory_manager)
         self._pending_candidates = None
         self._pending_intent = None
+        self._pending_user_goal = None
         self._last_file_action = None
         self._agent_loop = AgentLoop(
             self.brain,
@@ -259,6 +260,7 @@ class Agent:
             candidates = response.get("candidates", [])
             self._pending_candidates = candidates
             self._pending_intent = response.get("intent")
+            self._pending_user_goal = user
             lines = [f"{i + 1}. {c.get('path')}" for i, c in enumerate(candidates)]
             self._speak(
                 "I found a few close matches, but I'm not confident enough to guess. "
@@ -383,6 +385,18 @@ class Agent:
         path = result.get("path")
 
         if intent in {"open_file", "open_folder", "find_installation", "search"}:
+           original_goal = self._pending_user_goal or user
+           self._pending_user_goal = None
+           normalized = original_goal.lower()
+           is_extract = any(kw in normalized for kw in ("unzip", "extract", "decompress", "unpack"))
+           if is_extract and path and any(path.lower().endswith(ext) for ext in (".zip", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".rar")):
+               self._speak(f"Extracting {Path(path).name} to the same folder...")
+               tool = "unzip_archive" if path.lower().endswith(".zip") else "extract_archive"
+               extract_result = run_tool(tool, {"archive_path": path, "destination": str(Path(path).parent)})
+               self._record_tool_result("extract_archive", extract_result)
+               safe_print("\n[extract_archive]")
+               safe_print(extract_result)
+               return
            spoken_text = self._describe_opening_text(user)
            self._speak(spoken_text)
            open_result = run_tool("file_open", {"path": path})
@@ -411,6 +425,14 @@ class Agent:
            safe_print("\n[show_properties]")
            safe_print(props)
            return
+
+        if intent == "extract_archive":
+            self._speak(f"Extracting {Path(path).name}...")
+            extract_result = run_tool("unzip_archive" if str(path).lower().endswith(".zip") else "extract_archive", {"archive_path": path, "destination": str(Path(path).parent)})
+            self._record_tool_result("extract_archive", extract_result)
+            safe_print("\n[extract_archive]")
+            safe_print(extract_result)
+            return
 
         if intent in OPERATIONS_NEEDING_A_SECOND_ARGUMENT:
             self._speak(
@@ -444,6 +466,7 @@ class Agent:
                 candidates = response.get("candidates", [])
                 self._pending_candidates = candidates
                 self._pending_intent = response.get("intent")
+                self._pending_user_goal = user
                 lines = [f"{i + 1}. {c.get('path')}" for i, c in enumerate(candidates)]
                 self.assistant.speak(
                     "I found a few close matches, but I’m not confident enough to guess. Which one did you mean?"
