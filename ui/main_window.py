@@ -12,6 +12,8 @@ module has zero imports from backend/.
 """
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import Qt, QRect, QPoint, QTimer, Signal, QEasingCurve
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QWidget
@@ -22,6 +24,7 @@ from ui.widgets.bubble import FloatingBubble
 from ui.widgets.panel import AssistantPanel
 
 TOP_MARGIN = 28
+_DEBOUNCE_SECONDS = 0.5
 
 
 class AssistantWindow(QWidget):
@@ -49,6 +52,7 @@ class AssistantWindow(QWidget):
 
         self._expanded = False
         self._animating = False
+        self._last_activate_time = 0.0
 
         self.bubble = FloatingBubble(self)
         self.panel = AssistantPanel(self)
@@ -116,6 +120,11 @@ class AssistantWindow(QWidget):
     def _on_hotkey_triggered(self) -> None:
         if self._animating:
             return
+
+        now = time.time()
+        if (now - self._last_activate_time) < _DEBOUNCE_SECONDS:
+            return
+        self._last_activate_time = now
 
         self.show()
         self.raise_()

@@ -69,7 +69,7 @@ def _preload_voice_models():
         logger.exception("Voice model preloading failed")
 
 
-threading.Thread(target=_preload_voice_models, daemon=True).start()
+threading.Thread(target=_preload_voice_models, daemon=True, name="voice-warmup").start()
 
 import keyboard
 keyboard.add_hotkey("ctrl+space", window.trigger_hotkey)
@@ -78,5 +78,6 @@ bridge = AssistantBridge()
 
 window.textSubmitted.connect(agent.run)
 window.activateAssistant.connect(_start_voice)
+window.voicePressed.connect(_start_voice)
 
 app.exec()

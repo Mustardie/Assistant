@@ -80,8 +80,9 @@ class TabManager:
             return "New Tab"
 
     def _ensure_ready(self) -> None:
-        if not self._tabs:
-            self._adopt_existing_pages()
+        if self._tabs:
+            return
+        self._adopt_existing_pages()
         if not self._tabs:
             self.open_tab()
 
