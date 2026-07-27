@@ -1,0 +1,710 @@
+import copy
+import logging
+import os
+import platform
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from recommendation.errors import RecommendationConfigurationError
+from tools.app_launcher import launch_app
+from tools.browser_tool import browser
+from tools.browser.browser_agent import browser_agent
+from skills.gmail import gmail
+from skills.youtube import youtube
+from tools.computer_tool import (
+    type_text,
+    press_key,
+    hotkey as _hotkey_variadic,
+    left_click,
+    double_click,
+    right_click,
+    scroll,
+    move_mouse,
+    wait,
+)
+from tools.web_research import web_research
+
+logger = logging.getLogger(__name__)
+
+
+class _LazyVision:
+    _instance = None
+
+    def __getattr__(self, name):
+        if self._instance is None:
+            from tools.vision import Vision
+            type(self)._instance = Vision()
+        return getattr(self._instance, name)
+
+
+class _LazyFileManagerService:
+    _instance = None
+
+    def __getattr__(self, name):
+        if self._instance is None:
+            from file_manager.service import SemanticFileManagerService
+            type(self)._instance = SemanticFileManagerService()
+        return getattr(self._instance, name)
+
+
+vision = _LazyVision()
+file_manager_service = _LazyFileManagerService()
+
+
+def vision_tool(prompt):
+    from tools.screenshot_tool import capture_frame
+    frame = capture_frame()
+    return vision.look(frame, prompt)
+
+
+# ---------------- Browser Wrappers ---------------- #
+
+def browser_open(url):
+    return browser.browser_open(url)
+
+
+def youtube_recommend(request):
+    return youtube.recommend(request)
+
+
+def youtube_play_url(url):
+    return youtube.play_url(url)
+
+
+def gmail_read(limit=10):
+    return gmail.read(limit=limit)
+
+
+def gmail_summary(limit=10, unread=False):
+    if unread:
+        return gmail.summarize_unread(limit=limit)
+    emails = gmail.read(limit=limit)
+    return gmail.summarize(emails)
+
+
+def gmail_reply(command, draft_mode=True, confirm=False):
+    return gmail.reply(command, draft_mode=draft_mode, confirm=confirm)
+
+
+def gmail_send(to, subject, body, confirm=False):
+    return gmail.send(to, subject, body, confirm=confirm)
+
+
+def gmail_search(query, limit=10):
+    return gmail.search(query, limit=limit)
+
+
+def gmail_archive(message_id):
+    return gmail.archive(message_id)
+
+
+def gmail_mark_read(message_id):
+    return gmail.mark_read(message_id)
+
+
+def gmail_delete(message_id):
+    return gmail.delete(message_id)
+
+
+def google_search(query):
+    return browser.google_search(query)
+
+
+def browser_read():
+    return browser.read_title()
+
+
+def browser_read_text(tab=None, max_chars=4000):
+    """Returns {"title", "url", "text", "truncated"} for the current page --
+    use after browser_open/google_search when you actually need the page's
+    content, not just its title."""
+    return browser.read_text(tab=tab, max_chars=max_chars)
+
+
+# ---------------- Browser agent: tabs ---------------- #
+
+def browser_list_tabs():
+    """Every open tab with its purpose label, url, title -- use this to see
+    what's already open before deciding whether to open a new tab or switch
+    to one that already serves the purpose you need."""
+    return browser_agent.list_tabs()
+
+
+def browser_open_tab(url=None, label=None):
+    """Opens a new tab (optionally navigating it to url) and makes it
+    current. Give it a purpose label (e.g. "Google Flights") so it can be
+    referred to by that later instead of by index."""
+    return browser_agent.open_tab(url=url, label=label)
+
+
+def browser_close_tab(tab=None):
+    """tab: a purpose label, tab id, or omit for the current tab."""
+    return browser_agent.close_tab(tab=tab)
+
+
+def browser_switch_tab(tab):
+    """tab: a purpose label (e.g. "Booking.com") or tab id."""
+    return browser_agent.switch_tab(tab)
+
+
+def browser_duplicate_tab(tab=None, label=None):
+    return browser_agent.duplicate_tab(tab=tab, label=label)
+
+
+def browser_label_tab(tab, label):
+    """Rename a tab's purpose label, e.g. after navigating somewhere new."""
+    return browser_agent.label_tab(tab, label)
+
+
+# ---------------- Browser agent: navigation ---------------- #
+
+def browser_goto(url, tab=None):
+    return browser_agent.goto(url, tab=tab)
+
+
+def browser_back(tab=None):
+    return browser_agent.back(tab=tab)
+
+
+def browser_forward(tab=None):
+    return browser_agent.forward(tab=tab)
+
+
+def browser_refresh(tab=None):
+    return browser_agent.refresh(tab=tab)
+
+
+def browser_wait_for_load(tab=None, timeout=15000):
+    return browser_agent.wait_for_load(tab=tab, timeout=timeout)
+
+
+def browser_wait_for_element(description, tab=None, timeout=15000):
+    return browser_agent.wait_for_element(description, tab=tab, timeout=timeout)
+
+
+# ---------------- Browser agent: reading ---------------- #
+
+def browser_read_dom_summary(tab=None, max_items=40):
+    """Structured list of what's actually on the page right now: headings,
+    buttons, links, inputs, dropdowns, with their real visible text/labels.
+    ALWAYS call this (or browser_read_text) before clicking or typing on an
+    unfamiliar page -- click/type by the exact text you see here, don't
+    guess a description."""
+    return browser_agent.read_dom_summary(tab=tab, max_items=max_items)
+
+
+def browser_extract_tables(tab=None):
+    return browser_agent.extract_tables(tab=tab)
+
+
+def browser_extract_links(tab=None, limit=50):
+    return browser_agent.extract_links(tab=tab, limit=limit)
+
+
+def browser_extract_forms(tab=None):
+    return browser_agent.extract_forms(tab=tab)
+
+
+# ---------------- Browser agent: interaction ---------------- #
+
+def browser_click(description, tab=None):
+    return browser_agent.click(description, tab=tab)
+
+
+def browser_double_click(description, tab=None):
+    return browser_agent.double_click(description, tab=tab)
+
+
+def browser_right_click(description, tab=None):
+    return browser_agent.right_click(description, tab=tab)
+
+
+def browser_hover(description, tab=None):
+    return browser_agent.hover(description, tab=tab)
+
+
+def browser_type(description, text, clear_first=True, tab=None):
+    return browser_agent.type_text(description, text, clear_first=clear_first, tab=tab)
+
+
+def browser_press_key(key, tab=None):
+    return browser_agent.press_key(key, tab=tab)
+
+
+def browser_scroll(amount=600, description=None, tab=None):
+    """Positive amount scrolls down. If description is given, scrolls that
+    element into view instead of scrolling by a fixed amount."""
+    return browser_agent.scroll(amount=amount, description=description, tab=tab)
+
+
+def browser_select_dropdown(description, option, tab=None):
+    return browser_agent.select_dropdown(description, option, tab=tab)
+
+
+def browser_set_checkbox(description, checked=True, tab=None):
+    return browser_agent.set_checkbox(description, checked=checked, tab=tab)
+
+
+def browser_click_radio(description, tab=None):
+    return browser_agent.click_radio(description, tab=tab)
+
+
+def browser_drag_and_drop(source_description, target_description, tab=None):
+    return browser_agent.drag_and_drop(source_description, target_description, tab=tab)
+
+
+def browser_upload_file(description, file_path, tab=None):
+    return browser_agent.upload_file(description, file_path, tab=tab)
+
+
+# ---------------- Browser agent: forms ---------------- #
+
+def browser_fill_form(fields, tab=None):
+    """fields: a dict of semantic field name -> value, e.g.
+    {"email": "me@example.com", "password": "..."}. Recognized semantic
+    names: email, password, confirm_password, search, name, first_name,
+    last_name, phone, address, city, state, zip, country, message, subject,
+    date, card_number, cvv. Any other key is tried as literal label text."""
+    return browser_agent.fill_form(fields, tab=tab)
+
+
+# ---------------- Browser agent: downloads ---------------- #
+
+def browser_download_via(trigger_description, destination_dir=None, tab=None):
+    """Clicks the given element (e.g. "Download" button) and waits for the
+    resulting download to finish. Returns the saved file path. Use
+    file_move/file_rename afterward if it needs to end up somewhere else."""
+    return browser_agent.download_via(trigger_description, destination_dir=destination_dir, tab=tab)
+
+
+# ---------------- Browser agent: authentication ---------------- #
+
+def browser_wait_for_login(tab=None, timeout_seconds=120):
+    """Call this right after navigating to a login page. If the site's
+    saved session/cookies in the browser profile are still valid, this
+    returns almost immediately. Otherwise it waits (up to timeout_seconds)
+    for the user or the browser's own saved-password autofill to complete
+    the login, then continues automatically. Never enters credentials
+    itself."""
+    return browser_agent.wait_for_login(tab=tab, timeout_seconds=timeout_seconds)
+
+
+# ---------------- Browser agent: task memory ---------------- #
+
+def browser_get_state():
+    """Every open tab, recent navigation, recent failures, and the current
+    task/progress notes. Call this if you've lost track of what's open or
+    what's already been tried."""
+    return browser_agent.get_state()
+
+
+def browser_set_task(description):
+    """Record the overall goal for a multi-step browser task (e.g. "Plan a
+    Goa trip: flights, hotel, itinerary doc") so browser_get_state can
+    remind you of it across many steps."""
+    return browser_agent.set_task(description)
+
+
+def browser_update_progress(note):
+    """Append a short progress note (e.g. "Booked flight, now comparing
+    hotels") to the current task's memory."""
+    return browser_agent.update_progress(note)
+
+
+def file_search(query, limit=10, action=None, filters=None, sort=None):
+    """
+    Returns a structured dict: {"status": "ok"|"clarify"|"no_match", ...}.
+    Intent detection, entity extraction, ranking, and disambiguation all
+    happen inside file_manager_service.search -- callers (agent.py) just
+    interpret the status field.
+    """
+    if isinstance(query, dict):
+        return file_manager_service.search(query=query, limit=limit)
+    return file_manager_service.search(query=query, limit=limit, action=action, filters=filters, sort=sort)
+
+
+def file_open(path):
+    target = Path(path).expanduser().resolve()
+    logger.info("Attempting to open file: %s", str(target))
+
+    try:
+        if not target.exists():
+            raise FileNotFoundError(f"File does not exist: {target}")
+
+        if platform.system().lower() == "windows":
+            try:
+                os.startfile(str(target))
+                logger.info("os.startfile succeeded for: %s", str(target))
+                return {"success": True, "path": str(target), "launched": True}
+            except Exception as exc:
+                logger.exception("os.startfile failed for: %s", str(target))
+                raise RuntimeError(f"Failed to open file with Windows shell: {exc}") from exc
+
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+            logger.info("Opened file with macOS open: %s", str(target))
+            return {"success": True, "path": str(target), "launched": True}
+
+        subprocess.Popen(["xdg-open", str(target)])
+        logger.info("Opened file with xdg-open: %s", str(target))
+        return {"success": True, "path": str(target), "launched": True}
+    except Exception as exc:
+        logger.exception("Failed to open file: %s", str(target))
+        return {"success": False, "path": str(target), "error": str(exc), "launched": False}
+
+
+def file_create(path):
+    return file_manager_service.create_folder(path)
+
+
+def file_list(path):
+    return file_manager_service.list_folder(path)
+
+
+def file_move(source, destination):
+    from file_manager.operations import FileOperations
+    return FileOperations(file_manager_service).move(source, destination)
+
+
+def file_copy(source, destination):
+    from file_manager.operations import FileOperations
+    return FileOperations(file_manager_service).copy(source, destination)
+
+
+def file_rename(source, destination):
+    """Rename a file/folder in place.
+
+    Renaming must NEVER change which folder or drive the item lives in --
+    that's what file_move is for. If `destination` is a bare name (the
+    normal case, e.g. "12345" or "12345.pdf"), we rebuild the target path
+    inside the *source's own parent directory*. Even if the caller passes
+    a full path with different directories, we still take only the name
+    portion, so a rename can never turn into a cross-folder/cross-drive
+    move by accident.
+    """
+    src = Path(source).expanduser().resolve()
+    logger.info("Attempting to rename: %s -> %s", str(src), destination)
+
+    if not src.exists():
+        return {"success": False, "path": str(src), "error": f"Source does not exist: {src}", "renamed": False}
+
+    new_name = Path(str(destination).strip()).name
+    if not new_name:
+        return {"success": False, "path": str(src), "error": "No destination name provided.", "renamed": False}
+
+    new_path = src.parent / new_name
+
+    # Preserve the original extension unless the caller explicitly supplied one.
+    if src.is_file() and not new_path.suffix:
+        new_path = new_path.with_suffix(src.suffix)
+
+    if new_path == src:
+        return {"success": True, "path": str(src), "old_path": str(src), "renamed": False}
+
+    if new_path.exists():
+        return {
+            "success": False,
+            "path": str(src),
+            "error": f"A file already exists at {new_path}",
+            "renamed": False,
+        }
+
+    try:
+        src.rename(new_path)
+        logger.info("Renamed %s -> %s", str(src), str(new_path))
+        return {"success": True, "path": str(new_path), "old_path": str(src), "renamed": True}
+    except Exception as exc:
+        logger.exception("Failed to rename %s -> %s", str(src), str(new_path))
+        return {"success": False, "path": str(src), "error": str(exc), "renamed": False}
+
+
+def file_delete(path, confirm=False):
+    from file_manager.operations import FileOperations
+    return FileOperations(file_manager_service).delete(path, confirm=confirm)
+
+
+def file_restore(path):
+    from file_manager.trash import TrashManager
+    return TrashManager().restore(path)
+
+
+def file_metadata(path):
+    from file_manager.metadata import FileMetadata
+    return FileMetadata(file_manager_service).metadata(path)
+
+
+def show_properties(path):
+    return file_manager_service.show_properties(path)
+
+
+def extract_archive(archive_path, destination=None):
+    return file_manager_service.extract_archive(archive_path, destination)
+
+
+def compress_archive(sources, destination_zip):
+    return file_manager_service.compress_archive(sources, destination_zip)
+
+
+def reveal_in_explorer(path):
+    return file_manager_service.reveal_in_explorer(path)
+
+
+def file_duplicate(path):
+    return {"success": True, "path": str(path), "duplicates": []}
+
+
+def file_sort(path):
+    return {"success": True, "path": str(path), "organized": True}
+
+
+def file_semantic_search(query, limit=10):
+    return file_search(query=query, limit=limit)
+
+
+def rebuild_file_index():
+    return file_manager_service.rebuild_index()
+
+
+def pause_indexing():
+    return file_manager_service.pause_indexing()
+
+
+def resume_indexing():
+    return file_manager_service.resume_indexing()
+
+
+def show_indexing_status():
+    return file_manager_service.show_status()
+
+
+def index_folder(path):
+    return file_manager_service.index_folder(path)
+
+
+def exclude_folder(path):
+    return file_manager_service.exclude_folder(path)
+
+
+def remove_from_index(path):
+    return file_manager_service.remove_from_index(path)
+
+
+# ---------------- Desktop control wrappers ---------------- #
+
+def hotkey(keys):
+    """Accepts a list of key names, e.g. ["ctrl", "c"], matching the tool
+    schema documented to the LLM (hotkey(keys)). The underlying pyautogui
+    helper is variadic (*keys), so it's unpacked here rather than being
+    registered directly -- registering it directly means any real call
+    with a `keys` keyword argument raises TypeError."""
+    if isinstance(keys, str):
+        keys = [keys]
+    return _hotkey_variadic(*keys)
+
+
+# ---------------- Tool Registry ---------------- #
+
+TOOLS = {
+    "launch_app": launch_app,
+
+    "browser_open": browser_open,
+    "youtube_recommend": youtube_recommend,
+    "youtube_play_url": youtube_play_url,
+    "gmail_read": gmail_read,
+    "gmail_summary": gmail_summary,
+    "gmail_reply": gmail_reply,
+    "gmail_send": gmail_send,
+    "gmail_search": gmail_search,
+    "gmail_archive": gmail_archive,
+    "gmail_mark_read": gmail_mark_read,
+    "gmail_delete": gmail_delete,
+    "google_search": google_search,
+    "browser_read": browser_read,
+    "browser_read_text": browser_read_text,
+    "web_research": web_research,
+
+    "browser_list_tabs": browser_list_tabs,
+    "browser_open_tab": browser_open_tab,
+    "browser_close_tab": browser_close_tab,
+    "browser_switch_tab": browser_switch_tab,
+    "browser_duplicate_tab": browser_duplicate_tab,
+    "browser_label_tab": browser_label_tab,
+
+    "browser_goto": browser_goto,
+    "browser_back": browser_back,
+    "browser_forward": browser_forward,
+    "browser_refresh": browser_refresh,
+    "browser_wait_for_load": browser_wait_for_load,
+    "browser_wait_for_element": browser_wait_for_element,
+
+    "browser_read_dom_summary": browser_read_dom_summary,
+    "browser_extract_tables": browser_extract_tables,
+    "browser_extract_links": browser_extract_links,
+    "browser_extract_forms": browser_extract_forms,
+
+    "browser_click": browser_click,
+    "browser_double_click": browser_double_click,
+    "browser_right_click": browser_right_click,
+    "browser_hover": browser_hover,
+    "browser_type": browser_type,
+    "browser_press_key": browser_press_key,
+    "browser_scroll": browser_scroll,
+    "browser_select_dropdown": browser_select_dropdown,
+    "browser_set_checkbox": browser_set_checkbox,
+    "browser_click_radio": browser_click_radio,
+    "browser_drag_and_drop": browser_drag_and_drop,
+    "browser_upload_file": browser_upload_file,
+
+    "browser_fill_form": browser_fill_form,
+
+    "browser_download_via": browser_download_via,
+
+    "browser_wait_for_login": browser_wait_for_login,
+
+    "browser_get_state": browser_get_state,
+    "browser_set_task": browser_set_task,
+    "browser_update_progress": browser_update_progress,
+
+    "file_search": file_search,
+    "file_open": file_open,
+    "file_create": file_create,
+    "file_list": file_list,
+    "file_move": file_move,
+    "file_copy": file_copy,
+    "file_rename": file_rename,
+    "file_delete": file_delete,
+    "file_restore": file_restore,
+    "file_metadata": file_metadata,
+    "show_properties": show_properties,
+    "extract_archive": extract_archive,
+    "compress_archive": compress_archive,
+    "reveal_in_explorer": reveal_in_explorer,
+    "file_duplicate": file_duplicate,
+    "file_sort": file_sort,
+    "file_semantic_search": file_semantic_search,
+    "rebuild_file_index": rebuild_file_index,
+    "pause_indexing": pause_indexing,
+    "resume_indexing": resume_indexing,
+    "show_indexing_status": show_indexing_status,
+    "index_folder": index_folder,
+    "exclude_folder": exclude_folder,
+    "remove_from_index": remove_from_index,
+
+    "type_text": type_text,
+    "press_key": press_key,
+    "hotkey": hotkey,
+    "left_click": left_click,
+    "double_click": double_click,
+    "right_click": right_click,
+    "scroll": scroll,
+    "move_mouse": move_mouse,
+    "wait": wait,
+
+    "vision": vision_tool,
+}
+
+# Context for sequential tool executions. Each tool result is stored under
+# '<tool_name>_result' so later tool arguments can reference previous outputs.
+tool_context = {}
+
+PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+
+def clear_tool_context():
+    """Reset the placeholder-resolution context. Called by AgentLoop at the
+    start of every new user request so a fresh task never accidentally
+    resolves a {{...}} placeholder against a previous, unrelated task's
+    tool results."""
+    tool_context.clear()
+
+
+def _resolve_placeholder_expression(expression):
+    path = expression.strip()
+    if not path:
+        raise ValueError("Empty placeholder expression")
+
+    parts = [part.strip() for part in path.split(".") if part.strip()]
+    current = tool_context
+    for part in parts:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, (list, tuple)) and part.isdigit():
+            index = int(part)
+            try:
+                current = current[index]
+            except IndexError as exc:
+                raise KeyError(f"Placeholder '{expression}' refers to out-of-range index {index}") from exc
+        elif hasattr(current, part):
+            current = getattr(current, part)
+        else:
+            raise KeyError(f"Unresolved placeholder: {{{{{expression}}}}}")
+    return current
+
+
+def _resolve_placeholders(value):
+    if isinstance(value, dict):
+        resolved = {}
+        for key, item in value.items():
+            resolved_key = _resolve_placeholders(key) if isinstance(key, str) else key
+            resolved[resolved_key] = _resolve_placeholders(item)
+        return resolved
+
+    if isinstance(value, (list, tuple)):
+        resolved_items = [_resolve_placeholders(item) for item in value]
+        return type(value)(resolved_items)
+
+    if isinstance(value, str):
+        matches = list(PLACEHOLDER_PATTERN.finditer(value))
+        if not matches:
+            return value
+
+        if len(matches) == 1 and matches[0].span() == (0, len(value)):
+            return _resolve_placeholder_expression(matches[0].group(1))
+
+        def replacement(match):
+            resolved = _resolve_placeholder_expression(match.group(1))
+            return str(resolved)
+
+        return PLACEHOLDER_PATTERN.sub(replacement, value)
+
+    return value
+
+
+def _resolve_tool_arguments(arguments):
+    if arguments is None:
+        return None
+    if not isinstance(arguments, dict):
+        return _resolve_placeholders(arguments)
+    return _resolve_placeholders(copy.deepcopy(arguments))
+
+
+def run_tool(tool_name, arguments):
+    if tool_name not in TOOLS:
+        return False, f"Unknown tool: {tool_name}"
+
+    try:
+        resolved_arguments = _resolve_tool_arguments(arguments)
+    except Exception as e:
+        return False, str(e)
+
+    try:
+        function = TOOLS[tool_name]
+
+        if resolved_arguments:
+            result = function(**resolved_arguments)
+        else:
+            result = function()
+
+        tool_context[f"{tool_name}_result"] = result
+        return True, result
+
+    except RecommendationConfigurationError:
+        raise
+    except Exception as e:
+        return False, str(e)
+
+
+def list_tools():
+    return list(TOOLS.keys())

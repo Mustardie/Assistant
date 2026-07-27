@@ -1,0 +1,120 @@
+[
+  {
+    "role": "system",
+    "content": "Earlier conversation summary: Summary: Earlier conversation summary: Summary: Earlier conversation summary: Summary: Earlier conversation summary: Summary: Earlier conversation summary: Summary: Earlier conversation summary: Summary:... Tool[file_search]: {'status': 'clarify', 'intent': 'search', 'candidates': [{'path': 'c:\\\\users\\\\admin\\\\downloads\\\\class 10 hindi pt 1 ws.pdf', 'filename': 'class 10 hindi pt 1 ws.pdf', 'extension': '.pdf', 'size':..."
+  },
+  {
+    "role": "assistant",
+    "content": "I found a few close matches, but I'm not confident enough to guess. Which one did you mean?"
+  },
+  {
+    "role": "user",
+    "content": "1"
+  },
+  {
+    "role": "assistant",
+    "content": "Got it, using c:\\users\\admin\\downloads\\class 10 hindi pt 1 ws.pdf."
+  },
+  {
+    "role": "assistant",
+    "content": "Opening the file."
+  },
+  {
+    "role": "tool",
+    "content": "(True, {'success': False, 'path': 'C:\\\\Users\\\\Admin\\\\Downloads\\\\class 10 hindi pt 1 ws.pdf', 'error': 'File does not exist: C:\\\\Users\\\\Admin\\\\Downloads\\\\class 10 hindi pt 1 ws.pdf', 'launched': False})",
+    "tool": "file_open"
+  },
+  {
+    "role": "user",
+    "content": "open the second one"
+  },
+  {
+    "role": "assistant",
+    "content": "Opening the second file: hindi - meera ke pad notes.pdf."
+  },
+  {
+    "role": "tool",
+    "content": "{'success': True, 'path': 'C:\\\\Users\\\\Admin\\\\Downloads\\\\Hindi - Meera ke pad notes.pdf', 'launched': True}",
+    "tool": "file_open"
+  },
+  {
+    "role": "user",
+    "content": "open mecha chameleon"
+  },
+  {
+    "role": "assistant",
+    "content": "I wasn't able to figure out a next step for that. Could you rephrase or give me a bit more detail?"
+  },
+  {
+    "role": "user",
+    "content": "it is a file/game can u open the exe"
+  },
+  {
+    "role": "assistant",
+    "content": "Expecting value: line 1 column 1 (char 0)"
+  },
+  {
+    "role": "user",
+    "content": "What's the best budget GPU under ₹30,000 in India right now?"
+  },
+  {
+    "role": "assistant",
+    "content": "Searching for the latest budget GPU recommendations under ₹30,000 in India..."
+  },
+  {
+    "role": "tool",
+    "content": "{'success': False, 'query': 'best budget GPU under ₹30,000 in India 2023', 'error': 'HTTP 402: Insufficient credits. This account never purchased credits. Make sure your key is on the correct account or org, and if so, purchase more at https://openrouter.ai/settings/credits -- your OpenRouter account/key may be out of credits'}",
+    "tool": "web_research"
+  },
+  {
+    "role": "assistant",
+    "content": "Searching for the latest budget GPU recommendations under ₹30,000 in India..."
+  },
+  {
+    "role": "tool",
+    "content": "Searched Google for 'best budget GPU under ₹30000 India 2024'",
+    "tool": "google_search"
+  },
+  {
+    "role": "assistant",
+    "content": "Expecting value: line 5 column 17 (char 1093)"
+  },
+  {
+    "role": "user",
+    "content": "play a fun corryxkenshin video"
+  },
+  {
+    "role": "assistant",
+    "content": "Searching for a fun CorryXKenshin video to play..."
+  },
+  {
+    "role": "tool",
+    "content": "Request: fun corryxkenshin video\nGenerated 7 search queries.\nEvaluated 59 unique candidates.\n\nTop recommendations:\n1. IF YOU'RE READING THIS, TIKTOK IS BANNED (nvm) — CoryxKenshin\n   https://www.youtube.com/watch?v=-Jytrc5gJvA\n   Reason: Ranked by personalized YouTube-style signals (freshness=-5.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=102.1840345967398)\n2. Coryxkenshin out of context/funny moments #5 ONE HOUR SPECIAL! (Face reveal ^_^) — Amber\n   https://www.youtube.com/watch?v=VMH52uNd7f4\n   Reason: Ranked by personalized YouTube-style signals (freshness=10.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=97.40907763890156)\n3. Coryxkenshin out of context/funny moments #6 — Amber\n   https://www.youtube.com/watch?v=C8aLzieDoeA\n   Reason: Ranked by personalized YouTube-style signals (freshness=20.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=92.27649736048701)\n4. Coryxkenshin out of context/funny moments #4 — Amber\n   https://www.youtube.com/watch?v=H5ZsHnFW4_c\n   Reason: Ranked by personalized YouTube-style signals (freshness=10.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=91.23076000959003)\n5. 1 HOUR OF CORYXKENSHIN FUNNIEST MOMENTS SINCE RETURNING!!! (PART 4) — DFC_Productions\n   https://www.youtube.com/watch?v=5UiDKKQ-shI\n   Reason: Ranked by personalized YouTube-style signals (freshness=10.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=83.96372223281317)\n6. Coryxkenshin most funniest moments!! part 1 🤣 — Jake\n   https://www.youtube.com/watch?v=bk9MOQzyJCg\n   Reason: Ranked by personalized YouTube-style signals (freshness=10.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=82.84041979539384)\n7. 47 minutes of my favourite Coryxkenshin moments — Jippy The Stickman\n   https://www.youtube.com/watch?v=L19Gd6BD1Fc\n   Reason: Ranked by personalized YouTube-style signals (freshness=-5.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=78.2820621737294)\n8. Coryxkenshin out of context/funny moments #2 — Amber\n   https://www.youtube.com/watch?v=2Sbq6Mh9Da4\n   Reason: Ranked by personalized YouTube-style signals (freshness=-5.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=76.3332030686488)\n9. Coryxkenshin most funniest skits!! 😂😂😂🤣🤣 — Jake\n   https://www.youtube.com/watch?v=twsv9ztrkhI\n   Reason: Ranked by personalized YouTube-style signals (freshness=-5.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=57.09918759624064)\n10. FUNNIEST CORYXKENSHIN GAMING MOMENTS! (SINCE RETURNING) — DFC_Productions\n   https://www.youtube.com/watch?v=vAy9lYM0izE\n   Reason: Ranked by personalized YouTube-style signals (freshness=-5.0; language=50.0; subscription=0.0; unfinished=0.0; history_penalty=0.0; shorts_penalty=0.0; final_score=56.33986490712365)\n\nNow playing: IF YOU'RE READING THIS, TIKTOK IS BANNED (nvm)\nPlaying https://www.youtube.com/watch?v=-Jytrc5gJvA",
+    "tool": "youtube_recommend"
+  },
+  {
+    "role": "assistant",
+    "content": "Playing \"IF YOU'RE READING THIS, TIKTOK IS BANNED (nvm)\" by CoryxKenshin."
+  },
+  {
+    "role": "user",
+    "content": "python main.py"
+  },
+  {
+    "role": "user",
+    "content": "open spotify"
+  },
+  {
+    "role": "assistant",
+    "content": "Opening Spotify."
+  },
+  {
+    "role": "tool",
+    "content": "(True, 'Spotify')",
+    "tool": "launch_app"
+  },
+  {
+    "role": "assistant",
+    "content": "Spotify is open."
+  }
+]

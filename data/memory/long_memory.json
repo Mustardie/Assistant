@@ -1,0 +1,18 @@
+{
+  "onboarded": true,
+  "communication_style": {
+    "tone": "",
+    "length": "",
+    "preferences": [
+      "I like casual, natural conversations",
+      "I prefer medium-length answers, but for technical problems I like detailed step-by-step debugging"
+    ]
+  },
+  "interests": [],
+  "dislikes": [],
+  "goals": [],
+  "facts_about_user": [
+    "Don't talk like a corporate assistant — keep it human, a little Gen Z",
+    "get to the point"
+  ]
+}

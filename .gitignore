@@ -1,0 +1,15 @@
+# Local generated credentials and tokens
+client_secret.json
+token.json
+
+# Browser profile data
+EdgeProfile/
+
+# Python environment and caches
+.venv/
+__pycache__/
+.pytest_cache/
+.tmp_cache/
+
+# Local SQLite state
+*.sqlite3
