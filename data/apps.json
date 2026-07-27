@@ -1,0 +1,608 @@
+{
+  "access": {
+    "name": "Access",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\MSACCESS.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "adobe after effects 2025": {
+    "name": "Adobe After Effects 2025",
+    "target": "C:\\Program Files\\Adobe\\Adobe After Effects 2025\\Support Files\\AfterFX.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "adobe photoshop 2026": {
+    "name": "Adobe Photoshop 2026",
+    "target": "C:\\Program Files\\Adobe\\Adobe Photoshop 2026\\Photoshop.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "adobe premiere pro 2025": {
+    "name": "Adobe Premiere Pro 2025",
+    "target": "C:\\Program Files\\Adobe\\Adobe Premiere Pro 2025\\Adobe Premiere Pro.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "audacity": {
+    "name": "Audacity",
+    "target": "C:\\Program Files\\Audacity\\Audacity.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "epic games launcher": {
+    "name": "Epic Games Launcher",
+    "target": "C:\\Program Files\\Epic Games\\Launcher\\Portal\\Binaries\\Win64\\EpicGamesLauncher.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "excel": {
+    "name": "Excel",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "fl cloud plugins": {
+    "name": "FL Cloud Plugins",
+    "target": "C:\\Program Files\\FL Cloud Plugins\\FL Cloud Plugins.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "google chrome": {
+    "name": "Google Chrome",
+    "target": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "kaspersky": {
+    "name": "Kaspersky",
+    "target": "C:\\Program Files (x86)\\Kaspersky Lab\\Kaspersky 21.25\\avpui.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "microsoft edge": {
+    "name": "Microsoft Edge",
+    "target": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "obs studio": {
+    "name": "OBS Studio",
+    "target": "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "onenote": {
+    "name": "OneNote",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\ONENOTE.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "outlook": {
+    "name": "Outlook",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\OUTLOOK.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "powerpoint": {
+    "name": "PowerPoint",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\POWERPNT.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "publisher": {
+    "name": "Publisher",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\MSPUB.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "skype for business": {
+    "name": "Skype for Business",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\lync.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "soundly": {
+    "name": "Soundly",
+    "target": "E:\\Soudnly\\Soundly\\Soundly.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "windhawk": {
+    "name": "Windhawk",
+    "target": "C:\\Program Files\\Windhawk\\windhawk.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "word": {
+    "name": "Word",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "remote desktop connection": {
+    "name": "Remote Desktop Connection",
+    "target": "C:\\WINDOWS\\system32\\mstsc.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "steps recorder": {
+    "name": "Steps Recorder",
+    "target": "C:\\WINDOWS\\system32\\psr.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "windows media player legacy": {
+    "name": "Windows Media Player Legacy",
+    "target": "C:\\Program Files (x86)\\Windows Media Player\\wmplayer.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "character map": {
+    "name": "Character Map",
+    "target": "C:\\WINDOWS\\system32\\charmap.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "dfrgui": {
+    "name": "dfrgui",
+    "target": "C:\\WINDOWS\\system32\\dfrgui.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "disk cleanup": {
+    "name": "Disk Cleanup",
+    "target": "C:\\WINDOWS\\system32\\cleanmgr.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "iscsi initiator": {
+    "name": "iSCSI Initiator",
+    "target": "C:\\WINDOWS\\system32\\iscsicpl.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "memory diagnostics tool": {
+    "name": "Memory Diagnostics Tool",
+    "target": "C:\\WINDOWS\\system32\\MdSched.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "odbc data sources (32-bit)": {
+    "name": "ODBC Data Sources (32-bit)",
+    "target": "C:\\WINDOWS\\syswow64\\odbcad32.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "odbc data sources (64-bit)": {
+    "name": "ODBC Data Sources (64-bit)",
+    "target": "C:\\WINDOWS\\system32\\odbcad32.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "recoverydrive": {
+    "name": "RecoveryDrive",
+    "target": "C:\\WINDOWS\\system32\\RecoveryDrive.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "registry editor": {
+    "name": "Registry Editor",
+    "target": "C:\\WINDOWS\\regedit.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "resource monitor": {
+    "name": "Resource Monitor",
+    "target": "C:\\WINDOWS\\system32\\perfmon.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "system configuration": {
+    "name": "System Configuration",
+    "target": "C:\\WINDOWS\\system32\\msconfig.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "system information": {
+    "name": "System Information",
+    "target": "C:\\WINDOWS\\system32\\msinfo32.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "apollo": {
+    "name": "Apollo",
+    "target": "C:\\Program Files\\Apollo\\sunshine.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "uninstall": {
+    "name": "Uninstall",
+    "target": "H:\\Marvels Guardians of the Galaxy\\Uninstall\\unins000.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "gigabyte control center": {
+    "name": "GIGABYTE Control Center",
+    "target": "C:\\Program Files\\GIGABYTE\\Control Center\\LaunchGCC.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "git bash": {
+    "name": "Git Bash",
+    "target": "C:\\Program Files\\Git\\git-bash.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "git cmd": {
+    "name": "Git CMD",
+    "target": "C:\\Program Files\\Git\\git-cmd.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "git gui": {
+    "name": "Git GUI",
+    "target": "C:\\Program Files\\Git\\cmd\\git-gui.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "handbrake": {
+    "name": "HandBrake",
+    "target": "C:\\Program Files\\HandBrake\\HandBrake.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "fl studio 2024": {
+    "name": "FL Studio 2024",
+    "target": "F:\\Fl Studio\\FL64.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "play marvels guardians of the galaxy": {
+    "name": "Play Marvels Guardians of the Galaxy",
+    "target": "H:\\Marvels Guardians of the Galaxy\\bin\\gotg.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "database compare": {
+    "name": "Database Compare",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Client\\AppVLP.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "office language preferences": {
+    "name": "Office Language Preferences",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\SETLANG.EXE",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "office upload center": {
+    "name": "Office Upload Center",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Client\\AppVLP.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "skype for business recording manager": {
+    "name": "Skype for Business Recording Manager",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\OcPubMgr.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "spreadsheet compare": {
+    "name": "Spreadsheet Compare",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Client\\AppVLP.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "telemetry dashboard for office": {
+    "name": "Telemetry Dashboard for Office",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\msotd.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "telemetry log for office": {
+    "name": "Telemetry Log for Office",
+    "target": "C:\\Program Files\\Microsoft Office\\root\\Office16\\msoev.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "minitool partition wizard": {
+    "name": "MiniTool Partition Wizard",
+    "target": "C:\\Program Files\\MiniTool Partition Wizard 13\\partitionwizard.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "uninstall minitool partition wizard": {
+    "name": "Uninstall MiniTool Partition Wizard",
+    "target": "C:\\Program Files\\MiniTool Partition Wizard 13\\unins000.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "nvidia app": {
+    "name": "NVIDIA App",
+    "target": "C:\\Program Files\\NVIDIA Corporation\\NVIDIA App\\CEF\\NVIDIA App.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "oracle virtualbox": {
+    "name": "Oracle VirtualBox",
+    "target": "C:\\Program Files\\Oracle\\VirtualBox\\VirtualBox.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "riot client": {
+    "name": "Riot Client",
+    "target": "C:\\Riot Games\\Riot Client\\RiotClientServices.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "steam": {
+    "name": "Steam",
+    "target": "C:\\Program Files (x86)\\Steam\\Steam.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "task manager": {
+    "name": "Task Manager",
+    "target": "C:\\WINDOWS\\system32\\taskmgr.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "vlc media player - reset preferences and cache files": {
+    "name": "VLC media player - reset preferences and cache files",
+    "target": "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "vlc media player skinned": {
+    "name": "VLC media player skinned",
+    "target": "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "vlc media player": {
+    "name": "VLC media player",
+    "target": "C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "webos dev manager": {
+    "name": "webOS Dev Manager",
+    "target": "C:\\Program Files\\webOS Dev Manager\\webos-dev-manager.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "windows powershell ise 5.1 (x86)": {
+    "name": "Windows PowerShell ISE 5.1 (x86)",
+    "target": "C:\\WINDOWS\\syswow64\\WindowsPowerShell\\v1.0\\PowerShell_ISE.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "windows powershell ise 5.1": {
+    "name": "Windows PowerShell ISE 5.1",
+    "target": "C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\PowerShell_ISE.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "winrar": {
+    "name": "WinRAR",
+    "target": "C:\\Program Files\\WinRAR\\WinRAR.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "worldpainter (safe mode)": {
+    "name": "WorldPainter (Safe Mode)",
+    "target": "C:\\Program Files\\WorldPainter\\worldpainter.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "worldpainter uninstaller": {
+    "name": "WorldPainter Uninstaller",
+    "target": "C:\\Program Files\\WorldPainter\\uninstall.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "worldpainter": {
+    "name": "WorldPainter",
+    "target": "C:\\Program Files\\WorldPainter\\worldpainter.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "administrative tools": {
+    "name": "Administrative Tools",
+    "target": "C:\\WINDOWS\\system32\\control.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "autosubs": {
+    "name": "AutoSubs",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\AutoSubs\\autosubs.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "blurautoclicker": {
+    "name": "BlurAutoClicker",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\BlurAutoClicker\\BlurAutoClicker.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "cosmic byte blitz controller": {
+    "name": "Cosmic Byte BLITZ Controller",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Programs\\cosmic_byte_blitz_app\\Cosmic Byte BLITZ Controller.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "crack world": {
+    "name": "Crack World",
+    "target": "E:\\cws\\Crack World\\Crack World.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "hydra": {
+    "name": "Hydra",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Hydra\\Hydra.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "localsend": {
+    "name": "LocalSend",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Programs\\LocalSend\\localsend_app.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "medal": {
+    "name": "Medal",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Medal\\Medal.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "modrinth app": {
+    "name": "Modrinth App",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Modrinth App\\Modrinth App.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "roblox": {
+    "name": "Roblox",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Roblox\\Versions\\version-8884371d30284041\\RobloxPlayerBeta.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "spotify": {
+    "name": "Spotify",
+    "target": "C:\\Users\\Admin\\AppData\\Roaming\\Spotify\\Spotify.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "utorrent web": {
+    "name": "uTorrent Web",
+    "target": "C:\\Users\\Admin\\AppData\\Roaming\\uTorrent Web\\utweb.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "livecaptions": {
+    "name": "LiveCaptions",
+    "target": "C:\\WINDOWS\\system32\\LiveCaptions.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "magnify": {
+    "name": "Magnify",
+    "target": "C:\\WINDOWS\\system32\\magnify.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "narrator": {
+    "name": "Narrator",
+    "target": "C:\\WINDOWS\\system32\\narrator.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "on-screen keyboard": {
+    "name": "On-Screen Keyboard",
+    "target": "C:\\WINDOWS\\system32\\osk.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "voiceaccess": {
+    "name": "VoiceAccess",
+    "target": "C:\\WINDOWS\\system32\\voiceaccess.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "discord": {
+    "name": "Discord",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Discord\\Update.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "idle (python 3.14 64-bit)": {
+    "name": "IDLE (Python 3.14 64-bit)",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python314\\pythonw.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "python 3.14 (64-bit)": {
+    "name": "Python 3.14 (64-bit)",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "python 3.14 module docs (64-bit)": {
+    "name": "Python 3.14 Module Docs (64-bit)",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "roblox player": {
+    "name": "Roblox Player",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Roblox\\Versions\\version-5cf2272675e145f5\\RobloxPlayerBeta.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "roblox studio": {
+    "name": "Roblox Studio",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Roblox\\Versions\\RobloxStudioInstaller.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "steamtools": {
+    "name": "SteamTools",
+    "target": "C:\\Program Files\\SteamTools\\SteamTools.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "uninstall steamtools": {
+    "name": "Uninstall SteamTools",
+    "target": "C:\\Program Files\\SteamTools\\Uninstall.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "command prompt": {
+    "name": "Command Prompt",
+    "target": "C:\\WINDOWS\\system32\\cmd.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "visual studio code": {
+    "name": "Visual Studio Code",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "signalrgb": {
+    "name": "SignalRgb",
+    "target": "C:\\Users\\Admin\\AppData\\Local\\VortxEngine\\SignalRgbLauncher.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "windows powershell (x86)": {
+    "name": "Windows PowerShell (x86)",
+    "target": "C:\\Windows\\SysWOW64\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "windows powershell": {
+    "name": "Windows PowerShell",
+    "target": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "uninstall zoom workplace": {
+    "name": "Uninstall Zoom Workplace",
+    "target": "C:\\Users\\Admin\\AppData\\Roaming\\Zoom\\uninstall\\Installer.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "zoom workplace": {
+    "name": "Zoom Workplace",
+    "target": "C:\\Users\\Admin\\AppData\\Roaming\\Zoom\\bin\\Zoom.exe",
+    "source": "start_menu",
+    "aliases": []
+  },
+  "project lightning": {
+    "name": "project lightning",
+    "target": "\"C:\\Users\\Admin\\AppData\\Roaming\\ProjectLightning\\Project Lightning.exe\"",
+    "source": "user",
+    "aliases": []
+  }
+}
