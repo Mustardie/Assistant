@@ -1,4 +1,5 @@
 import logging
+import time
 
 from config.settings import settings
 from recommendation.engine import RecommendationEngine
@@ -8,10 +9,14 @@ from tools.browser_tool import browser
 
 logger = logging.getLogger(__name__)
 
+_RECOMMEND_CACHE_TTL = 300  # 5 minutes
+
 
 class YouTubeSkill:
     def __init__(self):
         self._engine = None
+        self._cache = {}
+        self._cache_time = {}
 
     def _require_api_key(self):
         if settings.youtube_api_key:
@@ -62,6 +67,13 @@ class YouTubeSkill:
             )
             self._require_api_key()
 
+        cache_key = request.strip().lower()
+        now = time.time()
+        cached = self._cache.get(cache_key)
+        if cached and (now - self._cache_time.get(cache_key, 0)) < _RECOMMEND_CACHE_TTL:
+            logger.info("Using cached recommendation for: %s", request)
+            return cached
+
         result = self._get_engine().recommend(
             user_request=request,
             auto_play=True,
@@ -74,7 +86,10 @@ class YouTubeSkill:
             result.top_pick.url if result.top_pick else None,
         )
 
-        return result.summary()
+        summary = result.summary()
+        self._cache[cache_key] = summary
+        self._cache_time[cache_key] = now
+        return summary
 
     def play_url(self, url: str):
         logger.info("Play URL requested: %s", url)

@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 from assistant import Assistant
@@ -57,6 +58,7 @@ class Agent:
             track_file_action=self._track_file_action,
             fallback=self._run_intent_fallback,
         )
+        self._run_lock = threading.Lock()
 
     def _is_youtube_request(self, user: str) -> bool:
         normalized = user.lower().strip()
@@ -507,6 +509,15 @@ class Agent:
         return True
 
     def run(self, user):
+        if not self._run_lock.acquire(blocking=False):
+            logger.warning("Agent.run() called while already running; dropping duplicate call for: %s", user[:80])
+            return
+        try:
+            self._run_inner(user)
+        finally:
+            self._run_lock.release()
+
+    def _run_inner(self, user):
         self.memory_manager.add_message("user", user)
 
         if self._handle_rename_correction(user):

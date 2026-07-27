@@ -272,6 +272,9 @@ class AgentLoop:
         stop = False
         if tool == "file_search" and isinstance(result, dict):
             stop = bool(self._handle_file_search(user, result))
+        elif tool == "youtube_recommend" and success:
+            logger.info("youtube_recommend succeeded; terminating loop (video is playing)")
+            stop = True
 
         return {"success": success, "result": result, "stop": stop}
 

@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 
 
 class VoiceManager:
+    _WARMUP_TIMEOUT = 60.0
+
     def __init__(self, agent, callbacks=None):
         self.agent = agent
         self.callbacks = callbacks or {}
@@ -19,10 +21,25 @@ class VoiceManager:
         self.player = Player()
         self._running = False
         self._lock = threading.Lock()
+        self._warmup_done = threading.Event()
 
     def warmup(self):
-        self.transcriber.load_model()
-        self.tts.load_pipeline()
+        try:
+            self.transcriber.load_model()
+            self.tts.load_pipeline()
+        finally:
+            self._warmup_done.set()
+
+    def _await_warmup(self):
+        if self._warmup_done.is_set():
+            return
+        logger.info("Voice: waiting for warmup to complete...")
+        self._warmup_done.wait(timeout=self._WARMUP_TIMEOUT)
+        if not self._warmup_done.is_set():
+            logger.warning("Voice: warmup timed out, loading models synchronously")
+            self.transcriber.load_model()
+            self.tts.load_pipeline()
+            self._warmup_done.set()
 
     def start_voice_session(self):
         with self._lock:
@@ -35,6 +52,7 @@ class VoiceManager:
 
     def _run_session(self):
         try:
+            self._await_warmup()
             self._emit("on_listening")
             audio = self.recorder.record()
             if audio.size == 0:

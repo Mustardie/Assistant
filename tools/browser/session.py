@@ -19,6 +19,10 @@ class BrowserSession:
     reimplementing connection/launch logic like the old monolithic
     Browser class did."""
 
+    _CONTEXT_VALIDITY_CACHE_SECONDS = 2.0
+    _LAUNCH_WAIT_LOOPS = 40
+    _LAUNCH_WAIT_INTERVAL = 0.25
+
     def __init__(self, edge_path: str = EDGE_PATH, edge_profile: str = EDGE_PROFILE, debug_port: int = DEBUG_PORT):
         self.edge_path = edge_path
         self.edge_profile = edge_profile
@@ -27,10 +31,12 @@ class BrowserSession:
         self._playwright = None
         self._browser = None
         self.context = None
+        self._context_validated_at = 0.0
 
     def _debug_running(self) -> bool:
         s = socket.socket()
         try:
+            s.settimeout(0.5)
             s.connect(("127.0.0.1", self.debug_port))
             s.close()
             return True
@@ -46,10 +52,10 @@ class BrowserSession:
             f"--user-data-dir={self.edge_profile}",
         ])
 
-        for _ in range(40):
+        for _ in range(self._LAUNCH_WAIT_LOOPS):
             if self._debug_running():
                 return
-            time.sleep(0.25)
+            time.sleep(self._LAUNCH_WAIT_INTERVAL)
 
         raise RuntimeError("Edge debugging port never started.")
 
@@ -68,9 +74,15 @@ class BrowserSession:
 
     def ensure_context(self):
         """Returns a live BrowserContext, launching/connecting/reconnecting
-        as needed. Safe to call before every operation."""
+        as needed. Uses a time-based cache so the socket check only runs
+        once every N seconds instead of before every browser operation."""
+        now = time.time()
+        if self.context and (now - self._context_validated_at) < self._CONTEXT_VALIDITY_CACHE_SECONDS:
+            return self.context
+
         try:
             if self.context and self.context.browser and self.context.browser.is_connected():
+                self._context_validated_at = now
                 return self.context
         except Exception:
             pass
@@ -79,4 +91,5 @@ class BrowserSession:
             self._launch_edge()
 
         self._connect()
+        self._context_validated_at = time.time()
         return self.context
