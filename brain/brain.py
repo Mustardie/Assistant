@@ -433,11 +433,27 @@ class Brain:
 
     def _build_system_prompt(self) -> str:
         user_memory = self.memory_manager.get_user_memory()
-        memory_text = json.dumps(user_memory, indent=2, ensure_ascii=False)
+        comm = user_memory.get("communication_style", {})
+        memory_lines = []
+        tone = comm.get("tone", "")
+        length = comm.get("length", "")
+        if tone:
+            memory_lines.append(f"- Communication tone: {tone}")
+        if length:
+            memory_lines.append(f"- Preferred response length: {length}")
+        for pref in comm.get("preferences", []):
+            memory_lines.append(f"- Communication preference: {pref}")
+        for label, key in [("Projects", "projects"), ("Goals", "goals"), ("Key facts", "facts_about_user")]:
+            items = user_memory.get(key, [])
+            if items:
+                memory_lines.append(f"- {label}: {'; '.join(items)}")
+        memory_text = "\n".join(memory_lines) if memory_lines else "No stored information yet."
         return (
             f"{AGENT_SYSTEM_PROMPT}\n\n"
-            "You are assisting this user. Here is information they asked you to remember:\n"
-            f"{memory_text}"
+            "## User Profile\n\n"
+            f"{memory_text}\n\n"
+            "Retrieve additional relevant memories with the remember/forget tools.\n"
+            "Only correct the user if a stored fact is clearly wrong — otherwise trust it."
         )
 
     def _build_user_prompt(
@@ -456,13 +472,23 @@ class Brain:
             observations = observations[-5:]
         observations_text = self._format_observations(observations or [])
 
-        parts = [f"USER REQUEST:\n{user}"]
+        relevant_memories = self.memory_manager.get_relevant_memories(query=user, limit=4)
+        memories_text = ""
+        if relevant_memories:
+            mem_lines = [f"- [{m.get('category','fact')}] {m.get('text','')}" for m in relevant_memories]
+            memories_text = "RELEVANT MEMORIES:\n" + "\n".join(mem_lines) + "\n\n"
+
+        query = goal or user
+        parts = [f"USER REQUEST:\n{query}"]
 
         if goal and goal != user:
             parts.append(f"ORIGINAL GOAL:\n{goal}")
 
         if intent_hint:
             parts.append(f"INTENT HINT:\n{intent_hint}")
+
+        if memories_text:
+            parts.append(memories_text)
 
         parts.append(f"OBSERVATIONS:\n{observations_text}")
         parts.append(f"CURRENT CONVERSATION:\n{conversation_text}")

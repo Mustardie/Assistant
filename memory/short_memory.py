@@ -1,5 +1,40 @@
 import json
+import logging
+import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_MAX_TOOL_CONTENT_CHARS = 300
+_MAX_CONVERSATION_CHARS = 8000
+_MAX_RECENT_MESSAGES = 15
+_MAX_SUMMARY_CHARS = 1500
+
+
+def _compress_tool_content(content: str, tool_name: str = "") -> str:
+    try:
+        data = json.loads(content) if isinstance(content, str) else content
+        if isinstance(data, dict):
+            parts = []
+            if "success" in data:
+                parts.append("OK" if data["success"] else "FAILED")
+            for key in ("path", "count", "indexed", "error", "status", "matches", "total"):
+                val = data.get(key)
+                if val is not None:
+                    parts.append(f"{key}={val}")
+            if parts:
+                compressed = f"[{tool_name}] {' '.join(parts)}"
+                if len(compressed) > _MAX_TOOL_CONTENT_CHARS:
+                    compressed = compressed[:_MAX_TOOL_CONTENT_CHARS] + "..."
+                return compressed
+        if isinstance(data, list) and len(data) > 3:
+            return f"[{tool_name}] {len(data)} results (first: {str(data[0])[:100]})"
+    except (json.JSONDecodeError, TypeError):
+        pass
+    content_str = str(content)
+    if len(content_str) > _MAX_TOOL_CONTENT_CHARS:
+        content_str = content_str[:_MAX_TOOL_CONTENT_CHARS] + "..."
+    return content_str
 
 
 class ShortTermMemory:
@@ -7,9 +42,9 @@ class ShortTermMemory:
         self,
         storage_path: Path | str | None = None,
         max_entries: int = 80,
-        max_chars: int = 6000,
-        recent_messages: int = 20,
-        max_summary_chars: int = 1200,
+        max_chars: int = _MAX_CONVERSATION_CHARS,
+        recent_messages: int = _MAX_RECENT_MESSAGES,
+        max_summary_chars: int = _MAX_SUMMARY_CHARS,
     ):
         self.storage_path = Path(storage_path) if storage_path else self._default_path()
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -32,13 +67,11 @@ class ShortTermMemory:
     def load_history(self) -> list:
         if not self.storage_path.exists():
             return []
-
         try:
             with open(self.storage_path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except Exception:
             return []
-
         if isinstance(data, list):
             return [self._normalize_message(message) for message in data]
         return []
@@ -55,11 +88,13 @@ class ShortTermMemory:
         content = str(content).strip()
         if not content:
             return
-
-        message = {"role": role, "content": content}
-        if metadata:
-            message.update(metadata)
-
+        compressed = content
+        if role == "tool":
+            tool_name = (metadata or {}).get("tool", "")
+            compressed = _compress_tool_content(content, tool_name)
+        message = {"role": role, "content": compressed}
+        if metadata and role == "tool":
+            message["tool"] = metadata.get("tool", "")
         history = self._get_history()
         history.append(message)
         self._enforce_limits()
@@ -79,12 +114,10 @@ class ShortTermMemory:
         history = self._get_history()
         if not history:
             return
-
         if len(history) <= self.max_entries and self._total_chars() <= self.max_chars:
             return
-
-        recent = history[-self.recent_messages :]
-        old_messages = history[: max(0, len(history) - len(recent))]
+        recent = history[-self.recent_messages:]
+        old_messages = history[:max(0, len(history) - len(recent))]
         summary = self.summarize_messages(old_messages)
         self._history = [{"role": "system", "content": summary}] + recent
 
@@ -94,16 +127,13 @@ class ShortTermMemory:
     def summarize_messages(self, messages: list) -> str:
         if not messages:
             return ""
-
         summary_lines = []
         max_messages = min(len(messages), 10)
         tail = messages[-max_messages:]
-
         for message in tail:
             content = str(message.get("content", "")).replace("\n", " ").strip()
             if not content:
                 continue
-
             role = message.get("role", "assistant")
             if role == "user":
                 label = "User"
@@ -116,12 +146,9 @@ class ShortTermMemory:
                 label = "Summary"
             else:
                 label = role.capitalize()
-
             if len(content) > 200:
                 content = content[:197].rsplit(" ", 1)[0] + "..."
-
             summary_lines.append(f"{label}: {content}")
-
         prefix = "Earlier conversation summary:" if len(messages) <= max_messages else "Earlier conversation summary (older content condensed):"
         summary = f"{prefix} {' '.join(summary_lines)}"
         if len(summary) > self.max_summary_chars:
@@ -132,4 +159,8 @@ class ShortTermMemory:
     def _normalize_message(message: dict) -> dict:
         if not isinstance(message, dict):
             return {"role": "assistant", "content": str(message)}
-        return {"role": str(message.get("role", "assistant")), "content": str(message.get("content", "")), **{k: v for k, v in message.items() if k not in {"role", "content"}}}
+        return {
+            "role": str(message.get("role", "assistant")),
+            "content": str(message.get("content", "")),
+            **{k: v for k, v in message.items() if k not in {"role", "content"}},
+        }
