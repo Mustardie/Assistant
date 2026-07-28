@@ -1,8 +1,11 @@
+import logging
 from pathlib import Path
 
 from config.settings import settings
 from .long_memory import LongTermMemory
 from .short_memory import ShortTermMemory
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
@@ -18,7 +21,6 @@ class MemoryManager:
     def initialize(self, prompt_fn=input) -> None:
         if self.long_memory.is_onboarded():
             return
-
         print(
             "Before we start, what should I permanently remember about you?"
         )
@@ -30,6 +32,9 @@ class MemoryManager:
 
     def get_user_memory(self) -> dict:
         return self.long_memory.to_dict()
+
+    def get_relevant_memories(self, query: str = "", limit: int = 5) -> list[dict]:
+        return self.long_memory.get_relevant(query=query, limit=limit)
 
     def get_conversation_history(self) -> list:
         return self.short_memory.retrieve_history()
