@@ -8,9 +8,11 @@ logger = logging.getLogger(__name__)
 
 
 def _run(page, description, role, action_name, do):
+    logger.info("[Browser] %s: %s", action_name, description)
     try:
         resolved = resolve(page, description, role=role)
     except ElementNotFoundError as exc:
+        logger.warning("[Browser] %s failed to locate element %r: %s", action_name, description, exc)
         return {"success": False, "action": action_name, "description": description, "error": str(exc)}
 
     try:
@@ -21,16 +23,19 @@ def _run(page, description, role, action_name, do):
     try:
         do(resolved.locator)
     except PlaywrightTimeoutError as exc:
+        logger.warning("[Browser] %s timed out on %r: %s", action_name, description, exc)
         return {
             "success": False, "action": action_name, "description": description,
             "strategy": resolved.strategy, "error": f"Found the element but the action timed out: {exc}",
         }
     except Exception as exc:
+        logger.warning("[Browser] %s raised on %r: %s", action_name, description, exc)
         return {
             "success": False, "action": action_name, "description": description,
             "strategy": resolved.strategy, "error": str(exc),
         }
 
+    logger.info("[Browser] %s succeeded: %s", action_name, description)
     return {"success": True, "action": action_name, "description": description, "strategy": resolved.strategy}
 
 
