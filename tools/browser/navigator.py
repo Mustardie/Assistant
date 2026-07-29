@@ -14,6 +14,7 @@ def goto(page, url: str, timeout: int = 20000) -> dict:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError as exc:
         return {"success": False, "url": url, "error": f"Timed out loading {url}: {exc}"}
+    wait_for_stable(page, timeout=5000)
     return {"success": True, "url": page.url, "title": page.title()}
 
 
@@ -22,6 +23,7 @@ def back(page, timeout: int = 15000) -> dict:
         page.go_back(wait_until="domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError as exc:
         return {"success": False, "error": str(exc)}
+    wait_for_stable(page, timeout=3000)
     return {"success": True, "url": page.url, "title": page.title()}
 
 
@@ -30,6 +32,7 @@ def forward(page, timeout: int = 15000) -> dict:
         page.go_forward(wait_until="domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError as exc:
         return {"success": False, "error": str(exc)}
+    wait_for_stable(page, timeout=3000)
     return {"success": True, "url": page.url, "title": page.title()}
 
 
@@ -38,6 +41,7 @@ def refresh(page, timeout: int = 15000) -> dict:
         page.reload(wait_until="domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError as exc:
         return {"success": False, "error": str(exc)}
+    wait_for_stable(page, timeout=5000)
     return {"success": True, "url": page.url, "title": page.title()}
 
 
@@ -50,13 +54,6 @@ def wait_for_load(page, timeout: int = 15000, state: str = "load") -> dict:
     except PlaywrightTimeoutError as exc:
         return {"success": False, "error": str(exc), "url": page.url}
 
-    # Handle redirect chains: if the URL is still changing shortly after
-    # "loaded", wait for it to settle rather than reporting success on an
-    # intermediate redirect page. Poll in short increments instead of a
-    # blind flat sleep -- same 400ms worst-case ceiling as before (a late
-    # redirect is still caught), but the common case (no redirect) exits
-    # as soon as two consecutive checks agree, instead of always paying
-    # the full 400ms.
     settle_budget_ms = 400
     poll_interval_ms = 100
     last_url = page.url
@@ -70,12 +67,23 @@ def wait_for_load(page, timeout: int = 15000, state: str = "load") -> dict:
                 break
             last_url = current_url
         if page.url != last_url or elapsed_ms >= settle_budget_ms:
-            # URL moved on the last check (or we hit the ceiling still
-            # mid-navigation) -- wait for that navigation to finish, same
-            # as the original behavior.
             page.wait_for_load_state(state, timeout=timeout)
     except PlaywrightTimeoutError:
         pass
+
+    return {"success": True, "url": page.url, "title": page.title()}
+
+
+def wait_for_stable(page, timeout: int = 4000) -> dict:
+    """Wait for the page to stabilise. Uses networkidle (best-effort)
+    then a brief settle for SPA rendering. 'domcontentloaded' after
+    'networkidle' is redundant — networkidle already implies it."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PlaywrightTimeoutError:
+        pass
+
+    page.wait_for_timeout(100)
 
     return {"success": True, "url": page.url, "title": page.title()}
 
@@ -84,8 +92,32 @@ def wait_for_element(page, description: str, timeout: int = 15000) -> dict:
     try:
         resolved = resolve(page, description)
         resolved.locator.wait_for(state="visible", timeout=timeout)
-        return {"success": True, "description": description, "strategy": resolved.strategy}
+        return {"success": True, "description": description, "strategy": resolved.strategy, "confidence": resolved.confidence}
     except ElementNotFoundError as exc:
         return {"success": False, "description": description, "error": str(exc)}
     except PlaywrightTimeoutError as exc:
         return {"success": False, "description": description, "error": f"Found but never became visible: {exc}"}
+
+
+def did_navigation_occur(page, before_url: str, before_title: str) -> dict:
+    """Compare current page state with a previously captured state
+    to determine if navigation or meaningful content change happened."""
+    try:
+        current_url = page.url
+        current_title = page.title()
+    except Exception as exc:
+        return {"success": False, "navigation_detected": False, "error": str(exc)}
+
+    url_changed = current_url != before_url
+    title_changed = current_title != before_title
+
+    return {
+        "success": True,
+        "navigation_detected": url_changed or title_changed,
+        "url_changed": url_changed,
+        "title_changed": title_changed,
+        "before_url": before_url,
+        "before_title": before_title,
+        "after_url": current_url,
+        "after_title": current_title,
+    }

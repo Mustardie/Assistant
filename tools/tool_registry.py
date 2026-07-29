@@ -78,15 +78,31 @@ def vision_tool(prompt):
 
 # ---------------- Browser Wrappers ---------------- #
 
-def browser_open(url):
+def _require(value, name, example=""):
+    if not value:
+        hint = f" (e.g. '{example}')" if example else ""
+        return {"success": False, "error": f"Missing argument '{name}'. Provide a value for '{name}'{hint}."}
+    return None
+
+
+def browser_open(url=None):
+    err = _require(url, "url")
+    if err:
+        return err
     return browser.browser_open(url)
 
 
-def youtube_recommend(request):
+def youtube_recommend(request=None):
+    err = _require(request, "request", "play some music")
+    if err:
+        return err
     return youtube.recommend(request)
 
 
-def youtube_play_url(url):
+def youtube_play_url(url=None):
+    err = _require(url, "url", "https://youtube.com/watch?v=...")
+    if err:
+        return err
     return youtube.play_url(url)
 
 
@@ -125,7 +141,10 @@ def gmail_delete(message_id):
     return gmail.delete(message_id)
 
 
-def google_search(query):
+def google_search(query=None):
+    err = _require(query, "query", "flights from Hyderabad to Delhi")
+    if err:
+        return err
     return browser.google_search(query)
 
 
@@ -177,7 +196,9 @@ def browser_label_tab(tab, label):
 
 # ---------------- Browser agent: navigation ---------------- #
 
-def browser_goto(url, tab=None):
+def browser_goto(url=None, tab=None):
+    if not url:
+        return {"success": False, "error": "Missing argument 'url'. Provide the URL to navigate to (e.g. 'https://flights.google.com')."}
     return browser_agent.goto(url, tab=tab)
 
 
@@ -226,24 +247,46 @@ def browser_extract_forms(tab=None):
 
 # ---------------- Browser agent: interaction ---------------- #
 
-def browser_click(description, tab=None):
+def _require_description(description, action):
+    if not description:
+        return {"success": False, "error": f"Missing argument 'description' for {action}. Provide the visible text label of the element (e.g. 'Search button')."}
+    return None
+
+
+def browser_click(description=None, tab=None):
+    err = _require_description(description, "browser_click")
+    if err:
+        return err
     return browser_agent.click(description, tab=tab)
 
 
-def browser_double_click(description, tab=None):
+def browser_double_click(description=None, tab=None):
+    err = _require_description(description, "browser_double_click")
+    if err:
+        return err
     return browser_agent.double_click(description, tab=tab)
 
 
-def browser_right_click(description, tab=None):
+def browser_right_click(description=None, tab=None):
+    err = _require_description(description, "browser_right_click")
+    if err:
+        return err
     return browser_agent.right_click(description, tab=tab)
 
 
-def browser_hover(description, tab=None):
+def browser_hover(description=None, tab=None):
+    err = _require_description(description, "browser_hover")
+    if err:
+        return err
     return browser_agent.hover(description, tab=tab)
 
 
-def browser_type(description, text, clear_first=True, tab=None):
-    return browser_agent.type_text(description, text, clear_first=clear_first, tab=tab)
+def browser_type(description=None, text=None, clear_first=True, press_enter=False, tab=None):
+    if not description:
+        return {"success": False, "error": "Missing argument 'description'. Provide the visible text label of the input field (e.g. 'Where from?')."}
+    if not text:
+        return {"success": False, "error": "Missing argument 'text'. Provide the text to type into the field."}
+    return browser_agent.type_text(description, text, clear_first=clear_first, press_enter=press_enter, tab=tab)
 
 
 def browser_press_key(key, tab=None):
@@ -308,26 +351,116 @@ def browser_wait_for_login(tab=None, timeout_seconds=120):
     return browser_agent.wait_for_login(tab=tab, timeout_seconds=timeout_seconds)
 
 
+# ---------------- Browser agent: page understanding ---------------- #
+
+def browser_read_page(tab=None):
+    """Comprehensive structured snapshot of the current page: URL, title,
+    page type (search, form, article, error, etc.), all interactive elements
+    (buttons, links, inputs, selects, checkboxes), headings, visible text,
+    forms, tables, lists, scroll position. Use THIS instead of read_dom_summary
+    + read_text + extract_links + extract_forms + extract_tables separately.
+    Call this BEFORE every interaction so you act on real page state."""
+    return browser_agent.read_page(tab=tab)
+
+
+def browser_read_page_light(tab=None):
+    """Quick page check: URL, title, page type, buttons, links, inputs.
+    Lighter than read_page for fast verification loops after an action."""
+    return browser_agent.read_page_light(tab=tab)
+
+
+# ---------------- Browser agent: action verification ---------------- #
+
+def browser_verify_navigation(tab=None, before_url="", before_title=""):
+    """Check if the page changed (URL, title) since a previous state.
+    Call before an action to capture state, then after to verify the
+    action actually had an effect (e.g. after clicking a link or
+    submitting a form)."""
+    return browser_agent.verify_navigation(tab=tab, before_url=before_url, before_title=before_title)
+
+
+def browser_verify_element(description, tab=None, timeout=5000):
+    """Check if an element matching the description is visible now.
+    Returns confidence score. Use after an action to confirm the
+    expected result appeared."""
+    return browser_agent.verify_element_appeared(description, tab=tab, timeout=timeout)
+
+
+def browser_vision(question="What do you see on this page?", tab=None):
+    """Take a screenshot of the current page and ask the vision model a
+    question. Use when text-based snapshot isn't enough — dropdown popups,
+    date picker calendars, captchas, custom widgets."""
+    return browser_agent.vision(question=question, tab=tab)
+
+
 # ---------------- Browser agent: task memory ---------------- #
 
 def browser_get_state():
-    """Every open tab, recent navigation, recent failures, and the current
-    task/progress notes. Call this if you've lost track of what's open or
+    """Every open tab, recent navigation, recent failures, extracted data,
+    completed steps, and the current task/progress notes. Call this if
+    you've lost track of what's open, what data you've collected, or
     what's already been tried."""
     return browser_agent.get_state()
 
 
-def browser_set_task(description):
-    """Record the overall goal for a multi-step browser task (e.g. "Plan a
-    Goa trip: flights, hotel, itinerary doc") so browser_get_state can
-    remind you of it across many steps."""
-    return browser_agent.set_task(description)
+def browser_set_task(description, total_steps=0):
+    """Record the overall goal and step count for a multi-step browser
+    task (e.g. "Plan a trip: flights, hotel, itinerary doc"). Provide
+    total_steps so the agent can track completion percentage."""
+    return browser_agent.set_task(description, total_steps=total_steps)
 
 
 def browser_update_progress(note):
     """Append a short progress note (e.g. "Booked flight, now comparing
     hotels") to the current task's memory."""
     return browser_agent.update_progress(note)
+
+
+def browser_complete_step(step_description):
+    """Mark one step of the current task as completed. Updates step
+    counter and appends to completed_steps list."""
+    return browser_agent.complete_step(step_description)
+
+
+def browser_record_data(key, data, tab=None):
+    """Store extracted information (prices, search results, product names,
+    etc.) in browser memory so it can be referenced later without re-reading
+    the same pages."""
+    return browser_agent.record_data(key=key, data=data, tab=tab)
+
+
+def browser_plan(goal=None, steps=None, plan=None):
+    """Define an explicit ordered plan for a multi-tab browser workflow.
+    Steps is a list of strings like ['Search flights to Tokyo',
+    'Compare hotel options', 'Create itinerary doc'].
+    Call this ONCE at the start of any multi-step task spanning >1 tab.
+    Internally also calls browser_set_task."""
+    steps = steps or plan or []
+    return browser_agent.plan(goal=goal or "", steps=steps)
+
+
+def browser_note(key, value):
+    """Store a session-level note (cross-tab working memory).
+    Unlike browser_record_data which is per-tab, notes are global —
+    use for things like cheapest_flight, best_price, summary strings."""
+    return browser_agent.note(key=key, value=value)
+
+
+def browser_summarize_session(format="text"):
+    """Collect all extracted data, notes, page summaries, and progress
+    into a final structured digest. Call at the END of a multi-tab
+    workflow to present the full result."""
+    return browser_agent.summarize_session(format=format)
+
+
+def recipe_save(goal, tags, steps):
+    """Save the current successful workflow as a reusable recipe.
+    Call this after completing a multi-step task that you might want
+    to repeat later. Provide tags for matching and the list of
+    {tool, arguments} steps that worked."""
+    from tools.recipe_manager import recipe_manager
+    recipe_manager.save_recipe(goal=goal, tags=tags, steps=steps)
+    return {"success": True, "goal": goal, "tags": tags, "steps": len(steps)}
 
 
 def file_search(query, limit=10, action=None, filters=None, sort=None):
@@ -651,9 +784,22 @@ TOOLS = {
 
     "browser_wait_for_login": browser_wait_for_login,
 
+    "browser_read_page": browser_read_page,
+    "browser_read_page_light": browser_read_page_light,
+
+    "browser_verify_navigation": browser_verify_navigation,
+    "browser_verify_element": browser_verify_element,
+    "browser_vision": browser_vision,
+
     "browser_get_state": browser_get_state,
     "browser_set_task": browser_set_task,
     "browser_update_progress": browser_update_progress,
+    "browser_complete_step": browser_complete_step,
+    "browser_record_data": browser_record_data,
+    "browser_plan": browser_plan,
+    "browser_note": browser_note,
+    "browser_summarize_session": browser_summarize_session,
+    "recipe_save": recipe_save,
 
     "file_search": file_search,
     "file_open": file_open,
@@ -805,6 +951,11 @@ def run_tool(tool_name, arguments):
         function = TOOLS[tool_name]
 
         if resolved_arguments:
+            if not isinstance(resolved_arguments, dict):
+                return False, (
+                    f"Tool '{tool_name}' was called with {type(resolved_arguments).__name__} "
+                    f"arguments (expected dict). The LLM generated bad JSON for this step."
+                )
             result = function(**resolved_arguments)
         else:
             result = function()

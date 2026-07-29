@@ -48,6 +48,7 @@ class AgentLoop:
         self.on_file_search_result = on_file_search_result
         self.track_file_action = track_file_action
         self.fallback = fallback
+        self._last_response = ""
 
     def run(self, user: str, intent_hint: str | None = None) -> None:
         clear_tool_context()
@@ -57,22 +58,48 @@ class AgentLoop:
         recovery_attempts = 0
         last_failed_signature: tuple | None = None
         repeat_failures = 0
+        self._last_response = ""
+
+        from tools.recipe_manager import recipe_manager
+        matched_recipe = recipe_manager.find_match(goal)
+        if matched_recipe:
+            logger.info("Found matching recipe: %s", matched_recipe.get("goal"))
 
         for iteration in range(1, settings.agent_max_iterations + 1):
             logger.info("Agent loop iteration %s for goal: %s", iteration, goal[:80])
 
-            decision = self.brain.think(
-                user,
-                goal=goal,
-                observations=observations,
-                intent_hint=intent_hint,
-            )
+            try:
+                decision = self.brain.think(
+                    user,
+                    goal=goal,
+                    observations=observations,
+                    intent_hint=intent_hint,
+                    recipe=matched_recipe if iteration == 1 else None,
+                )
+            except json.JSONDecodeError:
+                logger.warning("LLM returned invalid JSON on iteration %s; treating as empty decision", iteration)
+                decision = {"reasoning": "", "response": None, "done": False, "step": None}
+            except Exception as llm_err:
+                err_msg = str(llm_err)
+                logger.error("LLM call failed on iteration %s: %s", iteration, err_msg)
+                decision = {
+                    "reasoning": err_msg,
+                    "response": f"The language model is taking too long. Let me try again.",
+                    "done": False,
+                    "step": None,
+                }
 
             self._log_reasoning(decision.get("reasoning"))
 
             response = decision.get("response")
+
+            # Deduplicate: skip speaking if this response is identical to the last one spoken.
             if response:
-                self.speak(response)
+                if response == self._last_response:
+                    logger.info("[TTS] Duplicate response prevented at loop level: %s", response[:60])
+                else:
+                    self._last_response = response
+                    self.speak(response)
 
             if decision.get("done"):
                 return
@@ -83,22 +110,40 @@ class AgentLoop:
             step = decision.get("step")
 
             if not step:
+                # LLM returned no tool step — if it's the first turn and
+                # the fallback catches it (youtube/file), dispatch there.
                 if not observations and self.fallback and self.fallback(user, intent_hint):
                     return
 
-                if observations:
-                    if response:
-                        continue
+                # If we have observations (tools were called) but the LLM
+                # still returned no step and no response, retry once.
+                if observations and not response:
+                    logger.warning("LLM returned no step on iteration %s; retrying", iteration)
+                    continue
 
-                    self.speak("I'm not sure what to do next. Could you clarify what you'd like?")
-                    return
-
-                if not response:
-                    self.speak(
-                        "I wasn't able to figure out a next step for that. "
-                        "Could you rephrase or give me a bit more detail?"
+                # LLM returned a chat response but no tool step.
+                # Instead of silently returning, retry with stronger
+                # prompting so it actually does something.
+                if response:
+                    logger.warning(
+                        "LLM returned response without step on iteration %s; "
+                        "retrying with stronger instruction", iteration,
                     )
+                    observations.append({
+                        "step": {"tool": "_llm_hint", "arguments": {}},
+                        "success": False,
+                        "result": (
+                            "You returned a response without a tool step. "
+                            "You MUST return a valid step with tool + arguments. "
+                            "Do NOT ask the user for information already in the goal."
+                        ),
+                    })
+                    continue
 
+                self.speak(
+                    "I wasn't able to figure out a next step for that. "
+                    "Could you rephrase or give me a bit more detail?"
+                )
                 return
 
             # A decision may bundle several deterministic actions into one

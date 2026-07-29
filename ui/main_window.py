@@ -39,6 +39,8 @@ class AssistantWindow(QWidget):
 
     # internal, thread-safe hotkey trampoline (see trigger_hotkey())
     _hotkeyTriggered = Signal()
+    # thread-safe state dispatch — Qt auto-queues cross-thread signal delivery
+    _stateRequested = Signal(str)
 
     def __init__(self):
         super().__init__(
@@ -60,6 +62,7 @@ class AssistantWindow(QWidget):
 
         self.bubble.clicked.connect(self._on_bubble_clicked)
         self._hotkeyTriggered.connect(self._on_hotkey_triggered)
+        self._stateRequested.connect(self._set_state_impl)
 
         self.panel.textSubmitted.connect(self.textSubmitted.emit)
         self.panel.historyRequested.connect(self.historyRequested.emit)
@@ -81,9 +84,12 @@ class AssistantWindow(QWidget):
 
     def set_state(self, state: str) -> None:
         """state in {'idle', 'listening', 'thinking', 'speaking'}.
-        Call this from the backend (e.g. the existing on_listening /
-        on_transcribing / on_thinking / on_speaking / on_idle callbacks in
-        main.py) to reflect real assistant state in the UI."""
+        Thread-safe: call from any thread — Qt auto-queues delivery to the
+        GUI thread via _stateRequested signal."""
+        self._stateRequested.emit(state)
+
+    def _set_state_impl(self, state: str) -> None:
+        """Actual UI update — always runs on the GUI thread."""
         self.bubble.set_state(state)
         if self._expanded:
             self.panel.set_state(state)

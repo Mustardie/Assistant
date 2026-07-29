@@ -35,6 +35,9 @@ class Settings:
     youtube_api_key: str = os.getenv("YOUTUBE_API_KEY", "")
     assistant_name: str = os.getenv("ASSISTANT_NAME", "Nova")
 
+    # LLM provider: "openrouter" or "gemini"
+    llm_provider: str = os.getenv("LLM_PROVIDER", "ollama")
+
     # Reasoning / planning model (cloud). This is what brain.py and the
     # long-term memory classifier use for all "thinking" now.
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")

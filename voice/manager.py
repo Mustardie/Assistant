@@ -9,6 +9,31 @@ from voice.tts import TTS
 logger = logging.getLogger(__name__)
 
 
+def _extract_spoken_text(text: str) -> str:
+    """Strip anything that is not the Nova assistant's spoken response.
+    The conversation history may contain tool logs or reasoning mixed in
+    with the response; this heuristic keeps only the actual output."""
+    if not text:
+        return ""
+    lines = text.split("\n")
+    spoken = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip reasoning blocks, tool names, and JSON blobs
+        if stripped.startswith("[") and stripped.endswith("]"):
+            continue
+        if stripped.startswith("{") or stripped.startswith("["):
+            continue
+        if stripped.startswith("```"):
+            continue
+        spoken.append(line)
+    result = "\n".join(spoken).strip()
+    # Remove leading "Nova:" prefix if present (already redundant for TTS)
+    if result.startswith("Nova:"):
+        result = result[5:].strip()
+    return result
+
+
 class VoiceManager:
     _WARMUP_TIMEOUT = 60.0
 
@@ -21,7 +46,36 @@ class VoiceManager:
         self.player = Player()
         self._running = False
         self._lock = threading.Lock()
+        self._tts_lock = threading.Lock()
         self._warmup_done = threading.Event()
+        self._last_spoken_text = ""
+
+        # Register callback on agent so TTS fires immediately when
+        # Nova speaks (instead of waiting for agent.run() to finish).
+        self.agent.set_voice_callback(self._on_agent_speak)
+
+    def _on_agent_speak(self, message: str):
+        """Called from agent._speak() the moment Nova: is printed.
+        Synthesises and plays immediately on a background thread so
+        it doesn't block the agent loop."""
+        spoken = _extract_spoken_text(message)
+        if not spoken:
+            return
+
+        # Deduplicate: skip if this is identical to the last spoken text.
+        if spoken == self._last_spoken_text:
+            logger.info("[TTS] Duplicate playback prevented: %s", spoken[:60])
+            return
+
+        self._last_spoken_text = spoken
+        self._emit("on_speaking")
+        logger.info("[TTS] Response queued: %s", spoken[:80])
+        try:
+            audio, sr = self.tts.synthesize(spoken)
+            self.player.play(audio, sr)
+            logger.info("[TTS] Playback started: %s", spoken[:80])
+        except Exception:
+            logger.exception("TTS failed in live callback")
 
     def warmup(self):
         try:
@@ -44,8 +98,12 @@ class VoiceManager:
     def start_voice_session(self):
         with self._lock:
             if self._running:
+                logger.warning("Voice: already running, dropping duplicate session")
                 return
             self._running = True
+            # Cancel any previous playback immediately
+            self.player.stop()
+            self.player.resume()
 
         thread = threading.Thread(target=self._run_session, daemon=True)
         thread.start()
@@ -53,6 +111,7 @@ class VoiceManager:
     def _run_session(self):
         try:
             self._await_warmup()
+            self._last_spoken_text = ""
             self._emit("on_listening")
             audio = self.recorder.record()
             if audio.size == 0:
@@ -69,15 +128,6 @@ class VoiceManager:
 
             self._emit("on_thinking")
             self.agent.run(text)
-
-            response = self._get_last_response()
-            if response:
-                self._emit("on_speaking")
-                try:
-                    audio, sr = self.tts.synthesize(response)
-                    self.player.play(audio, sr)
-                except Exception:
-                    logger.exception("TTS failed, response shown as text")
         except Exception:
             logger.exception("Voice session failed")
         finally:

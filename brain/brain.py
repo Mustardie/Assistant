@@ -1,7 +1,10 @@
 import json
 import logging
 
+from config.settings import settings
 from llm.openrouter_client import OpenRouterClient, OpenRouterConfigurationError
+from llm.gemini_client import GeminiClient, GeminiConfigurationError
+from llm.ollama_client import OllamaClient, OllamaConfigurationError
 from memory.memory_manager import MemoryManager
 
 logger = logging.getLogger(__name__)
@@ -78,8 +81,12 @@ Browser -- navigation:
 - browser_wait_for_load(tab, timeout)
 - browser_wait_for_element(description, tab, timeout)
 
-Browser -- reading (ALWAYS read before clicking on an unfamiliar page):
-- browser_read_dom_summary(tab, max_items)  <- structured buttons/links/inputs/headings with REAL visible text. This is how you know what you can click -- never guess a button's wording.
+Browser -- page understanding (use browser_read_page FIRST before any action):
+- browser_read_page(tab)            <- COMPREHENSIVE snapshot: url, title, page_type (search/form/error/article/etc), every button/link/input/select/checkbox/radio, headings, visible text, forms, tables, lists, scroll position. Use THIS instead of the 5 separate calls below. Call before EVERY interaction.
+- browser_read_page_light(tab)      <- Quick check: url, title, page_type, buttons, links, inputs. For verification loops after an action.
+
+Browser -- legacy specific reads (use read_page instead for new code):
+- browser_read_dom_summary(tab, max_items)  <- structured buttons/links/inputs/headings
 - browser_read_text(tab, max_chars)         <- full visible page text
 - browser_read(tab)                          <- page title only
 - browser_extract_tables(tab)
@@ -91,12 +98,18 @@ Browser -- interaction (click/type by the exact visible text or label you saw vi
 - browser_double_click(description, tab)
 - browser_right_click(description, tab)
 - browser_hover(description, tab)
-- browser_type(description, text, clear_first, tab)
+- browser_type(description, text, clear_first, press_enter, tab)
+  <- Use press_enter=True AFTER filling autocomplete/search/airport
+     fields where a dropdown suggestion popup must be accepted.
+     Without pressing Enter, the typed text won't register as a
+     selection and the field will look blank on the next interaction.
+     Example: typing "Delhi" in a "Where from?" field on Google
+     Flights -> browser_type("Where from?", "Delhi", press_enter=True)
 - browser_press_key(key, tab)
 - browser_scroll(amount, description, tab)   <- pass description to scroll a specific element into view
-- browser_select_dropdown(description, option, tab)
+- browser_select_dropdown(description, option, tab)   <- for native <select> dropdowns
 - browser_set_checkbox(description, checked, tab)
-- browser_click_radio(description, tab)
+- browser_click_radio(description, tab)   <- for individual radio buttons
 - browser_drag_and_drop(source_description, target_description, tab)
 - browser_upload_file(description, file_path, tab)
 
@@ -109,14 +122,63 @@ Browser -- downloads:
 Browser -- authentication (NEVER type or guess a password yourself):
 - browser_wait_for_login(tab, timeout_seconds)  <- call after navigating to a login page; returns fast if already logged in via the saved browser session, otherwise waits for the user or the browser's own saved-password autofill
 
-Browser -- task memory (use for multi-step goals spanning many tabs/turns):
-- browser_get_state()        <- all open tabs, recent navigation, recent failures, current task/progress
-- browser_set_task(description)
-- browser_update_progress(note)
+Browser -- action verification (call AFTER every interaction):
+- browser_verify_navigation(tab, before_url, before_title)  <- check if the page actually navigated since a prior state. Capture state before the action, then call this to verify.
+- browser_verify_element(description, tab, timeout)          <- check if an expected element appeared after an action (e.g. "Search results" appeared after clicking search). Returns confidence score.
+
+Browser -- vision fallback (use when text DOM snapshot is NOT enough):
+- browser_vision(question, tab)  <- Takes a screenshot of the current tab
+  page and asks the vision model a question about it. Use this when:
+  * A dropdown/autocomplete popup appeared after typing
+  * A date picker calendar is open
+  * A captcha or modal overlay is blocking the page
+  * Custom UI widgets (range sliders, color pickers, drag zones)
+    aren't captured by the text-based snapshot
+  * Text-based element finder fails or returns low confidence
+  Ask specific questions like "What are the visible options in the
+  dropdown?" or "What dates are shown on the calendar?"
+
+Browser -- multi-tab workflows (planner + working memory + final summary):
+- browser_plan(goal, steps)      <- DEFINE an ordered plan ONCE at the start.
+  steps is a list of strings. Example:
+  browser_plan("Plan Japan trip",
+    ["Open Google Flights for Tokyo",
+     "Search hotels on Booking.com",
+     "Search things to do",
+     "Write itinerary doc"])
+  Internally records the goal + total_steps. Returns plan_progress with
+  each step marked done=False. CHECK get_state() mid-workflow to see
+  which steps remain.
+- browser_note(key, value)       <- Cross-tab working memory, e.g.
+  browser_note("cheapest_flight", "₹45,000 IndiGo")
+  browser_note("selected_hotel", "Hotel Gracery Shinjuku, ₹8k/night")
+  Unlike browser_record_data (which is per-tab), notes are global to the
+  whole session — use them whenever data from one tab influences another.
+- browser_summarize_session()    <- Call when workflow is DONE. Collects
+  EVERYTHING (extracted_data from all tabs, notes, page_summaries,
+  completed steps, open tab labels/urls) into one structured dict.
+  Use this to present the final answer to the user.
+- browser_get_state()        <- all open tabs, plan_progress, notes,
+  recent navigation, recent failures, extracted data, completed steps
+- browser_complete_step(step_description)     <- mark one plan step done
+- browser_update_progress(note)   <- free-form progress note
+- browser_record_data(key, data, tab) <- per-tab extracted info (prices,
+  specs, results) that persists across turns
 
 Browser -- simple/legacy (fine for one-shot use, no tab tracking):
 - browser_open(url)
 - google_search(query)
+
+Recipe system (save AND reuse successful multi-step workflows):
+- recipe_save(goal, tags, steps)   <- Call this when you SUCCESSFULLY
+  complete a multi-step browser workflow that you might want to repeat
+  later. Pass the goal description, a list of tag keywords for matching,
+  and the exact list of tool steps (each with tool name + arguments)
+  that worked. The system will suggest this recipe to you next time a
+  similar goal comes up.
+  The system also AUTOMATICALLY matches saved recipes before each task
+  and injects them into the prompt as "MATCHED RECIPE" if found, so
+  you can reuse the proven steps instead of figuring it out again.
 
 Research (use this to LEARN something, not to perform an action):
 - web_research(query)  <- live, cited web search+answer via OpenRouter's web plugin.
@@ -273,14 +335,91 @@ using observations from previous tool results.
 
     After every browser interaction, verify that the page changed as expected before continuing.
 
-8d. For any task involving more than one site/purpose (comparing hotels,
-    researching while filling a form, etc.), open a separate tab per
-    purpose with a clear label (browser_open_tab(url, label=...)) rather
-    than reusing one tab and losing earlier context. Use browser_switch_tab
-    by that label to move between them. For a task spanning many turns,
-    call browser_set_task once at the start and browser_update_progress as
-    you complete milestones, so you (and browser_get_state) can recover
-    context if the task runs long.
+8d. MULTI-TAB WORKFLOWS. Whenever the user asks for something involving
+    MULTIPLE pages/sites/outcomes (planning a trip, comparing products,
+    researching + compiling a report, etc.), follow this pattern:
+
+    STEP 1: Define the plan (one call, very first turn):
+      browser_plan("Trip to Japan",
+        ["Search flights to Tokyo on Google Flights",
+         "Search hotels near Shinjuku on Booking.com",
+         "Browse things-to-do on Japan Guide",
+         "Create itinerary doc"])
+
+    STEP 2: Open one tab per purpose:
+      browser_open_tab("https://flights.google.com", label="Flights")
+      browser_open_tab("https://booking.com",       label="Hotels")
+      browser_open_tab("https://www.japan-guide.com", label="Activities")
+
+    STEP 3: Work each tab — switch, read, interact, extract data:
+      browser_switch_tab("Flights")
+      browser_read_page("Flights")          # understand the page
+      browser_type("From", "Delhi", tab="Flights")
+      ...                                   # fill, click, extract
+      browser_record_data("flight_price", "₹45,000 IndiGo", tab="Flights")
+      browser_note("cheapest_flight", "₹45,000 IndiGo 25-30 Aug")
+
+      browser_switch_tab("Hotels")
+      browser_read_page("Hotels")
+      browser_record_data("hotel_options", "Gracery 8k/night, ...", tab="Hotels")
+      browser_note("selected_hotel", "Hotel Gracery Shinjuku ~₹8k/night")
+
+      After EACH action, verify: browser_verify_navigation or
+      browser_verify_element before moving on.
+
+    STEP 4: Mark steps done:
+      browser_complete_step("Search flights to Tokyo on Google Flights")
+      browser_complete_step("Search hotels near Shinjuku on Booking.com")
+
+    STEP 5: Final summary:
+      browser_summarize_session()
+      # Returns all data, notes, page summaries, plan progress in one
+      # structured dict. Use the 'response' field to present the result.
+
+    HOW TO DECIDE: new tab vs same tab. Open a NEW tab when:
+    - Different website
+    - Different purpose even on same site (e.g. flights tab vs hotels tab)
+    - Any time you'd open a new browser tab yourself as a human
+    Reuse a tab when: back/forward navigation within the SAME workflow step.
+
+    ALWAYS label your tabs with short purpose names via the 'label' param.
+    browser_get_state() returns plan_progress so you can recover context
+
+8e. NON-TEXT INPUT HANDLING. Not every input is a text box. When you
+    encounter these, use the matching tool:
+    - <select> dropdown (native): browser_select_dropdown(description, option, tab)
+    - Custom JS dropdown (clickable div that opens a popup): click the
+      trigger first, then use browser_vision() to see the popup options,
+      then click the option you want.
+    - Radio buttons (multiple choice): the page_snapshot shows radio_groups
+      with all options and which is currently selected. Use
+      browser_click_radio("the label text", tab) to pick one.
+    - Checkboxes: browser_set_checkbox(description, True/False, tab)
+    - Date picker: click the date field, wait for the calendar popup,
+      then use browser_vision("What dates are shown on the calendar?")
+      to see which dates are available, then click the right date.
+    - Autocomplete dropdown (airport/city fields): type the text with
+      browser_type(..., press_enter=True). The press_enter accepts the
+      first suggestion so the field registers as filled.
+    If the DOM snapshot shows a field but `browser_type` doesn't work
+    (the text disappears or doesn't stick), the field is probably an
+    autocomplete/dropdown — retry with press_enter=True or use vision.
+    even if the conversation runs long or you lose state.
+
+    REAL EXAMPLE — product research ("find GPUs under ₹30,000"):
+      browser_plan("GPUs under ₹30,000",
+        ["Check Amazon",
+         "Check MDComputers",
+         "Check Vedant Computers",
+         "Compare prices"])
+      browser_open_tab("https://www.amazon.in/s?k=graphics+card+under+30000",
+                       label="Amazon GPUs")
+      browser_open_tab("https://mdcomputers.in/graphics-card",
+                       label="MDC GPUs")
+      browser_open_tab("https://www.vedantcomputers.com/graphics-card",
+                       label="Vedant GPUs")
+      # Work each tab, record_data each GPU found, note the best price,
+      # browser_complete_step each check, finally browser_summarize_session.
 
 9. You may chain tools across turns using observations. Previous tool results appear
    in the OBSERVATIONS section. Use paths and data from those results — do not invent values.
@@ -382,7 +521,18 @@ class Brain:
 
     def __init__(self, memory_manager: MemoryManager | None = None):
         self.memory_manager = memory_manager or MemoryManager()
-        self.client = OpenRouterClient()
+        provider = settings.llm_provider
+        if provider == "ollama":
+            self.client = OllamaClient()
+        elif provider == "gemini":
+            self.client = GeminiClient()
+        else:
+            self.client = OpenRouterClient()
+        logger.info(
+            "Brain using provider=%s model=%s client=%s",
+            provider, getattr(self.client, "model", "?"),
+            self.client.__class__.__name__,
+        )
 
     def _format_conversation(self, conversation: list) -> str:
         if not conversation:
@@ -431,6 +581,21 @@ class Brain:
             )
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _format_recipe(recipe: dict) -> str:
+        steps = recipe.get("steps", [])
+        if not steps:
+            return ""
+        lines = [
+            "MATCHED RECIPE (you previously solved a similar task):",
+            f"  Goal: {recipe.get('goal', '')}",
+        ]
+        for i, s in enumerate(steps, 1):
+            args = ", ".join(f"{k}={v!r}" for k, v in s.get("arguments", {}).items())
+            lines.append(f"  Step {i}: {s.get('tool', '?')}({args})")
+        lines.append("")
+        return "\n".join(lines)
+
     def _build_system_prompt(self) -> str:
         user_memory = self.memory_manager.get_user_memory()
         comm = user_memory.get("communication_style", {})
@@ -463,6 +628,7 @@ class Brain:
         goal: str | None = None,
         observations: list | None = None,
         intent_hint: str | None = None,
+        recipe: dict | None = None,
     ) -> str:
         history = self.memory_manager.get_conversation_history()
         if len(history) > 15:
@@ -489,6 +655,10 @@ class Brain:
 
         if memories_text:
             parts.append(memories_text)
+
+        if recipe:
+            recipe_text = self._format_recipe(recipe)
+            parts.append(recipe_text)
 
         parts.append(f"OBSERVATIONS:\n{observations_text}")
         parts.append(f"CURRENT CONVERSATION:\n{conversation_text}")
@@ -558,6 +728,7 @@ class Brain:
         goal: str | None = None,
         observations: list | None = None,
         intent_hint: str | None = None,
+        recipe: dict | None = None,
     ):
         try:
             decision = self._call(
@@ -567,10 +738,11 @@ class Brain:
                     goal=goal,
                     observations=observations,
                     intent_hint=intent_hint,
+                    recipe=recipe,
                 ),
             )
             return self._normalize_decision(decision)
-        except OpenRouterConfigurationError as error:
+        except (OpenRouterConfigurationError, GeminiConfigurationError, OllamaConfigurationError) as error:
             return {
                 "reasoning": str(error),
                 "response": str(error),
@@ -612,7 +784,7 @@ class Brain:
         try:
             decision = self._call(self._build_system_prompt(), prompt)
             return self._normalize_decision(decision)
-        except OpenRouterConfigurationError as error:
+        except (OpenRouterConfigurationError, GeminiConfigurationError, OllamaConfigurationError) as error:
             return {
                 "reasoning": str(error),
                 "response": str(error),

@@ -32,12 +32,40 @@ class BrowserAgent:
         return {"success": True, "tabs": self.tabs.list_tabs()}
 
     def open_tab(self, url: Optional[str] = None, label: Optional[str] = None) -> dict:
+        # Deduplicate: if a tab with the same label already exists, switch to it.
+        if label:
+            existing = self.tabs.find_by_label(label)
+            if existing:
+                logger.info("[Browser] Reusing existing tab '%s' (id=%s)", label, existing.id)
+                try:
+                    existing.page.bring_to_front()
+                except Exception:
+                    pass
+                self.tabs._current_id = existing.id
+                if url:
+                    return self.goto(url, tab=label)
+                return {"success": True, "tab": existing.snapshot(), "reused": True}
+
+        # Deduplicate: if a tab with the same URL already exists, switch to it.
+        if url:
+            existing = self.tabs.find_by_url(url)
+            if existing:
+                logger.info("[Browser] Reusing existing tab for URL '%s' (id=%s)", url, existing.id)
+                try:
+                    existing.page.bring_to_front()
+                except Exception:
+                    pass
+                self.tabs._current_id = existing.id
+                return {"success": True, "tab": existing.snapshot(), "reused": True}
+
         try:
+            logger.info("[Browser] Opening page '%s' label='%s'", url, label)
             tab = self.tabs.open_tab(url=url, label=label)
         except Exception as exc:
             return {"success": False, "error": str(exc)}
         if url:
             self.memory.record_navigation(tab.id, tab.page.url, tab.page.title())
+        logger.info("[Browser] Opened tab %s (%s)", tab.id, tab.label)
         return {"success": True, "tab": tab.snapshot()}
 
     def close_tab(self, tab: Optional[str] = None) -> dict:
@@ -82,8 +110,10 @@ class BrowserAgent:
         if result.get("success"):
             self.tabs.touch_label(resolved_tab)
             self.memory.record_navigation(resolved_tab.id, page.url, page.title())
+            logger.info("[Browser] Navigated to %s on tab %s", url, resolved_tab.id)
         else:
             self.memory.record_failure(resolved_tab.id, "goto", url, result.get("error", ""))
+            logger.warning("[Browser] Navigation to %s failed on tab %s: %s", url, resolved_tab.id, result.get("error", ""))
         return result
 
     def back(self, tab: Optional[str] = None) -> dict:
@@ -150,7 +180,10 @@ class BrowserAgent:
 
     def click(self, description: str, tab: Optional[str] = None) -> dict:
         resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(resolved_tab, page, "click", lambda: interaction.click(page, description), description)
+        result = self._do_interaction(resolved_tab, page, "click", lambda: interaction.click(page, description), description)
+        if result.get("success"):
+            logger.info("[Browser] Clicked '%s' on tab %s", description[:40], resolved_tab.id)
+        return result
 
     def double_click(self, description: str, tab: Optional[str] = None) -> dict:
         resolved_tab, page = self._page_for(tab)
@@ -164,12 +197,15 @@ class BrowserAgent:
         resolved_tab, page = self._page_for(tab)
         return self._do_interaction(resolved_tab, page, "hover", lambda: interaction.hover(page, description), description)
 
-    def type_text(self, description: str, text: str, clear_first: bool = True, tab: Optional[str] = None) -> dict:
+    def type_text(self, description: str, text: str, clear_first: bool = True, press_enter: bool = False, tab: Optional[str] = None) -> dict:
         resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(
+        result = self._do_interaction(
             resolved_tab, page, "type_text",
-            lambda: interaction.type_text(page, description, text, clear_first=clear_first), description,
+            lambda: interaction.type_text(page, description, text, clear_first=clear_first, press_enter=press_enter), description,
         )
+        if result.get("success") and press_enter:
+            logger.info("[Browser] Search completed (typed '%s' and pressed Enter)", text[:40])
+        return result
 
     def press_key(self, key: str, tab: Optional[str] = None) -> dict:
         _, page = self._page_for(tab)
@@ -275,19 +311,177 @@ class BrowserAgent:
         }
 
     # ------------------------------------------------------------------ #
+    # Page understanding (single-shot comprehensive snapshot)
+    # ------------------------------------------------------------------ #
+
+    def read_page(self, tab: str | None = None) -> dict:
+        """Return a comprehensive structured snapshot of the current page:
+        URL, title, page type, all interactive elements, headings, text,
+        forms, tables, viewport info. This is the preferred way to
+        understand a page before acting -- replaces needing 5 separate
+        calls to read_dom_summary/read_text/extract_links/etc."""
+        from .page_snapshot import snapshot as _snapshot
+
+        try:
+            resolved_tab, page = self._page_for(tab)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+        result = _snapshot(page)
+        if result.get("success"):
+            self.tabs.touch_label(resolved_tab)
+            self.memory.record_page_summary(resolved_tab.id, result)
+        return result
+
+    def read_page_light(self, tab: str | None = None) -> dict:
+        """Quick page check: URL, title, page type, buttons, links, inputs.
+        Lighter than full read_page for fast verification loops."""
+        from .page_snapshot import snapshot_light as _snapshot_light
+
+        try:
+            _, page = self._page_for(tab)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+        return _snapshot_light(page)
+
+    # ------------------------------------------------------------------ #
+    # Action verification
+    # ------------------------------------------------------------------ #
+
+    def verify_navigation(self, tab: str | None = None, before_url: str = "", before_title: str = "") -> dict:
+        """Check if the page changed (URL, title) since a previous state.
+        Call before an action to capture state, then after to verify."""
+        from .navigator import did_navigation_occur
+
+        try:
+            _, page = self._page_for(tab)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+        return did_navigation_occur(page, before_url, before_title)
+
+    def verify_element_appeared(self, description: str, tab: str | None = None, timeout: int = 5000) -> dict:
+        """Check if an element matching the description is now visible.
+        Returns confidence score if found."""
+        from .element_finder import resolve as _resolve
+
+        try:
+            _, page = self._page_for(tab)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+        try:
+            resolved = _resolve(page, description)
+            return {
+                "success": True,
+                "found": True,
+                "description": description,
+                "confidence": resolved.confidence,
+                "strategy": resolved.strategy,
+            }
+        except ElementNotFoundError as exc:
+            return {"success": True, "found": False, "description": description, "error": str(exc)}
+
+    # ------------------------------------------------------------------ #
+    # Vision fallback (page screenshot + vision model analysis)
+    # ------------------------------------------------------------------ #
+
+    def vision(self, question: str = "What do you see on this page?", tab: str | None = None) -> dict:
+        """Take a screenshot of the current page and ask the vision model
+        a question about it. Use this when the text-based snapshot doesn't
+        give you enough context — e.g. dropdown popups, date picker
+        calendars, captchas, or custom UI widgets that the DOM snapshot
+        can't capture."""
+        from tools.vision import Vision
+        try:
+            _, page = self._page_for(tab)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        try:
+            screenshot = page.screenshot()
+            from io import BytesIO
+            from PIL import Image
+            image = Image.open(BytesIO(screenshot))
+            answer = Vision().look(image, question)
+            return {"success": True, "answer": answer}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------ #
     # Memory / state
     # ------------------------------------------------------------------ #
 
     def get_state(self) -> dict:
         return self.memory.get_state(self.tabs.list_tabs())
 
-    def set_task(self, description: str) -> dict:
-        self.memory.set_task(description)
-        return {"success": True, "task": description}
+    def set_task(self, description: str, total_steps: int = 0) -> dict:
+        self.memory.set_task(description, total_steps=total_steps)
+        return {"success": True, "task": description, "total_steps": total_steps}
 
     def update_progress(self, note: str) -> dict:
         self.memory.add_progress(note)
         return {"success": True, "progress_notes": self.memory.progress_notes}
+
+    def complete_step(self, step_description: str) -> dict:
+        self.memory.complete_step(step_description)
+        return {"success": True, "step": self.memory.current_step, "completed_steps": self.memory.completed_steps}
+
+    def plan(self, goal: str, steps: list[str]) -> dict:
+        """Store an explicit ordered plan. Each step is a short string like
+        'Search flights to Tokyo', 'Compare hotel options', etc.
+        Also captures the goal in set_task."""
+        self.set_task(goal, total_steps=len(steps))
+        self.memory.set_plan(steps)
+        return {
+            "success": True,
+            "goal": goal,
+            "steps": steps,
+            "step_count": len(steps),
+            "plan_progress": [
+                {"step": s, "done": False} for s in steps
+            ],
+        }
+
+    def note(self, key: str, value: str) -> dict:
+        """Store a session-level note (cross-tab working memory).
+        Unlike record_data which is per-tab, notes are global to the
+        whole session — use for things like 'cheapest_flight=₹25,000'
+        that span multiple tabs."""
+        self.memory.set_note(key, value)
+        return {"success": True, "key": key, "value": value}
+
+    def summarize_session(self, format: str = "text") -> dict:
+        """Collect all extracted data, notes, page summaries, and
+        progress into a final structured digest. Use this when you've
+        completed a multi-tab workflow and need to present results."""
+        state = self.memory.get_state(self.tabs.list_tabs())
+        tabs = self.tabs.list_tabs()
+        summary = {
+            "goal": state.get("current_task", ""),
+            "plan": state.get("plan", []),
+            "plan_progress": state.get("plan_progress", []),
+            "completed_steps": state.get("completed_steps", []),
+            "notes": state.get("notes", {}),
+            "extracted_data": state.get("extracted_data", {}),
+            "page_summaries": state.get("page_summaries", {}),
+            "open_tabs": [
+                {"label": t.label, "url": t.url, "title": t.title}
+                for t in tabs
+            ],
+        }
+        return {"success": True, "format": format, "summary": summary}
+
+    def record_data(self, key: str, data, tab: str | None = None) -> dict:
+        """Store extracted data (prices, search results, etc.) in browser
+        memory so the agent can reference it later without re-reading."""
+        try:
+            resolved_tab = self.tabs.resolve(tab) if tab else self.tabs.get_current()
+            tab_id = resolved_tab.id
+        except Exception:
+            tab_id = "default"
+        self.memory.record_extracted_data(tab_id, key, data)
+        return {"success": True, "key": key, "tab_id": tab_id}
 
     # ------------------------------------------------------------------ #
     # Legacy-compatible helpers (used by tools/browser_tool.py shim so

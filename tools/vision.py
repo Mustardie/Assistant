@@ -2,11 +2,13 @@ import requests
 import base64
 from io import BytesIO
 
+from config.settings import settings
+
 
 class Vision:
     def __init__(self):
-        self.url = "http://localhost:11434/api/chat"
-        self.model = "qwen2.5vl:7b"
+        self.url = settings.ollama_url
+        self.model = settings.ollama_model
         self._session = None
 
     def _get_session(self):
