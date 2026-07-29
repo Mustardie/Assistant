@@ -940,18 +940,26 @@ def _resolve_tool_arguments(arguments):
 
 def run_tool(tool_name, arguments):
     if tool_name not in TOOLS:
+        logger.error("[Executor] Unknown tool requested: %s", tool_name)
         return False, f"Unknown tool: {tool_name}"
 
     try:
         resolved_arguments = _resolve_tool_arguments(arguments)
     except Exception as e:
+        logger.error("[Executor] Failed to resolve arguments for %s: %s", tool_name, e)
         return False, str(e)
+
+    logger.info("[Executor] Executing %s(%s)", tool_name, resolved_arguments or "")
 
     try:
         function = TOOLS[tool_name]
 
         if resolved_arguments:
             if not isinstance(resolved_arguments, dict):
+                logger.error(
+                    "[Executor] %s received non-dict arguments (%s) -- bad JSON from the LLM",
+                    tool_name, type(resolved_arguments).__name__,
+                )
                 return False, (
                     f"Tool '{tool_name}' was called with {type(resolved_arguments).__name__} "
                     f"arguments (expected dict). The LLM generated bad JSON for this step."
@@ -961,11 +969,24 @@ def run_tool(tool_name, arguments):
             result = function()
 
         tool_context[f"{tool_name}_result"] = result
+
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.warning("[Executor] %s reported failure: %s", tool_name, result.get("error", result))
+        else:
+            logger.info("[Executor] Tool completed successfully: %s", tool_name)
+
         return True, result
 
     except RecommendationConfigurationError:
         raise
     except Exception as e:
+        # Previously this exception was swallowed into a bare string with no
+        # trace of where/why it happened -- any bug inside a tool (browser
+        # automation included) would silently look like an ordinary "tool
+        # returned an error" to the agent loop, with nothing in the logs to
+        # debug it from. Log the full traceback, then still return the same
+        # (False, str(e)) contract callers already depend on.
+        logger.exception("[Executor] %s raised an unhandled exception", tool_name)
         return False, str(e)
 
 

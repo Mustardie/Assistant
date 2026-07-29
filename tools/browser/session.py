@@ -86,7 +86,7 @@ class BrowserSession:
         logger.info("Edge fully killed, profile locks cleared")
 
     def _launch_edge(self) -> None:
-        logger.info("Launching Edge with remote debugging on port %s", self.debug_port)
+        logger.info("[Browser] Launching browser (Edge, remote debugging on port %s)", self.debug_port)
         self._kill_all_edge()
         subprocess.Popen([
             self.edge_path,
@@ -161,4 +161,5 @@ class BrowserSession:
         self._launch_edge()
         self._connect()
         self._context_validated_at = time.time()
+        logger.info("[Browser] Browser session ready")
         return self.context

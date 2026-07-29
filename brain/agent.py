@@ -55,6 +55,12 @@ class Agent:
         self._pending_user_goal = None
         self._last_file_action = None
         self._voice_callback = None
+        # Set by AgentLoop.run() whenever it pauses mid-task (a genuine
+        # clarifying question, a recovery dead-end, or the iteration budget
+        # running out) instead of truly finishing. When set, the NEXT user
+        # message resumes this same goal instead of being treated as an
+        # unrelated fresh request -- see _handle_pending_agent_task.
+        self._pending_agent_task = None
         self._agent_loop = AgentLoop(
             self.brain,
             speak=self._speak,
@@ -575,5 +581,18 @@ class Agent:
             safe_print(direct_result)
             return
 
+        pending = self._pending_agent_task
+        self._pending_agent_task = None  # clear eagerly; run() will re-set it if still pending
+
+        if pending:
+            intent_hint = self._build_intent_hint(pending["goal"])
+            self._pending_agent_task = self._agent_loop.run(
+                user,
+                intent_hint=intent_hint,
+                resume_goal=pending["goal"],
+                resume_observations=pending["observations"],
+            )
+            return
+
         intent_hint = self._build_intent_hint(user)
-        self._agent_loop.run(user, intent_hint=intent_hint)
+        self._pending_agent_task = self._agent_loop.run(user, intent_hint=intent_hint)

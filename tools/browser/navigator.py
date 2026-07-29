@@ -10,11 +10,14 @@ logger = logging.getLogger(__name__)
 def goto(page, url: str, timeout: int = 20000) -> dict:
     if "://" not in url and not url.startswith("about:") and not url.startswith("data:"):
         url = "https://" + url
+    logger.info("[Browser] Navigating to %s", url)
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError as exc:
+        logger.warning("[Browser] Navigation to %s timed out: %s", url, exc)
         return {"success": False, "url": url, "error": f"Timed out loading {url}: {exc}"}
     wait_for_stable(page, timeout=5000)
+    logger.info("[Browser] Navigation complete: %s", page.url)
     return {"success": True, "url": page.url, "title": page.title()}
 
 
