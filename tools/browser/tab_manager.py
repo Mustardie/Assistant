@@ -90,6 +90,26 @@ class TabManager:
     # Public API
     # ------------------------------------------------------------------ #
 
+    def find_by_label(self, label: str) -> Optional[Tab]:
+        """Return the first tab whose label matches, or None."""
+        lowered = label.strip().lower()
+        for tab in self._tabs.values():
+            if tab.label.strip().lower() == lowered:
+                return tab
+        return None
+
+    def find_by_url(self, url: str) -> Optional[Tab]:
+        """Return the first tab whose URL contains the given URL, or None."""
+        clean = url.strip().lower().rstrip("/")
+        for tab in self._tabs.values():
+            try:
+                tab_url = tab.page.url.lower().rstrip("/")
+            except Exception:
+                continue
+            if clean == tab_url or clean in tab_url or tab_url in clean:
+                return tab
+        return None
+
     def list_tabs(self) -> list:
         self._ensure_ready()
         return [
@@ -119,12 +139,21 @@ class TabManager:
             if tab.label.strip().lower() == lowered:
                 return tab
 
-        matches = [tab for tab in self._tabs.values() if lowered in tab.label.lower() or lowered in (tab.page.url or "").lower()]
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            labels = ", ".join(f"'{m.label}'" for m in matches)
-            raise TabNotFoundError(f"'{tab_ref}' matches multiple open tabs: {labels}. Be more specific.")
+        first = None
+        count = 0
+        labels = []
+        for tab in self._tabs.values():
+            if lowered in tab.label.lower() or lowered in (tab.page.url or "").lower():
+                if count == 0:
+                    first = tab
+                count += 1
+                labels.append(tab.label)
+                if count > 1:
+                    break
+        if count == 1:
+            return first
+        if count > 1:
+            raise TabNotFoundError(f"'{tab_ref}' matches multiple open tabs: {', '.join(labels)}. Be more specific.")
 
         open_labels = ", ".join(f"'{t.label}'" for t in self._tabs.values())
         raise TabNotFoundError(f"No open tab matches '{tab_ref}'. Currently open: {open_labels}")

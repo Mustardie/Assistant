@@ -7,8 +7,16 @@ from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
-EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-EDGE_PROFILE = r"F:\Assistant\EdgeProfile"
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+_EDGE_CANDIDATES = [
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+]
+EDGE_PATH = next((p for p in _EDGE_CANDIDATES if Path(p).exists()), _EDGE_CANDIDATES[0])
+EDGE_PROFILE = str(_PROJECT_ROOT / "EdgeProfile")
 DEBUG_PORT = 9222
 
 
@@ -19,8 +27,8 @@ class BrowserSession:
     reimplementing connection/launch logic like the old monolithic
     Browser class did."""
 
-    _CONTEXT_VALIDITY_CACHE_SECONDS = 2.0
-    _LAUNCH_WAIT_LOOPS = 40
+    _CONTEXT_VALIDITY_CACHE_SECONDS = 10.0
+    _LAUNCH_WAIT_LOOPS = 120
     _LAUNCH_WAIT_INTERVAL = 0.25
 
     def __init__(self, edge_path: str = EDGE_PATH, edge_profile: str = EDGE_PROFILE, debug_port: int = DEBUG_PORT):
@@ -36,26 +44,81 @@ class BrowserSession:
     def _debug_running(self) -> bool:
         s = socket.socket()
         try:
-            s.settimeout(0.5)
+            s.settimeout(0.2)
             s.connect(("127.0.0.1", self.debug_port))
             s.close()
             return True
         except OSError:
             return False
 
+    def _kill_all_edge(self) -> None:
+        """Kill EVERY msedge* process via PowerShell and wait until none remain.
+        A pre-running Edge ignores --remote-debugging-port on relaunch, so we
+        must fully nuke all instances before starting fresh."""
+        import subprocess as _sp
+        import pathlib as _pl
+
+        # 1. Force-kill every msedge-related process via PowerShell
+        ps_cmd = 'Get-Process msedge* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue'
+        _sp.run(['powershell', '-Command', ps_cmd], capture_output=True, timeout=15)
+        _sp.run(['powershell', '-Command',
+                 'Get-Process edge_launcher,edge_updater,msedgewebview2* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue'],
+                capture_output=True, timeout=10)
+
+        # 2. Wait until ALL msedge.exe entries are gone from tasklist
+        for _ in range(20):
+            result = _sp.run(['tasklist', '/FI', 'IMAGENAME eq msedge.exe'],
+                             capture_output=True, text=True, timeout=5)
+            if 'msedge.exe' not in result.stdout:
+                break
+            time.sleep(0.25)
+
+        # 3. Clear profile lock files
+        profile = _pl.Path(self.edge_profile)
+        if profile.is_dir():
+            for lock_name in ('SingletonLock', 'SingletonSocket', 'SingletonCookie',
+                              'Last Session', 'Last Tabs', 'Last Active Tabs'):
+                try:
+                    (profile / lock_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        logger.info("Edge fully killed, profile locks cleared")
+
     def _launch_edge(self) -> None:
         logger.info("Launching Edge with remote debugging on port %s", self.debug_port)
+        self._kill_all_edge()
         subprocess.Popen([
             self.edge_path,
             f"--remote-debugging-port={self.debug_port}",
             "--remote-allow-origins=*",
             f"--user-data-dir={self.edge_profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-extensions",
+            "--disable-gpu",
+            "--disable-features=TranslateUI,msHub,AutofillServerCommunication",
         ])
 
         for _ in range(self._LAUNCH_WAIT_LOOPS):
             if self._debug_running():
                 return
             time.sleep(self._LAUNCH_WAIT_INTERVAL)
+
+        # Diagnostic: capture what's on port 9222 and running Edge processes
+        try:
+            import subprocess as _sp
+            netstat_out = _sp.check_output(['netstat', '-ano', '-p', 'tcp'],
+                                           timeout=5, text=True, stderr=_sp.STDOUT)
+            port_lines = [l.strip() for l in netstat_out.splitlines() if '9222' in l]
+            logger.error("Launch failed. Netstat entries for port 9222: %s", port_lines)
+            tasklist_out = _sp.check_output(['tasklist', '/FI', 'IMAGENAME eq msedge.exe', '/FO', 'CSV'],
+                                            timeout=5, text=True, stderr=_sp.STDOUT)
+            logger.error("Running msedge processes:\n%s", tasklist_out.strip())
+        except Exception as diag_err:
+            logger.error("Diagnostics also failed: %s", diag_err)
 
         raise RuntimeError("Edge debugging port never started.")
 
@@ -87,9 +150,15 @@ class BrowserSession:
         except Exception:
             pass
 
-        if not self._debug_running():
-            self._launch_edge()
+        if self._debug_running():
+            if self._browser and self._browser.is_connected():
+                self._context_validated_at = time.time()
+                return self.context
+            logger.info("Port %s is occupied but browser not connected — killing stale process", self.debug_port)
+            self._kill_all_edge()
+            time.sleep(0.5)
 
+        self._launch_edge()
         self._connect()
         self._context_validated_at = time.time()
         return self.context

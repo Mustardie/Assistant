@@ -50,14 +50,21 @@ def hover(page, description: str, timeout: int = 10000) -> dict:
     return _run(page, description, None, "hover", lambda loc: loc.hover(timeout=timeout))
 
 
-def type_text(page, description: str, text: str, clear_first: bool = True, timeout: int = 10000) -> dict:
+def type_text(page, description: str, text: str, clear_first: bool = True, press_enter: bool = False, timeout: int = 10000) -> dict:
+    """Type text into a field. If press_enter=True, presses Enter after
+    filling — use this for autocomplete/search fields where a dropdown
+    suggestion must be accepted (e.g. Google Flights city picker)."""
     def do(loc):
         if clear_first:
             loc.fill(text, timeout=timeout)
         else:
             loc.type(text, timeout=timeout)
+        if press_enter:
+            page.keyboard.press("Enter")
     result = _run(page, description, None, "type_text", do)
     result["text_length"] = len(text)
+    if press_enter:
+        result["pressed_enter"] = True
     return result
 
 

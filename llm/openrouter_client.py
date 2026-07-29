@@ -14,6 +14,8 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _MAX_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = 1.5
+_REQUEST_TIMEOUT = 45
+_TOTAL_DEADLINE = 90
 
 
 class OpenRouterConfigurationError(Exception):
@@ -84,7 +86,14 @@ class OpenRouterClient:
                 raise OpenRouterRequestError(f"Could not reach OpenRouter: {exc}") from exc
 
             if response.status_code == 200:
-                return response.json()
+                try:
+                    return response.json()
+                except json.JSONDecodeError:
+                    last_error_text = "OpenRouter returned HTTP 200 with empty body (free tier timeout)"
+                    if attempt < _MAX_RETRIES:
+                        time.sleep(_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                        continue
+                    raise OpenRouterRequestError(last_error_text)
 
             reason = self._extract_error_message(response)
             last_error_text = f"HTTP {response.status_code}: {reason}"
@@ -126,11 +135,10 @@ class OpenRouterClient:
             raise OpenRouterRequestError(f"OpenRouter returned no choices: {data}")
         return choices[0].get("message") or {}
 
-    def chat_json(self, system_prompt: str, user_prompt: str, timeout: int = 120) -> dict:
+    def chat_json(self, system_prompt: str, user_prompt: str, timeout: int = _REQUEST_TIMEOUT) -> dict:
         """Send one system+user turn, request JSON output, and parse it.
-        Raises on any failure -- callers are expected to catch and degrade
-        gracefully, same as the rest of this codebase does around external
-        calls."""
+        Retries on empty/invalid response but gives up after TOTAL_DEADLINE
+        seconds total so the agent loop never hangs for minutes."""
         self._require_key()
 
         body = {
@@ -143,12 +151,30 @@ class OpenRouterClient:
             "stream": False,
         }
 
-        data = self._post(body, timeout)
-        text = self._extract_message(data).get("content") or ""
-        cleaned = self._strip_code_fences(text)
-        return json.loads(cleaned)
+        started = time.time()
+        for attempt in range(3):
+            if time.time() - started > _TOTAL_DEADLINE:
+                raise OpenRouterRequestError(f"LLM call exceeded {_TOTAL_DEADLINE}s deadline")
+            remaining = max(10, int(_TOTAL_DEADLINE - (time.time() - started)))
+            data = self._post(body, min(timeout, remaining))
+            text = self._extract_message(data).get("content") or ""
+            cleaned = self._strip_code_fences(text)
+            if cleaned.strip():
+                try:
+                    return json.loads(cleaned)
+                except json.JSONDecodeError:
+                    pass
+            if attempt < 2:
+                logger.warning("Empty/invalid LLM response, retrying (%s/2)", attempt + 1)
+                time.sleep(1)
+        raise OpenRouterRequestError(
+            "LLM keeps returning empty responses. Your model is "
+            f"'{self.model}' which is a free-tier model — free OpenRouter "
+            "models are often overloaded. Try a paid model like "
+            "'openai/gpt-4o-mini' or 'anthropic/claude-3-haiku' in your .env file."
+        )
 
-    def chat_text(self, system_prompt: str, user_prompt: str, timeout: int = 120) -> str:
+    def chat_text(self, system_prompt: str, user_prompt: str, timeout: int = _REQUEST_TIMEOUT) -> str:
         """Plain-text variant (no JSON forcing)."""
         self._require_key()
 
@@ -164,7 +190,7 @@ class OpenRouterClient:
         data = self._post(body, timeout)
         return self._extract_message(data).get("content") or ""
 
-    def chat_with_search(self, system_prompt: str, user_prompt: str, timeout: int = 120):
+    def chat_with_search(self, system_prompt: str, user_prompt: str, timeout: int = _REQUEST_TIMEOUT):
         """Enables OpenRouter's built-in web-search plugin so the model can
         ground its answer in live results. Returns (answer_text, sources),
         where sources is a list of {"title": ..., "uri": ...} pulled from

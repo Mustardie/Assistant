@@ -1,3 +1,4 @@
+import logging
 import threading
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from brain.brain import Brain
 from memory.memory_manager import MemoryManager
 from recommendation.errors import RecommendationConfigurationError
 from tools.tool_registry import file_manager_service, run_tool
+
+logger = logging.getLogger(__name__)
 
 
 def safe_print(value):
@@ -51,6 +54,7 @@ class Agent:
         self._pending_intent = None
         self._pending_user_goal = None
         self._last_file_action = None
+        self._voice_callback = None
         self._agent_loop = AgentLoop(
             self.brain,
             speak=self._speak,
@@ -60,6 +64,11 @@ class Agent:
             fallback=self._run_intent_fallback,
         )
         self._run_lock = threading.Lock()
+
+    def set_voice_callback(self, callback):
+        """Register a function to be called immediately when Nova speaks,
+        so TTS can start without waiting for agent.run() to finish."""
+        self._voice_callback = callback
 
     def _is_youtube_request(self, user: str) -> bool:
         normalized = user.lower().strip()
@@ -219,6 +228,13 @@ class Agent:
             safe_message = str(message).encode("utf-8", errors="replace").decode("utf-8")
             self.assistant.speak(safe_message)
         self.memory_manager.add_message("assistant", message)
+        # Fire voice callback immediately so TTS starts without waiting
+        # for agent.run() to finish.
+        if self._voice_callback:
+            try:
+                self._voice_callback(message)
+            except Exception:
+                logger.exception("Voice callback failed in _speak")
 
     def _record_tool_result(self, tool_name: str, result) -> None:
         self.memory_manager.add_message(

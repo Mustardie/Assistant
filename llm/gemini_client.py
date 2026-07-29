@@ -141,6 +141,15 @@ class GeminiClient:
         )
 
     @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        import re
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        return cleaned
+
+    @staticmethod
     def _extract_error_message(response: requests.Response) -> str:
         try:
             payload = response.json()
