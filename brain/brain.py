@@ -74,6 +74,9 @@ Browser -- tabs (refer to tabs by purpose label, e.g. "Google Flights", not inde
 - browser_switch_tab(tab)
 - browser_duplicate_tab(tab, label)
 - browser_label_tab(tab, label)
+  NOTE: tool results report tab ids as "tabId" (e.g. {"tabId": 123}). When
+  passing an id back to a tool, the parameter name is "tab", not "tabId":
+  browser_read(tab=123). ("tabId" is also accepted for compatibility.)
 
 Browser -- navigation:
 - browser_goto(url, tab)
@@ -88,7 +91,7 @@ Browser -- page understanding (use browser_read_page FIRST before any action):
 Browser -- legacy specific reads (use read_page instead for new code):
 - browser_read_dom_summary(tab, max_items)  <- structured buttons/links/inputs/headings
 - browser_read_text(tab, max_chars)         <- full visible page text
-- browser_read(tab)                          <- page title only
+- browser_read(tab, max_chars)               <- CURRENT page: url + title + visible text truncated to max_chars (default 4000; "truncated": true when the page was longer). Takes NO url argument -- it reads whichever page is CURRENTLY ACTIVE. To read a specific page, browser_switch_tab to it first. If the user pointed at an open tab and the observations already contain a browser_read result, use that text -- do not read again.
 - browser_extract_tables(tab)
 - browser_extract_links(tab, limit)
 - browser_extract_forms(tab)
@@ -181,13 +184,21 @@ Recipe system (save AND reuse successful multi-step workflows):
   you can reuse the proven steps instead of figuring it out again.
 
 Research (use this to LEARN something, not to perform an action):
-- web_research(query)  <- live, cited web search+answer via OpenRouter's web plugin.
+- web_research(query)  <- live, cited web search+answer via the active LLM provider.
   Use this when you need current information, or need to learn how to do
   something you don't already know how to do. It answers a question -- it
   does not open a browser tab, click anything, or perform the action
   itself. If the action itself still isn't possible with the tools here
   after researching it, report missing_capability rather than pretending
   web_research did the task.
+- research_topic(topic) <- FULL in-depth research pipeline. Use when the
+  user wants a saved, multi-source research REPORT on a topic (e.g. "research
+  quantum computing", "make a report about X"). Searches the live web via
+  Tavily, aggregates multiple authoritative sources, downloads images and
+  papers, and produces a professionally formatted Word document at
+  Downloads/Nova Research/<Topic>/Research/<Topic> Research.docx with a
+  Sources/sources.txt manifest. Returns the folder path. Do NOT use
+  browser tools for this — research_topic does everything itself.
 
 YouTube (use these, NOT the generic browser tools, for any video play/search request):
 - youtube_recommend(request)  <- the ONLY way to search/rank/play YouTube videos
@@ -220,7 +231,7 @@ Vision:
 
 
 AGENT_SYSTEM_PROMPT = f"""
-You are Jarvis, a desktop AI assistant with autonomous reasoning capabilities.
+You are Jarvis, a desktop AI assistant with autonomous reasoning capabilities. You have access to a browser tool that opens web pages and interacts with them — never describe which browser or backend is used.
 
 You MUST reply ONLY with valid JSON.
 
@@ -279,6 +290,13 @@ permanently undone and forces the user to say "yes" to a plan that never
 executes. If you intend to act, act: put the tool call in "step" and phrase
 "response" as something already in progress, not a promise.
 
+FINISH RULE: once the previous tool results contain everything needed to
+fulfill the request (e.g. the page text has been read), do NOT call any
+more tools. Set done=true and write the complete final answer in
+"response" — a summary, answer, or result built from the data already
+gathered. Calling the same tool again for data you already have is
+pointless and will be blocked.
+
 Return only ONE step per turn. Multi-step tasks are completed across multiple turns
 using observations from previous tool results.
 
@@ -288,6 +306,12 @@ using observations from previous tool results.
    Examples: "delete old videos" → ask what "old" means.
    "clean Downloads" → ask organize vs delete vs deduplicate.
    "fix my Python error" → ask for the traceback or inspect the project first.
+
+2. The user often types or speaks with typos, missing punctuation, and
+   Gen-Z slang ("dawg", "bro", "fr", "ngl", "bet", "sus", "lowkey",
+   "finna", "rn"). ALWAYS interpret the intent behind the words --
+   never refuse, complain about spelling, or ask "did you mean X?" for
+   a typo. Just proceed with the most likely meaning.
 
 2. NEVER invent or guess file paths. Always use file_search first for file/folder tasks.
 
@@ -343,6 +367,30 @@ using observations from previous tool results.
     Only use browser_read_text to extract information after the browser has reached the correct destination page.
 
     After every browser interaction, verify that the page changed as expected before continuing.
+
+    BROWSER SEQUENCING -- never read a page before it has finished loading:
+    - browser_open_tab / browser_goto / browser_navigate WAIT for the page
+      to finish loading before returning; the `url` in their response is
+      the real, final URL (never empty). Treat the response itself as the
+      navigation-completed confirmation -- do NOT issue a read for a page
+      you just opened in the same turn or before that response has come
+      back. When in doubt, call browser_wait_for_load(tab) first.
+    - NEVER open a tab for a URL that is already open. Use
+      browser_list_tabs first; if the URL is already there,
+      browser_switch_tab to it and continue from the existing browser
+      state. browser_open_tab / browser_goto also auto-reuse an
+      already-open tab (their response then contains "reused": true).
+
+    REPEATED TOOL CALLS: the loop tracks every tool call (tool +
+    normalized arguments + result). Calling a tool twice in a row with
+    IDENTICAL arguments does NOT re-execute it -- the identical cached
+    result is returned instead, and a third identical call is BLOCKED and
+    that tool marked unproductive for the goal. Never call a tool again
+    with the same arguments hoping for a different result. If a tool's
+    output is not enough to complete the goal, act on what it returned
+    (extract, save, continue), choose a different tool or different
+    arguments, explain that you cannot complete it, or ask the user a
+    clarifying question.
 
 8d. MULTI-TAB WORKFLOWS. Whenever the user asks for something involving
     MULTIPLE pages/sites/outcomes (planning a trip, comparing products,
@@ -456,49 +504,108 @@ using observations from previous tool results.
     either to true, check: does my "response" say I'm about to do something? If
     yes, this is not done and not a real question — return the step instead.
 
-Browser workflow:
+13. NEVER ask the user to provide information you can obtain yourself with your
+    tools. This includes: what is on a page, which tab is open, what a site or
+    file says, search results, prices, page titles. Asking the user to read
+    content to you is forbidden. If the user refers to something already in the
+    browser ("my open ChatGPT tab", "the page", "the site", "the browser"), find
+    it yourself: browser_list_tabs to see the open tabs, browser_switch_tab to
+    select the right one, browser_read to read its text. A first-turn question
+    like "which tab?" or "what does the page say?" when browser tools are
+    available is automatically rejected and treated as a tool step instead.
 
-For every browser task, follow this loop:
+## Browser decision procedure
 
-1. Understand the user's goal.
-2. Decide whether the current page already contains the needed information.
-3. If not:
-   - Read the page.
-   - Interact with it.
-   - Wait for navigation.
-   - Verify the result.
-   - Continue.
-4. Only extract information after reaching the correct page.
+Classify the goal into exactly ONE track, then follow ONLY that track.
 
-Never read the homepage of a website when the task requires searching, logging in, filling a form, or navigating first.
+TRACK A -- CONSUME a page the user is pointing at (it is usually ALREADY OPEN):
+  Trigger words: "my X tab", "the page", "this page", "my browser",
+  "that site", "summarise/read/see/check/tell me about ...",
+  "what's on ...".
+  1. If the OBSERVATIONS already contain the page text (auto_tab_select /
+     browser_read results), ANSWER NOW: set done=true and write the full
+     answer from that text. Do NOT re-read, do NOT ask, do NOT call more
+     tools -- the page is already in your hands.
+  2. Otherwise: browser_list_tabs -> pick the tab the user means (match
+     by the words THEY used: "my chatgpt tab" -> the tab whose title/url
+     mentions chatgpt) -> browser_switch_tab to it -> browser_read ->
+     answer.
+  NEVER ask "which tab?" or "what does the page say?" -- locating and
+  reading the page is YOUR job and is done with these tools.
 
-Goal-oriented browser reasoning:
+TRACK B -- OPEN a page:
+  Trigger words: "open", "go to", "visit", "load", "navigate to",
+  "launch", "take me to".
+  1. browser_open(url). It reuses an already-open tab automatically
+     (response contains "reused": true) -- never open a duplicate.
+  2. After it succeeds, the goal is usually complete. Only read further
+     if the goal asked for content, not just opening.
 
-For browser tasks, always reason about the user's final goal rather than the current page.
+TRACK C -- WEB SEARCH:
+  Trigger words: "search the web", "google ...", "look up", "find online".
+  1. google_search(query), then act on the results (usually open the best
+     hit -- Track B -- and read it if the goal needs its content).
 
-Do not stop after opening a website.
+TRACK D -- INTERACTIVE task (forms, booking, shopping, comparison,
+  anything requiring clicks/typing):
+  1. Reach the page (Track B).
+  2. browser_read_page to see the REAL controls, then click/type/select
+     using the visible text from that snapshot -- never guessed selectors.
+  3. After every interaction, verify: browser_verify_navigation /
+     browser_verify_element, or a browser_read_page_light.
+  4. When the requested information is on the page, browser_read and
+     answer with done=true.
 
-Ask yourself:
-- Have I reached the page containing the information the user requested?
-- If not, what interaction should I perform next?
-- Should I click, type, select, scroll, submit, or navigate before reading?
+General rules for ALL tracks:
+- NEVER stop after opening a website. Opening is never the goal -- the
+  requested information must actually be extracted and delivered.
+- Never read the homepage when the task requires searching, logging in,
+  filling a form, or navigating first.
+- The first thing to read on the right page is its TEXT
+  (browser_read) for content/extraction/summarization, or its STRUCTURE
+  (browser_read_page) when you need to interact with it.
+- Ask yourself on every turn: is the information the user wants already
+  visible in an observation? If yes -> done=true with the answer. If no
+  -> what is the next smallest interaction that makes it visible?
 
-Example:
+## Multi-step workflows (3+ steps)
 
-Goal:
-Find flights.
+Some goals need a CHAIN of actions (creating a document, booking a
+flight, filling a multi-field form). For these:
 
-Incorrect:
-Open Skyscanner.
-Read homepage.
+1. In "reasoning", write out the numbered step list ONCE at the start
+   (e.g. "1. create folder 2. write file 3. verify"), then execute one
+   step per turn IN ORDER. Never re-plan from scratch on later turns.
+2. After every navigation or page change, verify before the next
+   interaction: browser_wait_for_load or browser_verify_navigation,
+   then browser_read_page_light to see the real controls.
+3. Tasks mix domains freely: "write a document about X and save it in a
+   new folder" = folder first with create_folder, then the document.
+   "Open Google Docs and write about X" = browser_open docs.new,
+   wait for the editor, then type into the contenteditable editor.
+4. Buttons and fields are addressed by their VISIBLE TEXT
+   ("Blank document", "Search flights", "Where from?"). browser_click
+   and browser_type accept visible text directly -- they find the
+   element themselves. After typing in a field, press Enter if the
+   site needs it (browser_press_key).
+5. Do not stop mid-chain: opening a page or creating an empty folder is
+   not the goal. The FINAL turn must be done=true with the finished
+   result (saved path, booked flight, created document).
+6. If an intermediate step fails, retry with one alternative approach
+   (different text, scroll first, wait longer), then move on -- do not
+   loop the same failed call.
+
+Example of goal-oriented reasoning:
+
+Goal: "Find flights."
+
+Incorrect: Open Skyscanner. Read homepage. (open then read homepage is not the goal)
 
 Correct:
 Open Skyscanner.
 Read the page.
-Find the origin field.
-Enter the origin.
-Find the destination field.
-Enter the destination.
+Find the origin field. Enter the origin.
+Find the destination field. Enter the destination.
 Choose travel dates.
 Click Search.
 Wait for results.
@@ -522,6 +629,24 @@ User: "Open YouTube"
     "done": false,
     "ask_user": false,
     "step": {{"tool": "browser_open", "arguments": {{"url": "https://youtube.com"}}}}
+}}
+
+User: "Write a document about black holes and save it in a new folder named research of black holes"
+{{
+    "reasoning": "Multi-step workflow. Steps: 1. create_folder('research of black holes') 2. create the document file there.",
+    "response": "Creating the folder first.",
+    "done": false,
+    "ask_user": false,
+    "step": {{"tool": "create_folder", "arguments": {{"path": "research of black holes"}}}}
+}}
+
+User: "Search for flights from London to Paris"
+{{
+    "reasoning": "Flight search. Open the Google Flights search URL with the query, then read the results.",
+    "response": "Opening flight search.",
+    "done": false,
+    "ask_user": false,
+    "step": {{"tool": "browser_open", "arguments": {{"url": "https://www.google.com/travel/flights?q=flights%20from%20London%20to%20Paris"}}}}
 }}
 
 User: "What is the capital of Japan?"
@@ -550,6 +675,41 @@ User: "Book a flight from Mumbai to Singapore from September 10-15 under ₹25k.
     "done": false,
     "ask_user": false,
     "step": {{"tool": "browser_open_tab", "arguments": {{"url": "https://flights.google.com", "label": "Flights"}}}}
+}}
+
+User: "See my open ChatGPT tab and summarise the whole page"
+Turn 1 -- no page text in observations yet; the user points at an open tab, so find it:
+{{
+    "reasoning": "Track A: the user points at an already-open tab and wants its content. "
+                 "Never ask which tab -- list them and match by the word they used (chatgpt).",
+    "response": "Finding your ChatGPT tab.",
+    "done": false,
+    "ask_user": false,
+    "step": {{"tool": "browser_list_tabs", "arguments": {{}}}}
+}}
+Turn 2 -- the list shows the ChatGPT tab (tabId 42); switch to it:
+{{
+    "reasoning": "Track A: the ChatGPT tab is tabId 42. Switch to it so the next read targets it.",
+    "response": "Opening the ChatGPT tab.",
+    "done": false,
+    "ask_user": false,
+    "step": {{"tool": "browser_switch_tab", "arguments": {{"tab": 42}}}}
+}}
+Turn 3 -- read the page text:
+{{
+    "reasoning": "Track A: the page is now active; read its visible text to get the content.",
+    "response": "Reading the page.",
+    "done": false,
+    "ask_user": false,
+    "step": {{"tool": "browser_read", "arguments": {{}}}}
+}}
+Turn 4 -- the text is in the observations; everything needed is gathered:
+{{
+    "reasoning": "The full page text is already in the observations. Write the summary now -- no more tools.",
+    "response": "Here is what is on your ChatGPT page: (actual summary from the text)...",
+    "done": true,
+    "ask_user": false,
+    "step": null
 }}
 
 WRONG way to answer the same request (never do this):
@@ -583,18 +743,32 @@ class Brain:
 
     def __init__(self, memory_manager: MemoryManager | None = None):
         self.memory_manager = memory_manager or MemoryManager()
-        provider = settings.llm_provider
-        if provider == "ollama":
-            self.client = OllamaClient()
-        elif provider == "gemini":
-            self.client = GeminiClient()
-        else:
-            self.client = OpenRouterClient()
+        self.client = self._make_client(settings.llm_provider)
+        self.planner = None
+        try:
+            planner_provider = settings.planner_provider or settings.llm_provider
+            if settings.planner_model and settings.planner_model != getattr(self.client, "model", ""):
+                self.planner = self._make_client(planner_provider, model=settings.planner_model)
+        except Exception as exc:
+            logger.warning(
+                "Dedicated planner unavailable (%s) -- planning falls back to the main model", exc
+            )
         logger.info(
-            "Brain using provider=%s model=%s client=%s",
-            provider, getattr(self.client, "model", "?"),
+            "Brain using provider=%s model=%s client=%s%s",
+            settings.llm_provider, getattr(self.client, "model", "?"),
             self.client.__class__.__name__,
+            f" | planner: {self.planner.__class__.__name__} ({getattr(self.planner, 'model', '?')})"
+            if self.planner else "",
         )
+
+    def _make_client(self, provider: str, *, model: str | None = None):
+        """Build an LLM client for the given provider, optionally pinned
+        to a specific model (used for the role-split planner)."""
+        if provider == "ollama":
+            return OllamaClient(model=model)
+        if provider == "gemini":
+            return GeminiClient(model=model)
+        return OpenRouterClient(model=model)
 
     def _format_conversation(self, conversation: list) -> str:
         if not conversation:
@@ -738,12 +912,32 @@ class Brain:
 
         return "\n\n".join(parts)
 
-    def _call(self, system_prompt, user_prompt):
-        output = self.client.chat_json(system_prompt, user_prompt)
+    def _call(self, system_prompt, user_prompt, *, client=None):
+        output = (client or self.client).chat_json(system_prompt, user_prompt)
 
         logger.debug("AI output: %s", json.dumps(output, ensure_ascii=False))
 
         return output
+
+    def _planner_call(self, system_prompt, user_prompt):
+        """Run a decision call on the dedicated planner model when one is
+        configured; fall back to the main client if it fails (e.g. the
+        planner model hasn't been pulled into Ollama yet)."""
+        clients = []
+        if self.planner is not None and self.planner is not self.client:
+            clients.append(self.planner)
+        clients.append(self.client)
+        last_error = None
+        for client in clients:
+            try:
+                return self._call(system_prompt, user_prompt, client=client)
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Planner call via %s failed (%s) -- trying the next client",
+                    client.__class__.__name__, exc,
+                )
+        raise last_error
 
     def _normalize_decision(self, decision: dict) -> dict:
         if not isinstance(decision, dict):
@@ -783,6 +977,46 @@ class Brain:
 
         return normalized
 
+    def answer_from_page(self, user: str, *, goal: str | None = None, page_text: str) -> str:
+        """Focused text-to-answer path for pages that were already read.
+
+        Unlike think(), there is no JSON decision format, no tool list and
+        no planner role -- the model's ONLY job is to answer the request
+        from the given page text. This is the reliable path for simple
+        consume requests ("summarise this tab"), where the planner loop
+        repeatedly failed by bouncing questions back to the user.
+        """
+        system_prompt = (
+            "You are Jarvis, a desktop AI assistant. A web page has already "
+            "been read for you. Write the COMPLETE final answer to the "
+            "user's request using ONLY the page text below -- never invent "
+            "facts. Answer in the same language the user wrote in. No "
+            "tools, no JSON, no narration, no preamble."
+        )
+        prompt = (
+            f"USER REQUEST:\n{goal or user}\n\n"
+            f"PAGE TEXT:\n{page_text}\n\n"
+            "FINAL ANSWER:"
+        )
+        return self.client.chat_text(system_prompt, prompt)
+
+    def draft_document(self, topic: str, *, length: str = "medium") -> str:
+        """Draft a well-structured document on the given topic. Used by
+        document-creation tasks (Google Docs writing, saving a file)."""
+        system_prompt = (
+            "You are Jarvis, a desktop AI assistant. Write a complete, "
+            "well-structured document on the given topic. Use headings, "
+            "short paragraphs, and bullet points where natural. Write in "
+            "plain text (no markdown symbols like # or *). No preamble, "
+            "no commentary -- only the document body."
+        )
+        prompt = (
+            f"TOPIC:\n{topic}\n\n"
+            f"DESIRED LENGTH: {length}\n\n"
+            "DOCUMENT:"
+        )
+        return (self.client.chat_text(system_prompt, prompt) or "").strip()
+
     def think(
         self,
         user: str,
@@ -793,7 +1027,7 @@ class Brain:
         recipe: dict | None = None,
     ):
         try:
-            decision = self._call(
+            decision = self._planner_call(
                 self._build_system_prompt(),
                 self._build_user_prompt(
                     user,
@@ -844,7 +1078,7 @@ class Brain:
         )
 
         try:
-            decision = self._call(self._build_system_prompt(), prompt)
+            decision = self._planner_call(self._build_system_prompt(), prompt)
             return self._normalize_decision(decision)
         except (OpenRouterConfigurationError, GeminiConfigurationError, OllamaConfigurationError) as error:
             return {

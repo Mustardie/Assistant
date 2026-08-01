@@ -3,7 +3,7 @@ import threading
 from pathlib import Path
 
 from assistant import Assistant
-from brain.agent_loop import AgentLoop
+from brain.agent_loop import AgentLoop, normalize_user_input
 from brain.brain import Brain
 from memory.memory_manager import MemoryManager
 from recommendation.errors import RecommendationConfigurationError
@@ -563,6 +563,7 @@ class Agent:
             self._run_lock.release()
 
     def _run_inner(self, user):
+        user = normalize_user_input(user)
         self.memory_manager.add_message("user", user)
 
         if self._handle_rename_correction(user):

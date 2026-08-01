@@ -1,9 +1,14 @@
+import difflib
+import hashlib
 import json
 import logging
 import re
+from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 from config.settings import settings
 from recommendation.errors import RecommendationConfigurationError
+from tools.browser.browser_agent import browser_agent
 from tools.tool_registry import clear_tool_context, run_tool
 
 logger = logging.getLogger(__name__)
@@ -40,10 +45,740 @@ _UNEXECUTED_ACTION_PATTERN = re.compile(
 )
 
 
+# Ask-guard: when the goal refers to something IN the browser (an open tab,
+# a page, a site), the planner must locate and read it itself with the
+# browser tools. A first-turn ask_user for content it can read on its own
+# ("which tab?", "what does the page say?") is rejected once and the model
+# is forced to use browser_list_tabs/browser_switch_tab/browser_read.
+# Ask-guard: when the goal refers to something IN the browser (an open tab,
+# a page, a site), the planner must locate and read it itself with the
+# browser tools. A first-turn ask_user for content it can read on its own
+# ("which tab?", "what does the page say?") is rejected once and the model
+# is forced to use browser_list_tabs/browser_switch_tab/browser_read.
+_BROWSER_REFERENCE_PATTERN = re.compile(
+    r"\b(tab|tabs|page|webpage|browser|website|web site|url)\b",
+    re.IGNORECASE,
+)
+
+
+def _goal_references_browser(goal: str) -> bool:
+    return bool(_BROWSER_REFERENCE_PATTERN.search(goal or ""))
+
+
+# Raw LLM-backend failures (Ollama down, API config errors, timeouts) must
+# never be narrated to the user or stored in conversation history verbatim:
+# the planner has repeatedly hallucinated them as browser/internet problems
+# on later turns. Terminal error decisions get a clean, neutral retry
+# message instead.
+_BACKEND_ERROR_PATTERN = re.compile(
+    r"(could not reach|error calling llm|connection refused|failed to "
+    r"establish|max retries exceeded|connectionerror|httpx|api/chat|"
+    r"api\.openai|openrouter|ollama|gemini client|configuration error)",
+    re.IGNORECASE,
+)
+
+_BACKEND_ERROR_RESPONSE = (
+    "Sorry, my thinking engine isn't responding right now — that's the "
+    "local model server, separate from your browser and internet. Give it "
+    "a moment and repeat your request."
+)
+
+
+# --------------------------------------------------------------------- #
+# Input normalization: typos + Gen-Z slang
+# --------------------------------------------------------------------- #
+# Users type and speak casually -- misspelled words ("reserch",
+# "flgihts"), dropped letters, and Gen-Z slang ("dawg", "bro", "fr",
+# "ngl", "bet"). Deterministic handlers match on exact patterns, so the
+# raw text is cleaned BEFORE any pattern matching: slang is expanded to
+# plain English and common misspellings are corrected. The cleaned text
+# is also what the planner sees, so it never trips on "typo" either.
+_GEN_Z_SLANG = {
+    "dawg": "", "bro": "", "bruh": "", "broski": "", "bruv": "",
+    "fr": "for real", "frfr": "for real", "ngl": "not going to lie",
+    "tbh": "to be honest", "nvm": "never mind", "idk": "i don't know",
+    "idc": "i don't care", "imo": "in my opinion", "imho": "in my humble opinion",
+    "ikr": "i know right", "smh": "shaking my head", "bet": "okay agreed",
+    "sus": "suspicious", "cap": "lying", "no cap": "not lying",
+    "lit": "amazing", "fire": "amazing", "mid": "mediocre", "goated": "excellent",
+    "bussin": "delicious", "vibe": "mood", "vibes": "mood",
+    "lowkey": "somewhat", "highkey": "definitely", "finna": "going to",
+    "gonna": "going to", "wanna": "want to", "gotta": "have to",
+    "kinda": "kind of", "sorta": "sort of", "lemme": "let me",
+    "gimme": "give me", "wyd": "what are you doing", "wym": "what do you mean",
+    "rn": "right now", "ppl": "people", "u": "you", "ur": "your", "yall": "you all",
+    "gon": "going to", "ima": "i am going to", "imma": "i am going to",
+    "aight": "okay", "yo": "", "sup": "what's up", "whaddup": "what's up",
+    "srsly": "seriously", "rly": "really", "obvi": "obviously",
+    "def": "definitely", "defs": "definitely", "deffo": "definitely",
+    "prolly": "probably", "prob": "probably", "bc": "because", "cuz": "because",
+    "coz": "because", "bcos": "because", "tho": "though", "thx": "thanks",
+    "ty": "thank you", "pls": "please", "plz": "please", "sry": "sorry",
+    "lol": "haha", "lmao": "haha", "rofl": "haha", "ik": "i know",
+    "ily": "i love you", "ily2": "i love you too", "asap": "as soon as possible",
+    "btw": "by the way", "fyi": "for your information", "tldr": "too long did not read",
+    "jk": "just kidding", "omg": "oh my god", "wtf": "what the heck",
+    "srs": "serious", "g2g": "got to go", "ttyl": "talk to you later",
+    "brb": "be right back", "afk": "away from keyboard", "wbu": "what about you",
+    "hbu": "how about you", "gm": "good morning", "gn": "good night",
+    "tysm": "thank you so much", "tq": "thank you", "wb": "welcome back",
+}
+
+# Common misspellings of words that matter to deterministic handlers and
+# topic extraction. Normalized before any pattern matching.
+_TYPO_FIXES = {
+    "reserch": "research", "reseach": "research", "reasearch": "research",
+    "resarch": "research", "reaserch": "research", "reserch": "research",
+    "reseacrh": "research", "reaseach": "research", "rsearch": "research",
+    "quatum": "quantum", "quantuum": "quantum", "quntum": "quantum",
+    "computin": "computing", "computr": "computer", "computers": "computers",
+    "flgiht": "flight", "flgihts": "flights", "flights": "flights",
+    "flghts": "flights", "fllights": "flights", "flightes": "flights",
+    "fligth": "flight", "fligths": "flights",
+    "hotles": "hotels", "hotel": "hotel", "hotle": "hotel", "hotels": "hotels",
+    "hotles": "hotels",
+    "goole": "google", "googl": "google", "gooogle": "google", "gogle": "google",
+    "goolge": "google", "googel": "google",
+    "youtube": "youtube", "yutube": "youtube", "utube": "youtube",
+    "youtbe": "youtube", "youtu": "youtube", "yt": "youtube",
+    "sumarize": "summarize", "summrize": "summarize", "summury": "summary",
+    "summery": "summary", "sammary": "summary", "sumary": "summary",
+    "docuemnt": "document", "documet": "document", "document": "document",
+    "docs": "docs",
+    "gmail": "gmail", "gmial": "gmail", "gmil": "gmail",
+    "fighs": "flights", "flites": "flights",
+    "pleas": "please", "plase": "please", "plz": "please", "pls": "please",
+    "thnaks": "thanks", "thankyou": "thank you",
+    "wat": "what", "waht": "what", "whta": "what", "hwta": "what",
+    "watz": "what's", "wats": "what's", "wht": "what", "whut": "what",
+    "woudl": "would", "wouldl": "would", "couod": "could", "cna": "can",
+    "nad": "and", "adn": "and", "teh": "the", "htat": "that", "taht": "that",
+    "wiht": "with", "hwile": "while", "abotu": "about", "abut": "about",
+    "becuase": "because", "becasue": "because", "becuse": "because",
+    "bfore": "before", "b4": "before", "aftr": "after", "tommorow": "tomorrow",
+    "tomorow": "tomorrow", "todya": "today", "2day": "today", "2morrow": "tomorrow",
+    "wher": "where", "were": "where", "whre": "where", "were": "were",
+    "hwo": "how", "hoiw": "how", "wahts": "what's", "wats": "what's",
+    "wat": "what", "wats": "what's", "thers": "there's", "thier": "their",
+    "hteir": "their", "yuor": "your", "yoru": "your", "yuo": "you",
+    "hae": "have", "hev": "have", "hte": "the", "hting": "thing",
+    "calulate": "calculate", "calcluate": "calculate", "recieve": "receive",
+    "recieved": "received", "seperate": "separate", "seperately": "separately",
+    "occured": "occurred", "occuring": "occurring", "definately": "definitely",
+    "definetly": "definitely", "definately": "definitely", "defintly": "definitely",
+    "really": "really", "reallly": "really", "realy": "really", "relly": "really",
+    "becuase": "because", "cuz": "because",
+    "search": "search", "seach": "search", "sreach": "search", "serach": "search",
+    "srch": "search", "searh": "search", "sarch": "search",
+    "weater": "weather", "weathe": "weather", "weater": "weather",
+    "musci": "music", "musik": "music", "miusic": "music",
+    "vedio": "video", "vido": "video", "vid": "video", "video": "video",
+    "pictre": "picture", "pic": "picture", "pics": "pictures",
+    "phto": "photo", "phot": "photo", "photoz": "photos",
+    "messsage": "message", "mesage": "message", "msg": "message",
+    "nubmer": "number", "numbr": "number", "nmber": "number",
+    "wokr": "work", "wrk": "work", "wrok": "work",
+    "taskk": "task", "tsk": "task", "tasls": "tasks",
+    "hlep": "help", "helo": "hello", "hllo": "hello", "hii": "hi", "heyy": "hey",
+    "okey": "okay", "oke": "okay", "kk": "okay", "k": "okay", "alrighty": "alright",
+    "suree": "sure", "okok": "okay okay", "kewl": "cool", "cooll": "cool",
+    "awsm": "awesome", "awsome": "awesome", "omw": "on my way",
+    "cu": "see you", "cya": "see you", "cuz": "because",
+    "recomend": "recommend", "recommend": "recommend", "recommened": "recommend",
+    "shcedule": "schedule", "scheudle": "schedule", "sched": "schedule",
+    "calender": "calendar", "calender": "calendar",
+    "wat": "what", "wht": "what", "whut": "what",
+    "dunno": "don't know", "idk": "i don't know",
+}
+
+_SLANG_RE = [
+    (re.compile(rf"\b{re.escape(s)}\b", re.IGNORECASE), repl)
+    for s, repl in sorted(_GEN_Z_SLANG.items(), key=lambda kv: -len(kv[0]))
+]
+_TYPO_RE = [
+    (re.compile(rf"\b{re.escape(t)}\b", re.IGNORECASE), repl)
+    for t, repl in sorted(_TYPO_FIXES.items(), key=lambda kv: -len(kv[0]))
+]
+
+
+def normalize_user_input(text: str) -> str:
+    """Clean a raw user message: expand Gen-Z slang and fix common typos.
+    Deterministic handlers and the planner both see the cleaned text, so
+    'reserch quantum computin dawg' behaves exactly like 'research
+    quantum computing friend'."""
+    if not text:
+        return text
+    result = str(text)
+    for pattern, repl in _SLANG_RE:
+        result = pattern.sub(repl, result)
+    for pattern, repl in _TYPO_RE:
+        result = pattern.sub(repl, result)
+    return result
+
+
+def _sanitize_backend_error(decision: dict) -> dict:
+    """Replace raw LLM-backend error text in terminal decisions with a
+    clean retry message. Leaves everything else untouched."""
+    response = decision.get("response") or ""
+    if (
+        decision.get("step") is None
+        and bool(decision.get("done") or decision.get("ask_user"))
+        and _BACKEND_ERROR_PATTERN.search(response)
+    ):
+        logger.warning("[Agent] Sanitized raw backend error response: %r", response[:160])
+        decision = dict(decision)
+        decision["response"] = _BACKEND_ERROR_RESPONSE
+    return decision
+
+
+def _browser_content_available(observations: list) -> bool:
+    """True when a successful page read is already in the observations --
+    the planner has the page text in hand and cannot ask for it."""
+    for obs in observations:
+        tool = (obs.get("step") or {}).get("tool")
+        if tool in ("browser_read", "browser_read_text", "auto_tab_select") and obs.get("success"):
+            return True
+    return False
+
+
+# Direct-answer path (Track A): a plain CONSUME goal with the page text
+# already available is answered without the planner loop at all -- the
+# JSON decision format is exactly what a weak planner uses to bounce
+# questions back instead of answering. These trigger words are pure
+# content-consumption; interactive-ambiguous words ("check", "see",
+# "look at") deliberately stay on the planner path.
+_DIRECT_ANSWER_PATTERN = re.compile(
+    r"\b(summar\w*|what'?s on|what is on|whats on|what'?s there|"
+    r"tell me about|describe|overview|recap|translate|extract|digest|"
+    r"break down)\b",
+    re.IGNORECASE,
+)
+
+_DIRECT_ANSWER_EXCLUSIONS = re.compile(
+    r"\b(compare|versus|vs\.?|difference|both|each|other tab|between)\b",
+    re.IGNORECASE,
+)
+
+_LOCATE_PAGE_HINT = (
+    "Your question to the user was rejected: the information you "
+    "asked for is inside the browser and you can read it yourself "
+    "with your tools. Use browser_list_tabs to find the open tab "
+    "the user means, browser_switch_tab to select it, and "
+    "browser_read to get the page text. NEVER ask the user to "
+    "read a page to you. Return a tool step now."
+)
+
+
+def _goal_is_direct_answer(goal: str) -> bool:
+    return bool(_DIRECT_ANSWER_PATTERN.search(goal or "")) and not bool(
+        _DIRECT_ANSWER_EXCLUSIONS.search(goal or "")
+    )
+
+
+def _extract_read_text(observations: list) -> str:
+    """Return the most recent successful browser_read page text (at least
+    40 chars -- shorter than that and there is nothing to answer from)."""
+    for obs in reversed(observations):
+        tool = (obs.get("step") or {}).get("tool")
+        if tool == "browser_read" and obs.get("success"):
+            result = obs.get("result") or {}
+            if isinstance(result, dict):
+                text = str(result.get("text") or "").strip()
+            else:
+                text = str(result).strip()
+            if len(text) >= 40:
+                return text
+    return ""
+
+
+# A goal that asks the planner to CONSUME a page ("summarise the page",
+# "see my chatgpt tab", "what's on this site") triggers deterministic
+# page resolution -- the loop itself finds the open tab and reads it, so
+# the model never has to (and can never stall asking "which tab?").
+_READ_INTENT_PATTERN = re.compile(
+    r"\b(summar\w*|read|reading|see|look at|look through|what'?s on|"
+    r"what is on|whats on|check|tell me about|describe|review|overview|"
+    r"content of|contents of|translate|recap|highlights? (?:of|from|on))\b",
+    re.IGNORECASE,
+)
+
+# Words that carry no discriminating signal about WHICH page is meant.
+_BROWSER_STOPWORDS = {
+    "the", "a", "an", "my", "your", "our", "their", "this", "that", "these",
+    "those", "and", "of", "on", "in", "to", "for", "with", "is", "are", "was",
+    "be", "it", "its", "at", "me", "please", "can", "you", "what", "whats",
+    "whole", "content", "contents", "currently", "tell", "about", "just",
+    "want", "need", "have", "give", "get", "show", "open", "see", "read",
+    "summarise", "summarize", "summary", "page", "tab", "tabs", "i", "we",
+    "us", "them", "into", "from", "up", "down", "now", "also", "then",
+    "there", "google", "website", "webpage", "browser", "site", "nothing",
+    "specific", "short", "points", "entire", "full", "general", "basically",
+}
+
+# Content-scan limits: when no tab's title/URL names the goal, the loop
+# reads a snippet of each open tab and scores the goal words against the
+# page text. Caps keep the scan cheap and bounded.
+_SCAN_TAB_LIMIT = 6
+_SCAN_TEXT_CHARS = 1500
+
+# Confirmation replies: "2", "the second one", "first" map to a candidate
+# from the ambiguous-tabs list. Ordinals are checked before cardinals so
+# "the second one" picks 2, not 1.
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6}
+_DIGITS = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6}
+_CARDINALS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+
+
+def _reply_number(text: str) -> int | None:
+    for table in (_ORDINALS, _DIGITS, _CARDINALS):
+        for word, idx in table.items():
+            if re.search(rf"\b{re.escape(word)}\b", text):
+                return idx
+    return None
+
+
+def _confirmation_message(candidates: list) -> str:
+    """Numbered list of ambiguous candidate tabs, spoken to the user."""
+    parts = ["I found several similar tabs open. Which one do you mean?"]
+    for i, c in enumerate(candidates, 1):
+        title = str(c.get("title") or "Untitled tab").strip()
+        host = urlsplit(str(c.get("url") or "")).hostname or ""
+        parts.append(f"{i}) {title} ({host})" if host else f"{i}) {title}")
+    return " ".join(parts)
+
+
+def _match_pending_choice(reply: str | None, candidates: list) -> dict | None:
+    """Map the user's reply to a tab from the confirmation list. A
+    unique title/hostname hit wins ("the chess one" must not become
+    "candidate 1" because of the word "one"); a plain number reply
+    ("2", "second", "2nd") is used only when no title match is unique.
+    """
+    if not reply or not candidates:
+        return None
+    text = reply.strip().lower()
+    tokens = _significant_tokens(text)
+    if tokens:
+        hits = []
+        for c in candidates:
+            title = str(c.get("title") or "").lower()
+            host = urlsplit(str(c.get("url") or "")).hostname or ""
+            if any(t in title or t in host for t in tokens):
+                hits.append(c)
+        if len(hits) == 1:
+            return hits[0]
+    n = _reply_number(text)
+    if n is not None and 1 <= n <= len(candidates):
+        return candidates[n - 1]
+    return None
+
+
+def _goal_asks_to_read(goal: str) -> bool:
+    return bool(_READ_INTENT_PATTERN.search(goal or ""))
+
+
+def _significant_tokens(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return [t for t in tokens if len(t) >= 3 and t not in _BROWSER_STOPWORDS]
+
+
+def _scan_tabs_for_goal(tabs: list, tokens: list) -> dict | None:
+    """Read a snippet of each open tab (capped) and score the goal tokens
+    against the actual page text -- catches pages whose titles and URLs
+    give nothing away ("tell me about the football tab" where the tab is
+    just "Untitled"). Returns a resolved tab, an ambiguity signal, or
+    None when nothing matches. The user's active tab is restored after
+    the scan."""
+    original_active = None
+    switched_any = False
+    entries: list[dict] = []
+    try:
+        for t in tabs[:_SCAN_TAB_LIMIT]:
+            tab_id = t.get("tabId")
+            if bool(t.get("active")):
+                original_active = tab_id
+            else:
+                try:
+                    ok, _res = run_tool("browser_switch_tab", {"tab": tab_id})
+                except Exception as exc:
+                    logger.info("[Agent] Content scan: cannot switch to tab %s: %s", tab_id, exc)
+                    continue
+                if not ok:
+                    continue
+                switched_any = True
+            try:
+                ok, res = run_tool("browser_read", {})
+            except Exception as exc:
+                logger.info("[Agent] Content scan: cannot read tab %s: %s", tab_id, exc)
+                continue
+            if not ok:
+                continue
+            if isinstance(res, dict):
+                text = str(res.get("text") or "")
+            else:
+                text = str(res)
+            snippet = text[:_SCAN_TEXT_CHARS].lower()
+            score = sum(1 for tok in tokens if tok in snippet)
+            entries.append({
+                "tabId": tab_id,
+                "title": str(t.get("title") or ""),
+                "url": str(t.get("url") or ""),
+                "active": bool(t.get("active")),
+                "score": score,
+            })
+    finally:
+        if switched_any and original_active is not None:
+            try:
+                run_tool("browser_switch_tab", {"tab": original_active})
+            except Exception:
+                pass
+    if not entries:
+        return None
+    best = max(entries, key=lambda e: e["score"])
+    if best["score"] < 1:
+        return None
+    tied = [e for e in entries if e["score"] == best["score"]]
+    if len(tied) > 1:
+        active_first = sorted(tied, key=lambda e: (not e["active"], -e["score"]))
+        logger.info(
+            "[Agent] Content scan: %s tabs tied at score %s -- asking which one",
+            len(tied), best["score"],
+        )
+        return {"ambiguous": True, "candidates": active_first}
+    logger.info(
+        "[Agent] Content scan resolved tab '%s' (score %s)",
+        best.get("title"), best["score"],
+    )
+    return best
+
+
+def _resolve_browser_page(goal: str) -> dict | None:
+    """Deterministically find the open tab the user means.
+
+    Every significant goal word scores against each tab's title (2
+    points) and URL/host (2 points); the active tab gets +1. Returns the
+    best tab with score >= 2, an ambiguity signal when several tabs tie
+    or share the same site (e.g. many Wikipedia tabs -- the goal cannot
+    pick one page), or None when nothing matches (or the tab list cannot
+    be queried). With no significant tokens at all (e.g. "summarise the
+    page") the active tab is the best possible referent. When metadata
+    matching finds nothing, the loop falls back to reading a snippet of
+    each tab and scoring the goal words against the page text.
+    """
+    try:
+        listing = browser_agent.list_tabs()
+    except Exception as exc:
+        logger.info("[Agent] Auto page resolution skipped (tab list unavailable): %s", exc)
+        return None
+    tabs = (listing or {}).get("tabs") or []
+    if not tabs:
+        return None
+
+    tokens = _significant_tokens(goal)
+    if not tokens:
+        for t in tabs:
+            if t.get("active"):
+                return {
+                    "tabId": t.get("tabId"),
+                    "title": str(t.get("title") or ""),
+                    "url": str(t.get("url") or ""),
+                    "active": True,
+                    "score": 1,
+                }
+        return None
+
+    scored: list[dict] = []
+    for t in tabs:
+        title = str(t.get("title") or "").lower()
+        url = str(t.get("url") or "")
+        host = urlsplit(url).hostname or ""
+        hay_url = f"{url} {host}".lower()
+        score = 0
+        for tok in tokens:
+            if tok in title:
+                score += 2
+            elif tok in hay_url:
+                # A hostname/URL match is as distinctive as a title match
+                # (titles are often generic: "PC control from phone" while
+                # the URL says chatgpt.com). A token found in either is a
+                # strong signal.
+                score += 2
+        if t.get("active"):
+            score += 1
+        if score >= 2:
+            scored.append({
+                "tabId": t.get("tabId"),
+                "title": str(t.get("title") or ""),
+                "url": url,
+                "active": bool(t.get("active")),
+                "score": score,
+            })
+    if scored:
+        scored.sort(key=lambda s: (s["score"], s["active"]), reverse=True)
+        best = scored[0]
+        host = urlsplit(best["url"]).hostname or ""
+        candidates_by_id: dict = {}
+        for s in scored:
+            same_host = host and urlsplit(s["url"]).hostname == host
+            if s["score"] == best["score"] or same_host:
+                candidates_by_id[s["tabId"]] = s
+        if len(candidates_by_id) > 1:
+            active_first = sorted(
+                candidates_by_id.values(),
+                key=lambda s: (not s["active"], -s["score"]),
+            )
+            logger.info(
+                "[Agent] Auto page resolution: %s tabs ambiguous (tie or same "
+                "site) -- asking the user to pick one",
+                len(candidates_by_id),
+            )
+            return {"ambiguous": True, "candidates": active_first}
+        return best
+
+    # No tab named the goal in its title/URL -- scan page content.
+    logger.info("[Agent] Auto page resolution: no tab matched the goal tokens %s -- scanning page content", tokens)
+    return _scan_tabs_for_goal(tabs, tokens)
+
+
+_GDOCS_WRITE_PATTERN = re.compile(
+    r"(?:google docs|docs\.google\.com|docs\.new).{0,40}\b(write|type|create|put|add|start)\b"
+    r"|\b(write|type|create|put|add|start)\b.{0,40}(?:google docs|docs\.google\.com|docs\.new)",
+    re.IGNORECASE,
+)
+_DOC_TO_FOLDER_PATTERN = re.compile(
+    r"\b(save|write|create|make|draft|store|put|export|add|keep)\b"
+    r".{0,80}\b(?:documents?|reports?|essays?|articles?|notes?|files?)\b"
+    r".{0,80}(?:\b(save|store|put|keep)\b|\b(folder|directory)\b)",
+    re.IGNORECASE,
+)
+_DOC_WRITE_PATTERN = re.compile(
+    r"\b(write|create|make|draft)\b.{0,40}\b(document|report|essay|article|note)\b",
+    re.IGNORECASE,
+)
+_FLIGHT_SEARCH_PATTERN = re.compile(
+    r"\b(book|find|search|look for|plan|look up)\b.{0,20}\bflights?\b"
+    r"|\bflights?\b.{0,40}\b(?:to|from|for|departing|returning)\b",
+    re.IGNORECASE,
+)
+_HOTEL_SEARCH_PATTERN = re.compile(
+    r"\b(book|find|search|look for|look up)\b.{0,20}\bhotels?\b",
+    re.IGNORECASE,
+)
+# "research X" / "do research on X" / "deep dive into X" routes to the
+# deterministic research pipeline (research_topic), never to the weak
+# planner -- the planner has repeatedly picked browser_open for these.
+_RESEARCH_PATTERN = re.compile(
+    r"\b(?:do|conduct|perform|run|start)\b.{0,20}\b(?:a\s+)?(?:deep\s+)?research\b"
+    r"|\b(?:research|deep dive)\b.{0,20}\b(?:on|about|into|of)\b"
+    r"|\b(?:research|deep dive)\s+(?!on|about|into|of|papers?|methods?|"
+    r"methodology|results?|findings?)\S",
+    re.IGNORECASE,
+)
+_DATE_HINT_PATTERN = re.compile(
+    r"\b(?:on|for|until)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|"
+    r"sunday|tomorrow|today|this\s+\w+|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|"
+    r"apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*|\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?)\b",
+    re.IGNORECASE,
+)
+_TOPIC_STRIP_PHRASES = (
+    "save it in a new folder named", "save it in the folder named",
+    "save it in a folder named", "in a new folder named", "in the folder named",
+    "in a folder named", "and save it in", "and save it as", "save it in",
+    "save it as", "then save it", "and store it in", "and put it in",
+    "google docs", "a new document", "a document", "an essay", "an article",
+    "a report", "a note", "write a document about", "write a document on",
+    "write an essay about", "write an essay on", "write an article about",
+    "write an article on", "write a report about", "write a report on",
+    "write a note about", "write a note on", "write about", "write on",
+    "create a document about", "create a document on", "create a report about",
+    "create an article about", "draft a document about", "draft a document on",
+    "do a deep research on", "do a deep research about", "do deep research on",
+    "do deep research about", "conduct research on", "conduct research about",
+    "perform research on", "perform research about", "do research on",
+    "do research about", "run research on", "run research about",
+    "deep dive into", "deep dive on", "research report on", "research report about",
+    "research on", "research about", "research into", "research",
+    "and save it", "then save it", "and save", "save it", "about", "on",
+    "please", "for me", "the topic of", "topic",
+    "can you", "could you", "do you", "would you", "can i get",
+    "for real", "right now", "i want", "i need", "i would like",
+)
+
+
+def _sanitize_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]', "_", (name or "").strip())
+    return name or "document"
+
+
+def _extract_topic(goal: str) -> str | None:
+    """The subject of a document task: the quoted text first, then a
+    targeted 'write ... about/on X' capture, then the goal with all
+    known framing phrases stripped (longest phrases first)."""
+    m = re.search(r"['\"]([^'\"]+)['\"]", goal or "")
+    if m:
+        return m.group(1).strip()
+    m = re.search(
+        r"\b(?:write|create|make|draft|type|save)\b.{0,15}\b(?:about|on|document about|document on)\s+(.+)",
+        goal or "", re.IGNORECASE,
+    )
+    if m:
+        topic = m.group(1).strip(" .,;:!?")
+        # Cut at the save/folder part ("... and save it in a new folder ...",
+        # "... to a folder called ...")
+        topic = re.split(
+            r"\b(?:and\s+)?(?:then\s+)?(?:save|store|put)\b|"
+            r"\b(?:to|into|in|inside)\s+(?:a|my|our|the|your)\s+(?:new\s+)?(?:folder|directory)\b",
+            topic, maxsplit=1, flags=re.IGNORECASE,
+        )[0].strip(" .,;:!?")
+        return topic or None
+    text = goal or ""
+    for phrase in sorted(_TOPIC_STRIP_PHRASES, key=len, reverse=True):
+        text = re.sub(rf"\b{re.escape(phrase)}\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" .,;:!?")
+    return text or None
+
+
+def _extract_folder(goal: str, topic: str | None) -> str | None:
+    m = re.search(
+        r"\b(?:folder|directory)\s+(?:named\s+|called\s+)?['\"]?([^'\".,;]{2,60})['\"]?",
+        goal or "", re.IGNORECASE,
+    )
+    if m:
+        name = m.group(1).strip()
+        if name and not name.lower().startswith(("named", "called")):
+            return name
+    if topic:
+        return f"research of {topic}"
+    return None
+
+
+_TRAILING_STOP = r"(?=\s+(?:from|on|for|under|between|around|until|in|departing|returning|with|near|next|this|budget)|[,.;]|$)"
+
+
+def _flight_search_url(goal: str) -> str | None:
+    m = re.search(
+        r"\bfrom\s+([^,.;]{2,40}?)\s+to\s+([^,.;]{2,40}?)" + _TRAILING_STOP,
+        goal or "", re.IGNORECASE,
+    )
+    if m:
+        query = f"flights from {m.group(1).strip()} to {m.group(2).strip()}"
+    else:
+        m = re.search(
+            r"\bflights?\s+(?:to|towards)\s+([^,.;]{2,40}?)" + _TRAILING_STOP,
+            goal or "", re.IGNORECASE,
+        )
+        if not m:
+            return None
+        query = f"flights to {m.group(1).strip()}"
+    date = _DATE_HINT_PATTERN.search(goal or "")
+    if date:
+        query += " " + re.sub(r"\s+", " ", date.group(0).strip())
+    return f"https://www.google.com/travel/flights?q={quote(query)}"
+
+
+def _hotel_search_url(goal: str) -> str | None:
+    m = re.search(
+        r"\b(?:hotels?\s+)?(?:in|at|near)\s+([^,.;]{2,40}?)" + _TRAILING_STOP,
+        goal or "", re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(
+            r"\bhotels?\s+in\s+([^,.;]{2,40}?)" + _TRAILING_STOP,
+            goal or "", re.IGNORECASE,
+        )
+    if not m:
+        return None
+    query = f"hotels in {m.group(1).strip()}"
+    date = _DATE_HINT_PATTERN.search(goal or "")
+    if date:
+        query += " " + re.sub(r"\s+", " ", date.group(0).strip())
+    return f"https://www.google.com/travel/hotels?q={quote(query)}"
+
+
+def _detect_complex_task(goal: str) -> str | None:
+    """Classify a fresh goal into a deterministic multi-step task, or None
+    when the normal planner loop should handle it."""
+    goal = goal or ""
+    if _RESEARCH_PATTERN.search(goal):
+        return "research"
+    if _GDOCS_WRITE_PATTERN.search(goal):
+        return "gdocs"
+    if _DOC_TO_FOLDER_PATTERN.search(goal):
+        return "document_to_folder"
+    if _DOC_WRITE_PATTERN.search(goal):
+        return "gdocs"
+    if _FLIGHT_SEARCH_PATTERN.search(goal):
+        return "flights"
+    if _HOTEL_SEARCH_PATTERN.search(goal):
+        return "hotels"
+    return None
+
+
+def _read_resolved_page(page: dict) -> list[dict]:
+    """Switch to the resolved tab and read it, returning observation dicts.
+
+    Runs deterministically through run_tool so argument aliases apply;
+    failures become FAILED observations (the planner sees them and can
+    adapt) instead of aborting the task.
+    """
+    obs: list[dict] = []
+
+    def _obs(tool: str, arguments: dict, success: bool, result) -> dict:
+        return {
+            "step": {"tool": tool, "arguments": arguments},
+            "success": success,
+            "result": result,
+        }
+
+    tab_id = page.get("tabId")
+    switch_ok = True
+    if not page.get("active") and tab_id is not None:
+        try:
+            switch_ok, switch_result = run_tool("browser_switch_tab", {"tab": tab_id})
+            if not switch_ok:
+                obs.append(_obs(
+                    "browser_switch_tab",
+                    {"tab": tab_id},
+                    False,
+                    switch_result,
+                ))
+                return obs
+        except Exception as exc:
+            obs.append(_obs("browser_switch_tab", {"tab": tab_id}, False, str(exc)))
+            return obs
+
+    try:
+        read_ok, read_result = run_tool("browser_read", {})
+    except Exception as exc:
+        read_ok, read_result = False, str(exc)
+
+    obs.append(_obs(
+        "auto_tab_select",
+        {"tabId": tab_id, "title": page.get("title"), "url": page.get("url")},
+        True,
+        {
+            "resolved_page": page.get("title"),
+            "url": page.get("url"),
+            "tabId": tab_id,
+            "note": (
+                "This is the page the user meant. Read its content from the "
+                "next observation; you do not need more tabs."
+            ),
+        },
+    ))
+    obs.append(_obs("browser_read", {}, read_ok, read_result))
+    return obs
+
+
 def _describes_unexecuted_action(response: str | None) -> bool:
     if not response:
         return False
     return bool(_UNEXECUTED_ACTION_PATTERN.search(response))
+
+
+def _short_error(result) -> str:
+    if isinstance(result, dict):
+        return str(result.get("error") or result)[:120]
+    return str(result)[:120]
 
 
 def safe_print(value):
@@ -67,6 +802,53 @@ def _tool_reported_success(raw_success: bool, result) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Loop guard: repeated identical tool calls
+#
+# Guards against the "planner keeps calling the same tool with the same
+# arguments forever" failure mode (observed with browser_read: the call
+# succeeded and returned a result, and the planner just kept repeating the
+# identical call instead of acting on what it got). Within one task the
+# loop tracks every tool call (tool + normalized arguments + result hash)
+# and throttles consecutive identical proposals:
+#   1st consecutive identical call  -> executed normally
+#   2nd consecutive identical call  -> NOT re-executed; the identical
+#                                      cached result is served instead
+#   3rd consecutive identical call  -> BLOCKED; the tool is marked
+#                                      unproductive for this goal and the
+#                                      planner is forced to do something
+#                                      different
+#   4th consecutive identical call  -> AUTO-STOP: the loop ends the task
+#                                      and asks the user for help
+# The counts reset as soon as the tool or its arguments differ, so a
+# legitimate second use of a tool (after a different action changed the
+# page state) is never throttled. This is the enforcement backstop for the
+# system-prompt rule (see brain.py) telling the model to act on tool
+# results instead of re-issuing the same call.
+TOOL_REPEAT_LIMIT = 2  # identical executions allowed in a row before reuse/block
+IDENTICAL_BLOCK_AT = TOOL_REPEAT_LIMIT + 1  # 3rd consecutive proposal -> block
+IDENTICAL_AUTO_STOP_AT = TOOL_REPEAT_LIMIT + 2  # 4th consecutive proposal -> stop
+
+
+def _normalize_signature_arguments(arguments) -> dict:
+    """Drop None-valued keys so {'tab': None} and {} count as the same call."""
+    if not isinstance(arguments, dict):
+        return {}
+    return {key: value for key, value in arguments.items() if value is not None}
+
+
+def _step_signature(tool, arguments) -> tuple:
+    return (tool, json.dumps(_normalize_signature_arguments(arguments), sort_keys=True, default=str))
+
+
+def _hash_result(result) -> str:
+    try:
+        blob = json.dumps(result, sort_keys=True, default=str)
+    except Exception:
+        blob = repr(result)
+    return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
 class AgentLoop:
     """Iterative agent loop: plan → execute one step → observe → reflect → repeat."""
 
@@ -87,6 +869,181 @@ class AgentLoop:
         self.track_file_action = track_file_action
         self.fallback = fallback
         self._last_response = ""
+        self._consecutive_guard_firings = 0
+        self._no_step_streak = 0
+        self._tool_history: list[dict] = []
+        self._result_cache: dict[tuple, dict] = {}
+        self._unproductive_tools: set[str] = set()
+        self._consecutive_signature: tuple | None = None
+        self._consecutive_count = 0
+        self._loop_guard_blocks = 0
+        self._browser_ask_guard_fired = False
+        self._pending_tab_choice = None
+
+    # ------------------------------------------------------------------ #
+    # Deterministic complex-task handlers (pre-planner)
+    # ------------------------------------------------------------------ #
+
+    def _draft_content(self, topic: str | None) -> str:
+        if not topic:
+            return ""
+        try:
+            raw = self.brain.draft_document(topic)
+        except Exception as exc:
+            logger.error("[ComplexTask] Document draft failed: %s", exc)
+            return ""
+        return str(raw or "").strip()
+
+    def _task_gdocs(self, user: str, goal: str) -> bool:
+        """Open a new Google Doc and write the requested content into it."""
+        topic = _extract_topic(goal)
+        content = self._draft_content(topic) if topic else ""
+        try:
+            ok, res = run_tool("browser_open", {"url": "https://docs.new"})
+        except Exception as exc:
+            logger.error("[ComplexTask] gdocs open failed: %s", exc)
+            return False
+        if not ok:
+            self.speak(f"I couldn't open Google Docs: {_short_error(res)}")
+            return True
+        try:
+            run_tool("browser_wait_for_load", {"timeout": 20000})
+        except Exception:
+            pass
+        try:
+            run_tool("browser_wait_for_element", {"description": "[contenteditable]", "timeout": 20000})
+        except Exception:
+            pass
+        if not content:
+            self.speak("Google Docs is open with a new blank document. What should I write?")
+            return True
+        try:
+            run_tool("browser_click", {"description": "Untitled document"})
+            run_tool("browser_type", {"description": "Untitled document", "text": topic, "clear_first": True})
+            run_tool("browser_press_key", {"key": "Enter"})
+        except Exception as exc:
+            logger.info("[ComplexTask] gdocs title rename failed (non-fatal): %s", exc)
+        chunks = [content[i:i + 1500] for i in range(0, len(content), 1500)] or [""]
+        for i, chunk in enumerate(chunks):
+            try:
+                ok, res = run_tool("browser_type", {
+                    "description": "[contenteditable]",
+                    "text": chunk,
+                    "clear_first": i == 0,
+                })
+            except Exception as exc:
+                logger.error("[ComplexTask] gdocs typing failed: %s", exc)
+                self.speak("I opened Google Docs but had trouble writing the content.")
+                return True
+            if not ok and i == 0:
+                try:
+                    ok, res = run_tool("browser_type", {
+                        "description": "Body",
+                        "text": chunk,
+                        "clear_first": True,
+                    })
+                except Exception as exc:
+                    logger.error("[ComplexTask] gdocs typing fallback failed: %s", exc)
+            if not ok:
+                self.speak("I opened Google Docs but the editor wasn't ready for typing.")
+                return True
+        self.speak(f"Done — I've written a document on {topic} in a new Google Doc, open in your browser.")
+        return True
+
+    def _task_document_to_folder(self, user: str, goal: str) -> bool:
+        """Create 'research of X' (or a user-named folder) and save a
+        drafted document about the topic as a file in it."""
+        topic = _extract_topic(goal)
+        folder = _extract_folder(goal, topic)
+        if not folder:
+            return False
+        folder_name = _sanitize_filename(folder)
+        try:
+            ok, res = run_tool("create_folder", {"path": folder_name})
+        except Exception as exc:
+            logger.error("[ComplexTask] folder create failed: %s", exc)
+            return False
+        if not ok:
+            self.speak(f"I couldn't create the folder: {_short_error(res)}")
+            return True
+        content = self._draft_content(topic)
+        if not content:
+            self.speak(f"The folder '{folder_name}' is created, but I couldn't draft the document content.")
+            return True
+        filename = _sanitize_filename(topic or "document") + ".md"
+        path = Path(folder_name) / filename
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except Exception as exc:
+            logger.error("[ComplexTask] document save failed: %s", exc)
+            self.speak("The folder was created, but saving the document failed.")
+            return True
+        logger.info("[ComplexTask] Saved document: %s", path)
+        self.speak(f"Done. I created the folder '{folder_name}' and saved the document on {topic} there: {path}")
+        return True
+
+    def _task_research(self, user: str, goal: str) -> bool:
+        """Run the full research pipeline (research_topic) directly --
+        the planner is never asked to pick a tool for these."""
+        topic = _extract_topic(goal)
+        if not topic:
+            return False
+        self.speak(f"Starting in-depth research on {topic}. This takes a couple of minutes.")
+        try:
+            ok, res = run_tool("research_topic", {"topic": topic})
+        except Exception as exc:
+            logger.error("[ComplexTask] research_topic failed: %s", exc)
+            self.speak("The research pipeline hit an error and didn't complete.")
+            return True
+        if not ok:
+            self.speak(f"I couldn't complete the research: {_short_error(res)}")
+            return True
+        folder = (res or {}).get("folder") if isinstance(res, dict) else None
+        self.speak(
+            f"Research on {topic} is done. The report and sources are saved in {folder}."
+            if folder
+            else f"Research on {topic} is done."
+        )
+        return True
+
+    def _task_flights(self, user: str, goal: str) -> bool:
+        """Open a pre-built Google Flights search. Returns False so the
+        planner continues reading/interacting with the results."""
+        url = _flight_search_url(goal)
+        if not url:
+            return False
+        try:
+            ok, res = run_tool("browser_open", {"url": url})
+            if ok:
+                run_tool("browser_wait_for_load", {"timeout": 20000})
+        except Exception as exc:
+            logger.error("[ComplexTask] flights open failed: %s", exc)
+        return False
+
+    def _task_hotels(self, user: str, goal: str) -> bool:
+        url = _hotel_search_url(goal)
+        if not url:
+            return False
+        try:
+            ok, res = run_tool("browser_open", {"url": url})
+            if ok:
+                run_tool("browser_wait_for_load", {"timeout": 20000})
+        except Exception as exc:
+            logger.error("[ComplexTask] hotels open failed: %s", exc)
+        return False
+
+    def _handle_complex_task(self, user: str, goal: str, task: str) -> bool:
+        handler = {
+            "gdocs": self._task_gdocs,
+            "document_to_folder": self._task_document_to_folder,
+            "flights": self._task_flights,
+            "hotels": self._task_hotels,
+            "research": self._task_research,
+        }.get(task)
+        if handler is None:
+            return False
+        return handler(user, goal)
 
     def run(
         self,
@@ -101,8 +1058,9 @@ class AgentLoop:
         Returns None when the task reached a true terminal state (goal
         completed, or the caller should treat this as fully finished).
         Returns {"goal": ..., "observations": [...]} when the loop paused
-        mid-task (a genuine clarifying question, a recovery dead-end, or
-        the iteration budget ran out) -- the caller should pass this
+        mid-task (a genuine clarifying question, a recovery dead-end, the
+        planner repeatedly failing to produce a step or answer, or the
+        iteration budget ran out) -- the caller should pass this
         straight back in as resume_goal/resume_observations on the next
         call so the user's reply continues the SAME task instead of
         starting an unrelated new one.
@@ -111,18 +1069,126 @@ class AgentLoop:
 
         logger.info("[Agent] Received user request: %s", user[:200])
 
-        goal = resume_goal or user
+        user = normalize_user_input(user)
+        goal = normalize_user_input(resume_goal or user)
         observations: list[dict] = list(resume_observations) if resume_observations else []
         recovery_attempts = 0
         last_failed_signature: tuple | None = None
         repeat_failures = 0
         self._last_response = ""
+        self._consecutive_guard_firings = 0
+        self._no_step_streak = 0
+        self._consecutive_signature = None
+        self._consecutive_count = 0
+        self._loop_guard_blocks = 0
+        self._browser_ask_guard_fired = False
 
         if resume_goal:
             logger.info(
                 "[Agent] Resuming pending task (%d prior observation(s)): %s",
                 len(observations), goal[:120],
             )
+        else:
+            # A fresh task gets a fresh loop-guard memory: previous calls,
+            # cached results and unproductive-tool marks all belong to the
+            # prior goal. A resumed task keeps them so the same repeated
+            # call cannot restart after a user reply.
+            logger.info("[LoopGuard] New task -- tool history and result cache reset")
+            self._tool_history = []
+            self._result_cache = {}
+            self._unproductive_tools = set()
+            self._pending_tab_choice = None
+
+        # Deterministic complex-task handling: fresh goals that match a
+        # known multi-step workflow (Google Docs writing, document saved
+        # into a new folder, flight/hotel search) run through a
+        # deterministic executor instead of relying on the weak planner
+        # to chain 3+ tool calls correctly. Flight/hotel handlers return
+        # False (they only pre-open the search) so the planner still
+        # drives the interactive part.
+        if not resume_goal and not observations:
+            task = _detect_complex_task(goal)
+            if task:
+                logger.info("[ComplexTask] Detected task '%s' for goal: %s", task, goal[:120])
+                handled = self._handle_complex_task(user, goal, task)
+                if handled:
+                    return None
+
+        # Deterministic page resolution: when the goal asks to CONSUME a
+        # page ("summarise my chatgpt tab", "what's on the page") and no
+        # tool has run yet, the loop itself finds the open tab the user
+        # means, switches to it and reads it -- handing the page text to
+        # the planner as observations. The model cannot stall asking
+        # "which tab?" or "what does it say?" because the answer is
+        # already in front of it.
+        if not observations and _goal_references_browser(goal) and _goal_asks_to_read(goal):
+            # A confirmation question was pending from the previous turn:
+            # map the user's reply ("2", "the second one", a title) to a
+            # tab from the list and read it.
+            if self._pending_tab_choice:
+                picked = _match_pending_choice(user, self._pending_tab_choice)
+                if picked:
+                    auto_obs = _read_resolved_page(picked)
+                    if auto_obs:
+                        observations.extend(auto_obs)
+                        self._pending_tab_choice = None
+                        logger.info(
+                            "[Agent] Read page chosen from confirmation list: '%s'",
+                            picked.get("title"),
+                        )
+                else:
+                    logger.info(
+                        "[Agent] Reply did not match any candidate tab -- re-running resolution"
+                    )
+                    self._pending_tab_choice = None
+            if not observations:
+                resolved = _resolve_browser_page(goal)
+                if resolved and resolved.get("ambiguous"):
+                    candidates = resolved.get("candidates") or []
+                    self._pending_tab_choice = candidates
+                    logger.info(
+                        "[Agent] Multiple similar tabs (%s) -- asking the user to pick one",
+                        len(candidates),
+                    )
+                    self.speak(_confirmation_message(candidates))
+                    return {"goal": goal, "observations": []}
+                if resolved:
+                    auto_obs = _read_resolved_page(resolved)
+                    if auto_obs:
+                        observations.extend(auto_obs)
+                        logger.info(
+                            "[Agent] Auto-resolved page '%s' (%s) and read it before planning",
+                            resolved.get("title"), resolved.get("url"),
+                        )
+
+        # Track A shortcut: a plain consume goal ("summarise the page",
+        # "what's on my tab") with the page text already in hand (just
+        # auto-read, or carried over from a pending task) is answered
+        # DIRECTLY -- the planner's JSON decision loop has nothing to add,
+        # and a weak planner uses it to bounce questions back instead of
+        # answering. Interactive words ("check", "see") and comparisons
+        # stay on the planner path. A failed or empty direct answer falls
+        # through to normal planning.
+        page_text = _extract_read_text(observations)
+        if (
+            page_text
+            and _goal_references_browser(goal)
+            and _goal_asks_to_read(goal)
+            and _goal_is_direct_answer(goal)
+        ):
+            try:
+                answer = self.brain.answer_from_page(user, goal=goal, page_text=page_text)
+            except Exception as exc:
+                logger.error("[Agent] Direct page answer failed: %s", exc)
+                self.speak(_BACKEND_ERROR_RESPONSE)
+                return None
+            answer_text = (answer or "").strip()
+            if answer_text:
+                logger.info("[Agent] Answering directly from resolved page text (planner bypassed)")
+                self._last_response = answer_text
+                self.speak(answer_text)
+                return None
+            logger.info("[Agent] Direct page answer came back empty -- falling back to the planner")
 
         def _pending_result() -> dict:
             return {"goal": goal, "observations": list(observations)}
@@ -155,6 +1221,8 @@ class AgentLoop:
                     "done": False,
                     "step": None,
                 }
+
+            decision = _sanitize_backend_error(decision)
 
             self._log_reasoning(decision.get("reasoning"))
             logger.info("[Planner] Intent detected for iteration %s", iteration)
@@ -194,22 +1262,103 @@ class AgentLoop:
                         "sending messages/emails, purchases, shutdown/restart)."
                     ),
                 })
+                self._consecutive_guard_firings += 1
+                if response:
+                    self._last_response = response
+                if self._consecutive_guard_firings > 3:
+                    logger.warning(
+                        "[Planner] Guard fired %s times consecutively; breaking out of loop",
+                        self._consecutive_guard_firings,
+                    )
+                    self.speak(
+                        "I seem to be going in circles. Let me pause and ask — "
+                        "could you rephrase what you need or give me more specific instructions?"
+                    )
+                    return _pending_result()
                 continue
 
-            # Deduplicate: skip speaking if this response is identical to the last one spoken.
-            if response:
+            # Reject an ask_user when the goal points at something IN the
+            # browser (an open tab, a page) and the planner is trying to
+            # make the user do its own job -- either no tool has run yet
+            # (it must locate the page itself) or the page was ALREADY
+            # read and its text is in the observations (it must answer
+            # from that text). The question is not spoken, and the model
+            # is forced to act.
+            browser_ask_rejected = False
+            if (
+                decision.get("ask_user")
+                and not self._browser_ask_guard_fired
+                and _goal_references_browser(goal)
+                and _goal_asks_to_read(goal)
+                and (not observations or _browser_content_available(observations))
+            ):
+                self._browser_ask_guard_fired = True
+                browser_ask_rejected = True
+                hint = None
+                if _browser_content_available(observations):
+                    hint = (
+                        "Your question to the user was rejected: the page was already "
+                        "read and its text is in the observations above. Write the answer "
+                        "from that text now and set done=true. If the text is empty, set "
+                        "done=true and say the page appears to have no readable content. "
+                        "NEVER ask the user to provide the page's content."
+                    )
+                else:
+                    # The initial auto-resolution found nothing. The planner
+                    # is refusing to look -- retry the deterministic
+                    # resolution right here before even hinting.
+                    resolved = _resolve_browser_page(goal)
+                    if resolved and not resolved.get("ambiguous"):
+                        auto_obs = _read_resolved_page(resolved)
+                        if auto_obs:
+                            observations.extend(auto_obs)
+                            logger.info(
+                                "[Agent] Re-resolved page '%s' after rejected ask_user",
+                                resolved.get("title"),
+                            )
+                        else:
+                            hint = _LOCATE_PAGE_HINT
+                    else:
+                        hint = _LOCATE_PAGE_HINT
+                if hint:
+                    observations.append({
+                        "step": {"tool": "_browser_ask_guard", "arguments": {}},
+                        "success": False,
+                        "result": hint,
+                    })
+                logger.info(
+                    "[Agent] Rejected ask_user on iteration %s: goal references the "
+                    "browser -- forced planner action",
+                    iteration,
+                )
+
+            # Speak the response ONLY if it is a real message for the user.
+            # "I will now..."-style narration (even on a turn that has a
+            # step) is the model's running commentary, not an answer --
+            # repeating it aloud every iteration is what made multi-step
+            # tasks sound like an endless stalling loop. Also skip speaking
+            # if this response is identical to the last one spoken.
+            if browser_ask_rejected:
+                logger.info("[TTS] Suppressed rejected ask_user response: %s", (response or "")[:80])
+            elif response and not _describes_unexecuted_action(response):
                 if response == self._last_response:
                     logger.info("[TTS] Duplicate response prevented at loop level: %s", response[:60])
                 else:
                     self._last_response = response
                     logger.info("[Agent] Responding to user")
                     self.speak(response)
+            elif response:
+                logger.info("[TTS] Suppressed narrated-action response: %s", response[:80])
 
             if decision.get("done"):
+                self._consecutive_guard_firings = 0
                 logger.info("[Agent] Goal marked complete on iteration %s", iteration)
                 return None
 
             if decision.get("ask_user"):
+                self._consecutive_guard_firings = 0
+                if browser_ask_rejected:
+                    continue
                 logger.info("[Agent] Awaiting user clarification on iteration %s; task pending", iteration)
                 return _pending_result()
 
@@ -219,30 +1368,64 @@ class AgentLoop:
                 if not observations and self.fallback and self.fallback(user, intent_hint):
                     return None
 
-                # If we have observations (tools were called) but the LLM
-                # still returned no step and no response, retry once.
-                if observations and not response:
-                    logger.warning("LLM returned no step on iteration %s; retrying", iteration)
-                    continue
+                # A weak planner that has already gathered the data it
+                # needs will often keep returning narration ("I will now
+                # summarize...") or nothing instead of the final answer.
+                # Count consecutive no-step turns: on the first one tell it
+                # to ANSWER (not call another tool), and after three give
+                # up instead of looping forever.
+                self._no_step_streak += 1
+                logger.warning(
+                    "LLM returned no step on iteration %s (no-step streak %d)",
+                    iteration, self._no_step_streak,
+                )
 
-                # LLM returned a chat response but no tool step.
-                # Instead of silently returning, retry with stronger
-                # prompting so it actually does something.
-                if response:
-                    logger.warning(
-                        "LLM returned response without step on iteration %s; "
-                        "retrying with stronger instruction", iteration,
-                    )
+                if self._no_step_streak >= 3:
+                    logger.warning("LLM returned no step 3 times in a row; ending loop")
+                    if response and not _describes_unexecuted_action(response):
+                        self.speak(response)
+                    else:
+                        self.speak(
+                            "I've gathered some information, but I'm having trouble "
+                            "putting together the final answer. Could you rephrase "
+                            "what you need?"
+                        )
+                    return _pending_result()
+
+                if observations:
+                    # Data is already gathered from earlier tool calls --
+                    # the planner should FINISH, not call yet another tool.
                     observations.append({
-                        "step": {"tool": "_llm_hint", "arguments": {}},
+                        "step": {"tool": "_finish_hint", "arguments": {}},
                         "success": False,
                         "result": (
-                            "You returned a response without a tool step. "
-                            "You MUST return a valid step with tool + arguments. "
-                            "Do NOT ask the user for information already in the goal."
+                            "Do NOT call another tool -- you already have the "
+                            "information needed from the previous tool results. "
+                            "Finish the task NOW: return done=true and write the "
+                            "complete final answer in `response`."
                         ),
                     })
                     continue
+
+                if not response:
+                    continue
+
+                # Nothing has been done yet and the planner just talked
+                # instead of acting: force a real tool step.
+                logger.warning(
+                    "LLM returned response without step on iteration %s; "
+                    "retrying with stronger instruction", iteration,
+                )
+                observations.append({
+                    "step": {"tool": "_llm_hint", "arguments": {}},
+                    "success": False,
+                    "result": (
+                        "You returned a response without a tool step. "
+                        "You MUST return a valid step with tool + arguments. "
+                        "Do NOT ask the user for information already in the goal."
+                    ),
+                })
+                continue
 
                 logger.info("[Agent] Responding to user")
                 self.speak(
@@ -259,13 +1442,16 @@ class AgentLoop:
             # to the existing single-step failure/recovery handling below,
             # acting on whichever step actually failed -- for a single
             # step turn this is exactly the old behavior.
+            self._consecutive_guard_firings = 0
+            self._no_step_streak = 0  # a step was returned -- progress
             batch = decision.get("steps") or [step]
 
             tool = step.get("tool")
             arguments = step.get("arguments", {})
-            step_signature = (tool, json.dumps(arguments, sort_keys=True, default=str))
+            step_signature = _step_signature(tool, arguments)
             success = True
             result = None
+            guard_blocked = False
 
             logger.info(
                 "[Planner] Selected tool: %s%s",
@@ -275,7 +1461,79 @@ class AgentLoop:
             for batch_step in batch:
                 tool = batch_step.get("tool")
                 arguments = batch_step.get("arguments", {})
-                step_signature = (tool, json.dumps(arguments, sort_keys=True, default=str))
+                step_signature = _step_signature(tool, arguments)
+
+                guard_action = self._guard_identical_call(tool, step_signature)
+
+                if guard_action == "reuse":
+                    cached = self._result_cache.get(step_signature)
+                    if cached is None:
+                        guard_action = "execute"
+                    else:
+                        logger.info(
+                            "[LoopGuard] Serving cached result for identical consecutive "
+                            "call: %s args=%s (consecutive x%d)",
+                            tool, arguments, self._consecutive_count,
+                        )
+                        success = cached["success"]
+                        result = cached["result"]
+                        observations.append({
+                            "step": batch_step,
+                            "success": success,
+                            "result": result,
+                            "reused_from_cache": True,
+                        })
+                        safe_print(f"\n[{tool}]")
+                        safe_print(result)
+                        continue
+
+                if guard_action in ("block", "auto_stop"):
+                    self._loop_guard_blocks += 1
+                    self._unproductive_tools.add(tool)
+                    cached = self._result_cache.get(step_signature, {})
+                    hash_note = ""
+                    if cached.get("result_hash"):
+                        hash_note = f" (result hash {cached['result_hash']} every time)"
+                    message = (
+                        f"Loop guard: {tool} was called with identical arguments "
+                        f"{self._consecutive_count} times in a row{hash_note} and the "
+                        f"result never changed. It is marked UNPRODUCTIVE for this goal. "
+                        f"Repeating it cannot succeed. Choose a DIFFERENT tool or "
+                        f"different arguments, explain why the goal cannot be completed, "
+                        f"or ask the user for clarification."
+                    )
+                    if guard_action == "auto_stop":
+                        logger.error(
+                            "[LoopGuard] Auto-stopping: identical tool call %s args=%s "
+                            "repeated %d consecutive times",
+                            tool, arguments, self._consecutive_count,
+                        )
+                        observations.append({
+                            "step": batch_step,
+                            "success": False,
+                            "result": message,
+                            "blocked_by_loop_guard": True,
+                            "auto_stopped": True,
+                        })
+                        self.speak(
+                            f"I keep trying the same action ({tool}) with identical inputs "
+                            f"and it is not making progress, so I'm stopping. Could you "
+                            f"rephrase what you need or give me more details?"
+                        )
+                        return _pending_result()
+                    logger.warning(
+                        "[LoopGuard] Blocked repeated identical call: %s args=%s "
+                        "(consecutive x%d) -- tool marked unproductive",
+                        tool, arguments, self._consecutive_count,
+                    )
+                    observations.append({
+                        "step": batch_step,
+                        "success": False,
+                        "result": message,
+                        "blocked_by_loop_guard": True,
+                    })
+                    guard_blocked = True
+                    break
 
                 try:
                     outcome = self._execute_tool_step(user, batch_step)
@@ -291,6 +1549,8 @@ class AgentLoop:
                 success = outcome["success"]
                 result = outcome["result"]
 
+                self._record_tool_call(batch_step, step_signature, success, result)
+
                 observations.append({
                     "step": batch_step,
                     "success": success,
@@ -301,7 +1561,14 @@ class AgentLoop:
                     step = batch_step
                     break
 
+            if guard_blocked:
+                # The planner was told to do something different; skip the
+                # normal success/failure handling and give it another turn.
+                self._consecutive_guard_firings = 0
+                continue
+
             if success:
+                self._consecutive_guard_firings = 0
                 recovery_attempts = 0
                 repeat_failures = 0
                 last_failed_signature = None
@@ -334,6 +1601,7 @@ class AgentLoop:
                 error=str(result),
                 observations=observations,
             )
+            recovery = _sanitize_backend_error(recovery)
             self._log_reasoning(recovery.get("reasoning"))
 
             if recovery.get("response"):
@@ -351,7 +1619,7 @@ class AgentLoop:
 
             recovery_tool = recovery_step.get("tool")
             recovery_args = recovery_step.get("arguments", {})
-            recovery_signature = (recovery_tool, json.dumps(recovery_args, sort_keys=True, default=str))
+            recovery_signature = _step_signature(recovery_tool, recovery_args)
 
             if recovery_signature == step_signature:
                 self.speak(
@@ -389,6 +1657,7 @@ class AgentLoop:
             })
 
             if recovery_success:
+                self._consecutive_guard_firings = 0
                 recovery_attempts = 0
                 repeat_failures = 0
                 last_failed_signature = None
@@ -432,8 +1701,60 @@ class AgentLoop:
         elif tool == "youtube_recommend" and success:
             logger.info("youtube_recommend succeeded; terminating loop (video is playing)")
             stop = True
+        elif tool == "browser_open" and success:
+            # browser_open always opens a new tab and is typically the
+            # only step for simple "open X" tasks. Returning stop=True
+            # prevents the LLM from calling it again on the next turn
+            # and forces it to either set done=true or proceed to the
+            # next logical step (reading, interacting, etc.).
+            logger.info("browser_open succeeded; returning control for next decision")
+            stop = True
 
         return {"success": success, "result": result, "stop": stop}
+
+    def _guard_identical_call(self, tool: str, signature: tuple) -> str:
+        """Track consecutive identical (tool, normalized arguments) proposals.
+
+        Returns one of:
+          "execute"   - first identical proposal; execute the tool
+          "reuse"     - second identical proposal; serve the cached result
+          "block"     - third identical proposal; do not execute, force a
+                        change (tool gets marked unproductive for the task)
+          "auto_stop" - fourth+ identical proposal; end the task and ask
+                        the user for help
+        """
+        if signature == self._consecutive_signature:
+            self._consecutive_count += 1
+        else:
+            self._consecutive_signature = signature
+            self._consecutive_count = 1
+
+        if self._consecutive_count >= IDENTICAL_AUTO_STOP_AT:
+            return "auto_stop"
+        if self._consecutive_count >= IDENTICAL_BLOCK_AT:
+            return "block"
+        if self._consecutive_count > 1:
+            return "reuse"
+        return "execute"
+
+    def _record_tool_call(self, step: dict, signature: tuple, success: bool, result) -> None:
+        """Remember every executed tool call (tool + normalized arguments +
+        result hash) so the guard can detect identical repeats and serve
+        cached results without re-executing."""
+        entry = {
+            "tool": step.get("tool"),
+            "arguments": step.get("arguments", {}),
+            "signature": signature,
+            "success": success,
+            "result": result,
+            "result_hash": _hash_result(result),
+        }
+        self._tool_history.append(entry)
+        self._result_cache[signature] = {
+            "result": result,
+            "success": success,
+            "result_hash": entry["result_hash"],
+        }
 
     def _handle_file_search(self, user: str, result: dict) -> bool:
         if not self.on_file_search_result:
