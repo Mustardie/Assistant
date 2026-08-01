@@ -1,3 +1,4 @@
+import atexit
 import logging
 import threading
 import sys
@@ -7,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 from brain.agent import Agent
 from ui.main_window import AssistantWindow
 from backend.bridge import AssistantBridge
+from backend.browser_server import start_bridge, stop_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,34 @@ def configure_logging():
 
 
 configure_logging()
+
+
+def _start_embedded_bridge():
+    """Start the browser bridge in-process so the Edge extension has a
+    backend without requiring a separate terminal. Reuses an existing
+    bridge if one is already running on 127.0.0.1:8742."""
+    ok = start_bridge()
+    if not ok:
+        logger.warning(
+            "Browser bridge is not available -- browser commands "
+            "will fail until it can be started"
+        )
+    return ok
+
+
+# Start the browser bridge before anything else (Agent may touch it).
+_bridge_started = _start_embedded_bridge()
+
+
+def _shutdown_bridge():
+    """Gracefully stop the embedded bridge when Nova exits."""
+    if _bridge_started:
+        stop_bridge()
+    else:
+        logger.info("Browser bridge was not started by this process -- leaving it running")
+
+
+atexit.register(_shutdown_bridge)
 
 agent = Agent()
 
@@ -43,6 +73,10 @@ def _start_voice():
 # ------------------------------------------------------------------ #
 
 app = QApplication(sys.argv)
+
+# Gracefully stop the embedded bridge when the event loop exits
+# (atexit is registered as a fallback for non-Qt exit paths).
+app.aboutToQuit.connect(_shutdown_bridge)
 
 window = AssistantWindow()
 

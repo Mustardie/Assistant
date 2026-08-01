@@ -1,12 +1,14 @@
 """
-Backward-compatible facade over the new modular browser system in
-tools/browser/. Existing code (skills/youtube.py) imports `browser` from
-here and calls a handful of legacy method names -- those are preserved,
-just delegating to BrowserAgent underneath, always against the current tab.
+Backward-compatible facade over the browser system in tools/browser/.
+Existing code (skills/youtube.py) imports `browser` from here and calls
+a handful of legacy method names -- those are preserved, delegating to
+BrowserAgent underneath.
 
 New code should use the browser_* tools registered in tool_registry.py
-instead, which expose the full tab/navigation/interaction/reading/form/
-download surface built in tools/browser/.
+instead.
+
+BrowserAgent now uses the Edge Extension MV3 backend by default.
+Set NOVA_USE_LEGACY_BROWSER=1 to restore the old Playwright/CDP backend.
 """
 from tools.browser.browser_agent import browser_agent
 
@@ -28,8 +30,8 @@ class _LegacyBrowserFacade:
         return browser_agent.google_search(query)
 
     def read_title(self):
-        _, page = browser_agent._page_for(None)
-        return page.title()
+        result = browser_agent.read_page()
+        return result.get("title", "")
 
     def read_text(self, tab=None, max_chars=4000):
         return browser_agent.read_text(tab=tab, max_chars=max_chars)

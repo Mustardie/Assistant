@@ -8,6 +8,9 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
+from config.settings import settings
+from llm.gemini_client import GeminiClient
+from llm.ollama_client import OllamaClient
 from llm.openrouter_client import OpenRouterClient, OpenRouterConfigurationError
 
 logger = logging.getLogger(__name__)
@@ -469,9 +472,16 @@ class LongTermMemory:
     # LLM-backed classification
     # ------------------------------------------------------------------ #
 
-    def _get_llm_client(self) -> OpenRouterClient:
+    def _get_llm_client(self):
         if self._llm_client is None:
-            self._llm_client = OpenRouterClient()
+            provider = settings.llm_provider
+            if provider == "ollama":
+                self._llm_client = OllamaClient()
+            elif provider == "gemini":
+                self._llm_client = GeminiClient()
+            else:
+                self._llm_client = OpenRouterClient()
+            logger.info("Long-term memory using provider=%s client=%s", provider, self._llm_client.__class__.__name__)
         return self._llm_client
 
     def _classify_with_llm(self, raw_text: str) -> dict | None:

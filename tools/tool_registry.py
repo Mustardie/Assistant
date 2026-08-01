@@ -1,4 +1,5 @@
 import copy
+import inspect
 import logging
 import os
 import platform
@@ -25,6 +26,7 @@ from tools.computer_tool import (
     wait,
 )
 from tools.web_research import web_research
+from tools.research_tool import research_topic
 from tools.file_ops import (
     create_folder,
     delete_folder,
@@ -86,6 +88,9 @@ def _require(value, name, example=""):
 
 
 def browser_open(url=None):
+    """Open the given URL in a NEW browser tab. Never overwrites the
+    current tab. For simple 'open X' tasks this is often the only step
+    needed -- after it succeeds the goal is typically complete."""
     err = _require(url, "url")
     if err:
         return err
@@ -148,8 +153,25 @@ def google_search(query=None):
     return browser.google_search(query)
 
 
-def browser_read():
-    return browser.read_title()
+def browser_read(tab=None, url=None, max_chars=4000):
+    """Reads the CURRENT page: returns {"title", "url", "text", "truncated"}.
+
+    `text` is the page's visible text, truncated to max_chars characters
+    (default 4000; `truncated` is true when the page was longer).
+
+    There is no 'url' argument -- the page to read is whichever tab is
+    active after the last tab action. If the target page is in another
+    tab, browser_switch_tab(tab) to it first.
+
+    ('url' is accepted and ignored for compatibility with older planner
+    output that wrongly passed it -- it can NOT select a page to read.)
+    """
+    if url is not None:
+        logger.warning(
+            "[Browser] browser_read() ignored an unexpected 'url' argument -- "
+            "it reads the current page; switch tabs first if needed"
+        )
+    return browser.read_text(tab=tab, max_chars=max_chars)
 
 
 def browser_read_text(tab=None, max_chars=4000):
@@ -197,9 +219,31 @@ def browser_label_tab(tab, label):
 # ---------------- Browser agent: navigation ---------------- #
 
 def browser_goto(url=None, tab=None):
+    """Open URL in a NEW tab. Always creates a new tab -- never
+    overwrites the current page. Prefer this over browser_navigate
+    unless you explicitly need to replace the current tab."""
     if not url:
         return {"success": False, "error": "Missing argument 'url'. Provide the URL to navigate to (e.g. 'https://flights.google.com')."}
     return browser_agent.goto(url, tab=tab)
+
+
+def browser_navigate(url=None, tab=None):
+    """Navigate the CURRENT tab to the given URL (replaces the current
+    page). Unlike browser_goto, this does NOT create a new tab. Use
+    only when you explicitly want to replace what's in the current tab
+    (e.g. after browser_back, to navigate somewhere new from the
+    current page)."""
+    if not url:
+        return {"success": False, "error": "Missing argument 'url'. Provide the URL to navigate to (e.g. 'https://flights.google.com')."}
+    return browser_agent.navigate(url, tab=tab)
+
+
+def browser_get_browser_state():
+    """Lightweight snapshot of the current browser: active tab URL/title,
+    all open tabs, focused window, loading status. Uses the browser's
+    tab/window API directly (no page DOM injection). Call this to
+    quickly check what's open without reading a page."""
+    return browser_agent.get_browser_state()
 
 
 def browser_back(tab=None):
@@ -450,7 +494,7 @@ def browser_summarize_session(format="text"):
     """Collect all extracted data, notes, page summaries, and progress
     into a final structured digest. Call at the END of a multi-tab
     workflow to present the full result."""
-    return browser_agent.summarize_session(format=format)
+    return browser_agent.summarize_session(fmt=format)
 
 
 def recipe_save(goal, tags, steps):
@@ -745,6 +789,7 @@ TOOLS = {
     "browser_read": browser_read,
     "browser_read_text": browser_read_text,
     "web_research": web_research,
+    "research_topic": research_topic,
 
     "browser_list_tabs": browser_list_tabs,
     "browser_open_tab": browser_open_tab,
@@ -754,6 +799,8 @@ TOOLS = {
     "browser_label_tab": browser_label_tab,
 
     "browser_goto": browser_goto,
+    "browser_navigate": browser_navigate,
+    "browser_get_browser_state": browser_get_browser_state,
     "browser_back": browser_back,
     "browser_forward": browser_forward,
     "browser_refresh": browser_refresh,
@@ -938,6 +985,46 @@ def _resolve_tool_arguments(arguments):
     return _resolve_placeholders(copy.deepcopy(arguments))
 
 
+# Argument-name aliases the LLM is known to use for the same parameter.
+# Chrome/extension tool results report tab ids as "tabId"; weak models
+# copy that name straight into the next tool call, but every browser tool
+# names the parameter "tab". Accept both spellings so a copied "tabId"
+# can never TypeError a tool again. Keyed by the canonical parameter name.
+_ARGUMENT_ALIASES = {
+    "tab": ("tabId", "tab_id"),
+}
+
+
+def _apply_argument_aliases(tool_name, arguments, function) -> dict:
+    """Rename LLM-ism argument keys (e.g. tabId -> tab) before the call,
+    but only for tools that actually accept the canonical name, so a
+    legitimate 'tabId'-accepting tool is never disturbed."""
+    if not isinstance(arguments, dict) or not arguments:
+        return arguments
+
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return arguments
+
+    renamed = dict(arguments)
+    changed = False
+    for canonical, aliases in _ARGUMENT_ALIASES.items():
+        if canonical not in parameters or canonical in renamed:
+            continue
+        for alias in aliases:
+            if alias in renamed:
+                renamed[canonical] = renamed.pop(alias)
+                changed = True
+                break
+    if changed:
+        logger.info(
+            "[Executor] %s: mapped argument alias -> %s",
+            tool_name, {k: (renamed[k] if k in renamed else None) for k in sorted(set(arguments) | set(renamed))},
+        )
+    return renamed
+
+
 def run_tool(tool_name, arguments):
     if tool_name not in TOOLS:
         logger.error("[Executor] Unknown tool requested: %s", tool_name)
@@ -964,6 +1051,7 @@ def run_tool(tool_name, arguments):
                     f"Tool '{tool_name}' was called with {type(resolved_arguments).__name__} "
                     f"arguments (expected dict). The LLM generated bad JSON for this step."
                 )
+            resolved_arguments = _apply_argument_aliases(tool_name, resolved_arguments, function)
             result = function(**resolved_arguments)
         else:
             result = function()

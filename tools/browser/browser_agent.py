@@ -1,525 +1,743 @@
+"""
+browser_agent.py -- BrowserAgent backed by the Edge Extension.
+
+Why this file exists:
+The original Playwright/CDP-based BrowserAgent is preserved in
+browser_agent_legacy.py for rollback. This replacement uses the Edge
+Extension MV3 as its primary backend.
+
+Architecture:
+  BrowserAgent.method()  -->  EdgeExtensionClient.send(type, payload)
+                          -->  FastAPI server (POST /api/send)
+                          -->  Edge Extension (WebSocket)
+                          -->  DOM / chrome.tabs / chrome.downloads
+
+Key design:
+- goto() ALWAYS opens a NEW tab -- never overwrites the user's current page.
+- navigate() replaces the CURRENT tab's URL -- use only when explicitly
+  requested.
+- get_browser_state() returns a lightweight snapshot without DOM injection.
+
+Set NOVA_USE_LEGACY_BROWSER=1 to restore the old Playwright backend.
+
+Memory & state methods (get_state, set_task, plan, note, etc.) are
+implemented locally -- they don't require a browser backend.
+
+Methods without a direct extension equivalent raise a clear
+NotImplementedError rather than silently falling back.
+"""
+
 import logging
+import os
+import time
 from typing import Optional
+from urllib.parse import urlsplit
 
-from . import downloader, form_handler, interaction, navigator, page_reader
-from .browser_memory import BrowserMemory
-from .session import BrowserSession
-from .tab_manager import Tab, TabManager, TabNotFoundError
+from .edge_extension_client import EdgeExtensionClient
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("nova.browser")
 
+_backend_name = "EdgeExtension"
+_legacy_mode = os.environ.get("NOVA_USE_LEGACY_BROWSER", "").lower() in ("1", "true", "yes")
+
+if _legacy_mode:
+    from .browser_agent_legacy import BrowserAgent as _LegacyAgent
+    logger.warning("[Browser] Backend: Legacy (NO_EXTENSION mode)")
+
+
+def _map_result(raw: dict) -> dict:
+    if not isinstance(raw, dict):
+        return {"success": False, "error": f"Unexpected response: {raw}"}
+    if "success" not in raw:
+        return {"success": True, **raw}
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# BrowserAgent
+# ---------------------------------------------------------------------------
 
 class BrowserAgent:
-    """Top-level facade. Owns one TabManager (which owns one BrowserSession)
-    and one BrowserMemory, and dispatches every operation to the right
-    module against the right tab's Page. This is what tool_registry.py
-    wraps into individual tools for the reasoning loop."""
+    """Browser automation agent.  Uses the Edge Extension by default."""
 
     def __init__(self):
-        self.session = BrowserSession()
-        self.tabs = TabManager(self.session)
-        self.memory = BrowserMemory()
+        self._ext = EdgeExtensionClient()
 
-    def _page_for(self, tab_ref: Optional[str]):
-        tab = self.tabs.resolve(tab_ref)
-        return tab, tab.page
+        if _legacy_mode:
+            self._legacy = _LegacyAgent()
+        else:
+            self._legacy = None
 
-    # ------------------------------------------------------------------ #
+        self._memory = {}
+
+        # Edge Extension backend state (Nova-side bookkeeping):
+        #   _opened_urls: normalized URL -> tabId of the tab already showing it
+        #   _tab_labels:  tabId -> purpose label (from open_tab/goto)
+        # These let the agent REUSE an already-open page instead of spawning
+        # duplicate tabs, and let callers refer to tabs by label.
+        self._opened_urls: dict[str, int] = {}
+        self._tab_labels: dict[int, str] = {}
+
+    # -- helpers -----------------------------------------------------------
+
+    # Domains that are the same product under different hostnames -- a tab
+    # open on one must count as "the same page" when the other is requested
+    # (e.g. an open chatgpt.com tab vs a requested chat.openai.com/chat).
+    _HOST_ALIAS_GROUPS: tuple[frozenset[str], ...] = (
+        frozenset({"chatgpt.com", "chat.openai.com"}),
+    )
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """Normalize a URL for dedupe comparison (case + trailing slash)."""
+        return (url or "").strip().rstrip("/").lower()
+
+    @classmethod
+    def _host_key(cls, url: str) -> str:
+        """Hostname normalized for comparison (lowercase, no www, and
+        aliased across the same-product domain groups above)."""
+        host = (urlsplit(url or "").netloc or "").split(":")[0].strip().lower()
+        if host.startswith("www."):
+            host = host[4:]
+        for group in cls._HOST_ALIAS_GROUPS:
+            if host in group:
+                return "|".join(sorted(group))
+        return host
+
+    @classmethod
+    def _is_root_request(cls, url: str) -> bool:
+        """True when the requested URL points at a site root (no path)."""
+        return urlsplit(url or "").path in ("", "/")
+
+    def _find_existing_tab(self, url: str) -> Optional[dict]:
+        """Return the first open tab already showing this URL, else None.
+        Returns None (and logs) when the tab list cannot be queried, so
+        callers fall back to creating a new tab.
+
+        Matching is progressive:
+          1. exact normalized URL
+          2. same host, when the requested URL is a site root (a tab on
+             youtube.com matches a request for youtube.com)
+          3. same product via the host-alias groups (chatgpt.com matches
+             chat.openai.com/chat)
+        """
+        try:
+            listing = self._ext_send_and_check("tab_list")
+        except Exception as exc:
+            logger.debug("[Browser] tab_list failed during dedupe check: %s", exc)
+            return None
+        tabs = (listing or {}).get("tabs") or []
+        norm = self._normalize_url(url)
+        requested_host = self._host_key(url)
+        root_request = self._is_root_request(url)
+        for t in tabs:
+            if t and self._normalize_url(t.get("url")) == norm:
+                return t
+        if root_request:
+            for t in tabs:
+                if t and self._host_key(t.get("url")) == requested_host:
+                    return t
+        for t in tabs:
+            if t and self._host_key(t.get("url")) == requested_host:
+                return t
+        return None
+
+    def _resolve_tab_id(self, tab) -> Optional[int]:
+        """Resolve a tab reference to a tabId.
+
+        Accepts: None (-> None, meaning "active tab"), a numeric id, a
+        purpose label from open_tab/goto, or a string matching an open
+        tab's url/title. Returns None when unresolvable.
+        """
+        if tab is None:
+            return None
+        if isinstance(tab, int):
+            return tab
+        if isinstance(tab, str) and tab.strip().isdigit():
+            return int(tab.strip())
+
+        needle = str(tab).strip().lower()
+        # 1) Purpose labels recorded when tabs were opened
+        for tid, lbl in self._tab_labels.items():
+            if str(lbl).strip().lower() == needle:
+                return tid
+        # 2) Live match against open tabs (url/title/label substring)
+        try:
+            listing = self._ext_send_and_check("tab_list")
+        except Exception:
+            return None
+        for t in (listing or {}).get("tabs") or []:
+            tid = t.get("tabId")
+            haystacks = [str(t.get("url") or ""), str(t.get("title") or "")]
+            if tid in self._tab_labels:
+                haystacks.append(str(self._tab_labels[tid]))
+            for hay in haystacks:
+                if needle and needle in hay.lower():
+                    return tid
+        return None
+
+    def _remember_opened(self, url: str, tab_id, label: Optional[str] = None) -> None:
+        """Bookkeeping for dedupe + label resolution."""
+        if not tab_id:
+            return
+        self._opened_urls[self._normalize_url(url)] = int(tab_id)
+        if label:
+            self._tab_labels[int(tab_id)] = label
+
+    def _ext_send(self, cmd: str, payload: dict = None) -> dict:
+        result = self._ext.send(cmd, payload)
+        return _map_result(result)
+
+    def _ext_send_and_check(self, cmd: str, payload: dict = None) -> dict:
+        result = self._ext_send(cmd, payload)
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.warning(f"[Browser] Extension command failed: {cmd} – {result.get('error')}")
+        return result
+
+    def _browser_method(self, method: str, *args, **kwargs):
+        if self._legacy:
+            return getattr(self._legacy, method)(*args, **kwargs)
+        return None
+
+    # ================================================================== #
     # Tabs
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
 
     def list_tabs(self) -> dict:
-        return {"success": True, "tabs": self.tabs.list_tabs()}
+        if self._legacy:
+            return self._legacy.list_tabs()
+        return self._ext_send_and_check("tab_list")
 
     def open_tab(self, url: Optional[str] = None, label: Optional[str] = None) -> dict:
-        # Deduplicate: if a tab with the same label already exists, switch to it.
-        if label:
-            existing = self.tabs.find_by_label(label)
-            if existing:
-                logger.info("[Browser] Reusing existing tab '%s' (id=%s)", label, existing.id)
-                try:
-                    existing.page.bring_to_front()
-                except Exception:
-                    pass
-                self.tabs._current_id = existing.id
-                if url:
-                    return self.goto(url, tab=label)
-                return {"success": True, "tab": existing.snapshot(), "reused": True}
+        if self._legacy:
+            return self._legacy.open_tab(url=url, label=label)
+        url = (url or "about:blank").strip()
 
-        # Deduplicate: if a tab with the same URL already exists, switch to it.
-        if url:
-            existing = self.tabs.find_by_url(url)
+        # Dedupe: if this URL is already open in a tab, reuse it instead of
+        # creating a duplicate tab (per goal sequencing contract).
+        if url and url != "about:blank":
+            existing = self._find_existing_tab(url)
             if existing:
-                logger.info("[Browser] Reusing existing tab for URL '%s' (id=%s)", url, existing.id)
-                try:
-                    existing.page.bring_to_front()
-                except Exception:
-                    pass
-                self.tabs._current_id = existing.id
-                return {"success": True, "tab": existing.snapshot(), "reused": True}
+                tab_id = existing.get("tabId")
+                self._remember_opened(url, tab_id, label)
+                logger.info("[Browser] URL already open in tab %s -- reusing (no duplicate tab)", tab_id)
+                switch = self._ext_send_and_check("tab_switch", {"tabId": tab_id})
+                if not switch.get("success"):
+                    return {
+                        "success": False,
+                        "reused": True,
+                        "tabId": tab_id,
+                        "url": existing.get("url", url),
+                        "error": f"Tab for {url} is already open (id {tab_id}) but could not be activated: {switch.get('error')}",
+                    }
+                return {
+                    "success": True,
+                    "reused": True,
+                    "tabId": tab_id,
+                    "url": existing.get("url", url),
+                    "note": "Tab already open -- switched to the existing tab instead of opening a new one",
+                }
 
-        try:
-            logger.info("[Browser] Opening page '%s' label='%s'", url, label)
-            tab = self.tabs.open_tab(url=url, label=label)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-        if url:
-            self.memory.record_navigation(tab.id, tab.page.url, tab.page.title())
-        logger.info("[Browser] Opened tab %s (%s)", tab.id, tab.label)
-        return {"success": True, "tab": tab.snapshot()}
+        result = self._ext_send_and_check("tab_new", {"url": url})
+        self._remember_opened(url, result.get("tabId"), label)
+        return result
 
     def close_tab(self, tab: Optional[str] = None) -> dict:
-        try:
-            snapshot = self.tabs.close_tab(tab)
-        except TabNotFoundError as exc:
-            return {"success": False, "error": str(exc)}
-        return {"success": True, "closed": snapshot}
+        if self._legacy:
+            return self._legacy.close_tab(tab=tab)
+        resolved = self._resolve_tab_id(tab) if tab else None
+        if tab is not None and resolved is None:
+            return {
+                "success": False,
+                "error": f"Cannot resolve tab '{tab}' -- use a tab id or a purpose label from browser_open_tab",
+            }
+        payload = {"tabId": resolved} if resolved is not None else {}
+        return self._ext_send_and_check("tab_close", payload)
 
     def switch_tab(self, tab: str) -> dict:
-        try:
-            resolved = self.tabs.switch_tab(tab)
-        except TabNotFoundError as exc:
-            return {"success": False, "error": str(exc)}
-        return {"success": True, "tab": resolved.snapshot()}
+        if self._legacy:
+            return self._legacy.switch_tab(tab)
+        resolved = self._resolve_tab_id(tab)
+        if resolved is None:
+            return {
+                "success": False,
+                "error": f"Cannot resolve tab '{tab}' -- use a tab id or a purpose label from browser_open_tab",
+            }
+        return self._ext_send_and_check("tab_switch", {"tabId": resolved})
 
     def duplicate_tab(self, tab: Optional[str] = None, label: Optional[str] = None) -> dict:
-        try:
-            new_tab = self.tabs.duplicate_tab(tab, label=label)
-        except TabNotFoundError as exc:
-            return {"success": False, "error": str(exc)}
-        return {"success": True, "tab": new_tab.snapshot()}
+        if self._legacy:
+            return self._legacy.duplicate_tab(tab=tab, label=label)
+        return {"success": False, "error": "duplicate_tab not available in Edge Extension backend"}
 
     def label_tab(self, tab: str, label: str) -> dict:
-        try:
-            resolved = self.tabs.relabel(tab, label)
-        except TabNotFoundError as exc:
-            return {"success": False, "error": str(exc)}
-        return {"success": True, "tab": resolved.snapshot()}
+        if self._legacy:
+            return self._legacy.label_tab(tab, label)
+        return {"success": False, "error": "label_tab not available in Edge Extension backend"}
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
     # Navigation
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
 
     def goto(self, url: str, tab: Optional[str] = None) -> dict:
-        try:
-            resolved_tab, page = self._page_for(tab)
-        except TabNotFoundError as exc:
-            return {"success": False, "error": str(exc)}
+        """
+        Open URL in a NEW tab. NEVER overwrites the current tab.
+        Use navigate() if you need to replace the current tab's URL.
+        If the URL is already open in a tab, that tab is reused instead
+        of opening a duplicate.
+        """
+        if self._legacy:
+            return self._legacy.goto(url, tab=tab)
+        url = (url or "").strip()
 
-        result = navigator.goto(page, url)
-        if result.get("success"):
-            self.tabs.touch_label(resolved_tab)
-            self.memory.record_navigation(resolved_tab.id, page.url, page.title())
-            logger.info("[Browser] Navigated to %s on tab %s", url, resolved_tab.id)
-        else:
-            self.memory.record_failure(resolved_tab.id, "goto", url, result.get("error", ""))
-            logger.warning("[Browser] Navigation to %s failed on tab %s: %s", url, resolved_tab.id, result.get("error", ""))
-        return result
-
-    def back(self, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        result = navigator.back(page)
-        if result.get("success"):
-            self.tabs.touch_label(resolved_tab)
-            self.memory.record_navigation(resolved_tab.id, page.url, page.title())
-        return result
-
-    def forward(self, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        result = navigator.forward(page)
-        if result.get("success"):
-            self.tabs.touch_label(resolved_tab)
-            self.memory.record_navigation(resolved_tab.id, page.url, page.title())
-        return result
-
-    def refresh(self, tab: Optional[str] = None) -> dict:
-        _, page = self._page_for(tab)
-        return navigator.refresh(page)
-
-    def wait_for_load(self, tab: Optional[str] = None, timeout: int = 15000, state: str = "load") -> dict:
-        _, page = self._page_for(tab)
-        return navigator.wait_for_load(page, timeout=timeout, state=state)
-
-    def wait_for_element(self, description: str, tab: Optional[str] = None, timeout: int = 15000) -> dict:
-        _, page = self._page_for(tab)
-        return navigator.wait_for_element(page, description, timeout=timeout)
-
-    # ------------------------------------------------------------------ #
-    # Reading
-    # ------------------------------------------------------------------ #
-
-    def read_text(self, tab: Optional[str] = None, max_chars: int = 4000) -> dict:
-        _, page = self._page_for(tab)
-        return page_reader.read_text(page, max_chars=max_chars)
-
-    def read_dom_summary(self, tab: Optional[str] = None, max_items: int = 40) -> dict:
-        _, page = self._page_for(tab)
-        return page_reader.read_dom_summary(page, max_items=max_items)
-
-    def extract_tables(self, tab: Optional[str] = None) -> dict:
-        _, page = self._page_for(tab)
-        return page_reader.extract_tables(page)
-
-    def extract_links(self, tab: Optional[str] = None, limit: int = 50) -> dict:
-        _, page = self._page_for(tab)
-        return page_reader.extract_links(page, limit=limit)
-
-    def extract_forms(self, tab: Optional[str] = None) -> dict:
-        _, page = self._page_for(tab)
-        return page_reader.extract_forms(page)
-
-    # ------------------------------------------------------------------ #
-    # Interaction (each records a failure into browser_memory on failure)
-    # ------------------------------------------------------------------ #
-
-    def _do_interaction(self, tab, page, action_name, fn, description):
-        result = fn()
-        if not result.get("success"):
-            self.memory.record_failure(tab.id, action_name, description, result.get("error", ""))
-        return result
-
-    def click(self, description: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        result = self._do_interaction(resolved_tab, page, "click", lambda: interaction.click(page, description), description)
-        if result.get("success"):
-            logger.info("[Browser] Clicked '%s' on tab %s", description[:40], resolved_tab.id)
-        return result
-
-    def double_click(self, description: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(resolved_tab, page, "double_click", lambda: interaction.double_click(page, description), description)
-
-    def right_click(self, description: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(resolved_tab, page, "right_click", lambda: interaction.right_click(page, description), description)
-
-    def hover(self, description: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(resolved_tab, page, "hover", lambda: interaction.hover(page, description), description)
-
-    def type_text(self, description: str, text: str, clear_first: bool = True, press_enter: bool = False, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        result = self._do_interaction(
-            resolved_tab, page, "type_text",
-            lambda: interaction.type_text(page, description, text, clear_first=clear_first, press_enter=press_enter), description,
-        )
-        if result.get("success") and press_enter:
-            logger.info("[Browser] Search completed (typed '%s' and pressed Enter)", text[:40])
-        return result
-
-    def press_key(self, key: str, tab: Optional[str] = None) -> dict:
-        _, page = self._page_for(tab)
-        return interaction.press_key(page, key)
-
-    def scroll(self, amount: int = 600, description: Optional[str] = None, tab: Optional[str] = None) -> dict:
-        _, page = self._page_for(tab)
-        return interaction.scroll(page, amount=amount, description=description)
-
-    def select_dropdown(self, description: str, option: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(
-            resolved_tab, page, "select_dropdown",
-            lambda: interaction.select_dropdown(page, description, option), description,
-        )
-
-    def set_checkbox(self, description: str, checked: bool = True, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(
-            resolved_tab, page, "set_checkbox",
-            lambda: interaction.set_checkbox(page, description, checked=checked), description,
-        )
-
-    def click_radio(self, description: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(resolved_tab, page, "click_radio", lambda: interaction.click_radio(page, description), description)
-
-    def drag_and_drop(self, source_description: str, target_description: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(
-            resolved_tab, page, "drag_and_drop",
-            lambda: interaction.drag_and_drop(page, source_description, target_description),
-            f"{source_description} -> {target_description}",
-        )
-
-    def upload_file(self, description: str, file_path: str, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        return self._do_interaction(
-            resolved_tab, page, "upload_file",
-            lambda: interaction.upload_file(page, description, file_path), description,
-        )
-
-    # ------------------------------------------------------------------ #
-    # Forms
-    # ------------------------------------------------------------------ #
-
-    def fill_form(self, fields: dict, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        result = form_handler.fill_form(page, fields)
-        if not result.get("success"):
-            self.memory.record_failure(resolved_tab.id, "fill_form", str(list(fields.keys())), str(result.get("fields")))
-        return result
-
-    # ------------------------------------------------------------------ #
-    # Downloads
-    # ------------------------------------------------------------------ #
-
-    def download_via(self, trigger_description: str, destination_dir: Optional[str] = None, tab: Optional[str] = None) -> dict:
-        resolved_tab, page = self._page_for(tab)
-        result = downloader.download_via(page, trigger_description, destination_dir=destination_dir)
-        if not result.get("success"):
-            self.memory.record_failure(resolved_tab.id, "download", trigger_description, result.get("error", ""))
-        return result
-
-    # ------------------------------------------------------------------ #
-    # Auth (best-effort: relies on the persistent Edge profile's saved
-    # session/autofill -- never enters credentials itself)
-    # ------------------------------------------------------------------ #
-
-    def wait_for_login(self, tab: Optional[str] = None, timeout_seconds: int = 120) -> dict:
-        """Polls the tab's URL, waiting for it to move away from a
-        login-like path. Meant to be called right after navigating to a
-        login page: if the user is already authenticated via the browser's
-        saved session, this returns almost immediately; otherwise it gives
-        the user (or the browser's own saved-password autofill) time to
-        complete the login manually."""
-        import time as _time
-
-        resolved_tab, page = self._page_for(tab)
-        login_markers = ("login", "signin", "sign-in", "sign_in", "auth", "accounts.google.com")
-        start = _time.time()
-        start_url = page.url
-
-        while _time.time() - start < timeout_seconds:
-            try:
-                current_url = page.url
-            except Exception:
-                current_url = start_url
-
-            still_on_login = any(marker in current_url.lower() for marker in login_markers)
-            if not still_on_login and current_url != start_url:
-                self.tabs.touch_label(resolved_tab)
-                self.memory.record_navigation(resolved_tab.id, page.url, page.title())
-                return {"success": True, "url": current_url, "waited_seconds": round(_time.time() - start, 1)}
-
-            page.wait_for_timeout(1000)
-
-        self.memory.record_failure(resolved_tab.id, "wait_for_login", tab or "current", "Timed out waiting for login to complete")
-        return {
-            "success": False,
-            "error": f"Still appears to be on a login page after {timeout_seconds}s. "
-                     "The user may need to complete login manually, or saved credentials aren't available for this site.",
-        }
-
-    # ------------------------------------------------------------------ #
-    # Page understanding (single-shot comprehensive snapshot)
-    # ------------------------------------------------------------------ #
-
-    def read_page(self, tab: str | None = None) -> dict:
-        """Return a comprehensive structured snapshot of the current page:
-        URL, title, page type, all interactive elements, headings, text,
-        forms, tables, viewport info. This is the preferred way to
-        understand a page before acting -- replaces needing 5 separate
-        calls to read_dom_summary/read_text/extract_links/etc."""
-        from .page_snapshot import snapshot as _snapshot
-
-        try:
-            resolved_tab, page = self._page_for(tab)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-        result = _snapshot(page)
-        if result.get("success"):
-            self.tabs.touch_label(resolved_tab)
-            self.memory.record_page_summary(resolved_tab.id, result)
-        return result
-
-    def read_page_light(self, tab: str | None = None) -> dict:
-        """Quick page check: URL, title, page type, buttons, links, inputs.
-        Lighter than full read_page for fast verification loops."""
-        from .page_snapshot import snapshot_light as _snapshot_light
-
-        try:
-            _, page = self._page_for(tab)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-        return _snapshot_light(page)
-
-    # ------------------------------------------------------------------ #
-    # Action verification
-    # ------------------------------------------------------------------ #
-
-    def verify_navigation(self, tab: str | None = None, before_url: str = "", before_title: str = "") -> dict:
-        """Check if the page changed (URL, title) since a previous state.
-        Call before an action to capture state, then after to verify."""
-        from .navigator import did_navigation_occur
-
-        try:
-            _, page = self._page_for(tab)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-        return did_navigation_occur(page, before_url, before_title)
-
-    def verify_element_appeared(self, description: str, tab: str | None = None, timeout: int = 5000) -> dict:
-        """Check if an element matching the description is now visible.
-        Returns confidence score if found."""
-        from .element_finder import resolve as _resolve
-
-        try:
-            _, page = self._page_for(tab)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-
-        try:
-            resolved = _resolve(page, description)
+        existing = self._find_existing_tab(url) if url else None
+        if existing:
+            tab_id = existing.get("tabId")
+            self._remember_opened(url, tab_id)
+            logger.info("[Browser] goto: URL already open in tab %s -- reusing", tab_id)
+            switch = self._ext_send_and_check("tab_switch", {"tabId": tab_id})
+            if not switch.get("success"):
+                return {
+                    "success": False,
+                    "reused": True,
+                    "tabId": tab_id,
+                    "url": existing.get("url", url),
+                    "error": f"Tab for {url} is already open (id {tab_id}) but could not be activated: {switch.get('error')}",
+                }
             return {
                 "success": True,
-                "found": True,
-                "description": description,
-                "confidence": resolved.confidence,
-                "strategy": resolved.strategy,
+                "reused": True,
+                "tabId": tab_id,
+                "url": existing.get("url", url),
+                "note": "Tab already open -- switched to the existing tab instead of opening a new one",
             }
-        except ElementNotFoundError as exc:
-            return {"success": True, "found": False, "description": description, "error": str(exc)}
 
-    # ------------------------------------------------------------------ #
-    # Vision fallback (page screenshot + vision model analysis)
-    # ------------------------------------------------------------------ #
+        result = self._ext_send_and_check("tab_open", {"url": url})
+        self._remember_opened(url, result.get("tabId"))
+        return result
 
-    def vision(self, question: str = "What do you see on this page?", tab: str | None = None) -> dict:
-        """Take a screenshot of the current page and ask the vision model
-        a question about it. Use this when the text-based snapshot doesn't
-        give you enough context — e.g. dropdown popups, date picker
-        calendars, captchas, or custom UI widgets that the DOM snapshot
-        can't capture."""
-        from tools.vision import Vision
-        try:
-            _, page = self._page_for(tab)
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
-        try:
-            screenshot = page.screenshot()
-            from io import BytesIO
-            from PIL import Image
-            image = Image.open(BytesIO(screenshot))
-            answer = Vision().look(image, question)
-            return {"success": True, "answer": answer}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+    def navigate(self, url: str, tab: Optional[str] = None) -> dict:
+        """
+        Navigate the CURRENT tab to the given URL (replaces current page).
+        Unlike goto(), this does NOT create a new tab. Use this only when
+        you explicitly want to replace the current page.
+        """
+        if self._legacy:
+            return self._legacy.goto(url, tab=tab)
+        return self._ext_send_and_check("tab_navigate", {"url": url})
 
-    # ------------------------------------------------------------------ #
-    # Memory / state
-    # ------------------------------------------------------------------ #
+    def back(self, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.back(tab=tab)
+        return self._ext_send_and_check("tab_back")
 
-    def get_state(self) -> dict:
-        return self.memory.get_state(self.tabs.list_tabs())
+    def forward(self, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.forward(tab=tab)
+        return self._ext_send_and_check("tab_forward")
 
-    def set_task(self, description: str, total_steps: int = 0) -> dict:
-        self.memory.set_task(description, total_steps=total_steps)
-        return {"success": True, "task": description, "total_steps": total_steps}
+    def refresh(self, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.refresh(tab=tab)
+        return self._ext_send_and_check("tab_reload")
 
-    def update_progress(self, note: str) -> dict:
-        self.memory.add_progress(note)
-        return {"success": True, "progress_notes": self.memory.progress_notes}
+    def wait_for_load(self, tab: Optional[str] = None, timeout: int = 15000, state: str = "load") -> dict:
+        if self._legacy:
+            return self._legacy.wait_for_load(tab=tab, timeout=timeout, state=state)
+        # Poll the lightweight browser-state snapshot until the active tab
+        # reports status == "complete" (or the timeout elapses). This is
+        # the belt-and-suspenders for sequencing: tab_open/tab_new already
+        # wait for navigation to complete before responding, so this only
+        # matters when a page keeps loading (redirects, heavy JS).
+        deadline = time.monotonic() + (timeout or 15000) / 1000.0
+        last_status = None
+        while time.monotonic() < deadline:
+            try:
+                state_info = self._ext_send("get_browser_state")
+            except Exception as exc:
+                logger.debug("[Browser] wait_for_load: state query failed: %s", exc)
+                state_info = {}
+            active = (state_info or {}).get("activeTab") or {}
+            last_status = active.get("status") or last_status
+            if not last_status:
+                # Snapshot has no status field (older extension) -- assume loaded.
+                return {"success": True, "status": "unknown"}
+            if last_status == "complete":
+                return {"success": True, "status": last_status, "url": active.get("url", "")}
+            time.sleep(0.25)
+        return {
+            "success": False,
+            "error": f"Page did not finish loading within {timeout}ms (last status: {last_status})",
+        }
 
-    def complete_step(self, step_description: str) -> dict:
-        self.memory.complete_step(step_description)
-        return {"success": True, "step": self.memory.current_step, "completed_steps": self.memory.completed_steps}
+    def wait_for_element(self, description: str, tab: Optional[str] = None, timeout: int = 15000) -> dict:
+        if self._legacy:
+            return self._legacy.wait_for_element(description, tab=tab, timeout=timeout)
+        return self._ext_send_and_check("wait_for_selector", {
+            "selector": description,
+            "timeout": timeout,
+        })
 
-    def plan(self, goal: str, steps: list[str]) -> dict:
-        """Store an explicit ordered plan. Each step is a short string like
-        'Search flights to Tokyo', 'Compare hotel options', etc.
-        Also captures the goal in set_task."""
-        self.set_task(goal, total_steps=len(steps))
-        self.memory.set_plan(steps)
+    # ================================================================== #
+    # Browser state (lightweight, no DOM injection)
+    # ================================================================== #
+
+    def get_browser_state(self) -> dict:
+        """
+        Lightweight snapshot of the current browser state:
+        active tab, all tabs, focused window, etc.
+        No DOM injection -- uses chrome.tabs/chrome.windows API only.
+        """
+        if self._legacy:
+            return self._legacy.get_browser_state()
+        return self._ext_send_and_check("get_browser_state")
+
+    # ================================================================== #
+    # Reading
+    # ================================================================== #
+
+    def read_text(self, tab: Optional[str] = None, max_chars: int = 4000) -> dict:
+        if self._legacy:
+            return self._legacy.read_text(tab=tab, max_chars=max_chars)
+        result = self._ext_send("get_page_text")
+        text = result.get("text") or ""
         return {
             "success": True,
-            "goal": goal,
-            "steps": steps,
-            "step_count": len(steps),
-            "plan_progress": [
-                {"step": s, "done": False} for s in steps
-            ],
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars,
         }
+
+    def read_dom_summary(self, tab: Optional[str] = None, max_items: int = 40) -> dict:
+        if self._legacy:
+            return self._legacy.read_dom_summary(tab=tab, max_items=max_items)
+        return {"success": False, "error": "read_dom_summary not available in Edge Extension backend"}
+
+    def extract_tables(self, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.extract_tables(tab=tab)
+        return {"success": False, "error": "extract_tables not available in Edge Extension backend"}
+
+    def extract_links(self, tab: Optional[str] = None, limit: int = 50) -> dict:
+        if self._legacy:
+            return self._legacy.extract_links(tab=tab, limit=limit)
+        return {"success": False, "error": "extract_links not available in Edge Extension backend"}
+
+    def extract_forms(self, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.extract_forms(tab=tab)
+        return {"success": False, "error": "extract_forms not available in Edge Extension backend"}
+
+    # ================================================================== #
+    # Page understanding
+    # ================================================================== #
+
+    def read_page(self, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.read_page(tab=tab)
+        result = self._ext_send("get_page_text")
+        return _map_result({
+            "success": True,
+            "url": result.get("url", ""),
+            "title": result.get("title", ""),
+            "text": result.get("text", ""),
+            "metadata": result.get("metadata", {}),
+        })
+
+    def read_page_light(self, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.read_page_light(tab=tab)
+        result = self._ext_send("get_page_text")
+        text = (result.get("text") or "")[:3000]
+        return _map_result({
+            "success": True,
+            "url": result.get("url", ""),
+            "title": result.get("title", ""),
+            "text": text,
+            "metadata": result.get("metadata", {}),
+        })
+
+    # ================================================================== #
+    # Interaction
+    # ================================================================== #
+
+    def find_element(self, description: str, tab: Optional[str] = None) -> dict:
+        """Find page elements by their visible text / aria-label / placeholder.
+        The extension tags every hit with a stable selector so follow-up
+        click/type commands can target it. Returns the best (visible,
+        exact-match) hit plus all candidates."""
+        if self._legacy:
+            from .element_finder import resolve  # legacy Playwright path
+            try:
+                page = self._legacy._page_for(tab)
+                resolved = resolve(page, description)
+                return {
+                    "success": True,
+                    "best": {"selector": resolved.selector, "tag": resolved.tag},
+                    "count": 1,
+                    "elements": [{"selector": resolved.selector, "tag": resolved.tag}],
+                }
+            except Exception as exc:
+                return {"success": False, "error": str(exc)}
+        return self._ext_send_and_check("find_element", {"description": description})
+
+    def _click_selector(self, selector: str) -> dict:
+        return self._ext_send_and_check("click", {"selector": selector, "options": {}})
+
+    def click(self, description: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.click(description, tab=tab)
+        result = self._click_selector(description)
+        if result.get("success"):
+            return result
+        # The description was not a live CSS selector -- treat it as
+        # visible text ("the 'Blank document' button") and resolve it.
+        logger.info("[Browser] click '%s' failed as selector (%s) -- trying text lookup", description, (result.get("error") or "")[:60])
+        found = self.find_element(description, tab=tab)
+        if not found.get("success"):
+            return {
+                "success": False,
+                "error": f"Could not find anything to click matching: {description}",
+                "details": result.get("error"),
+            }
+        best = (found.get("best") or {}).get("selector")
+        if not best:
+            return {
+                "success": False,
+                "error": f"Found elements for '{description}' but none usable",
+                "elements": found.get("elements"),
+            }
+        logger.info("[Browser] click resolved '%s' -> %s", description, best)
+        return self._click_selector(best)
+
+    def double_click(self, description: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.double_click(description, tab=tab)
+        result = self._ext_send_and_check("double_click", {"selector": description})
+        if result.get("success"):
+            return result
+        found = self.find_element(description, tab=tab)
+        best = (found.get("best") or {}).get("selector")
+        if not found.get("success") or not best:
+            return {
+                "success": False,
+                "error": f"Could not find anything to double-click matching: {description}",
+            }
+        return self._ext_send_and_check("double_click", {"selector": best})
+
+    def right_click(self, description: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.right_click(description, tab=tab)
+        result = self._ext_send_and_check("right_click", {"selector": description})
+        if result.get("success"):
+            return result
+        found = self.find_element(description, tab=tab)
+        best = (found.get("best") or {}).get("selector")
+        if not found.get("success") or not best:
+            return {
+                "success": False,
+                "error": f"Could not find anything to right-click matching: {description}",
+            }
+        return self._ext_send_and_check("right_click", {"selector": best})
+
+    def hover(self, description: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.hover(description, tab=tab)
+        return {"success": False, "error": "hover not available in Edge Extension backend"}
+
+    def type_text(
+        self,
+        description: str,
+        text: str,
+        clear_first: bool = True,
+        press_enter: bool = False,
+        tab: Optional[str] = None,
+    ) -> dict:
+        if self._legacy:
+            return self._legacy.type_text(description, text, clear_first=clear_first, press_enter=press_enter, tab=tab)
+        result = self._type_into(description, text, clear_first=clear_first, keyboard=False)
+        if not result.get("success"):
+            found = self.find_element(description, tab=tab)
+            best = (found.get("best") or {}).get("selector")
+            if found.get("success") and best:
+                logger.info("[Browser] type_text resolved '%s' -> %s", description, best)
+                result = self._type_into(best, text, clear_first=clear_first, keyboard=False)
+                if not result.get("success"):
+                    # Rich editors (Google Docs, Notion) often ignore
+                    # synthetic input events -- retry with keyboard events.
+                    result = self._type_into(best, text, clear_first=clear_first, keyboard=True)
+        if press_enter and result.get("success"):
+            self._ext_send("press_key", {"key": "Enter"})
+        return result
+
+    def _type_into(self, selector: str, text: str, clear_first: bool, keyboard: bool) -> dict:
+        return self._ext_send_and_check("type_text", {
+            "selector": selector,
+            "text": text,
+            "clear": clear_first,
+            "keyboard": keyboard,
+        })
+
+    def press_key(self, key: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.press_key(key, tab=tab)
+        return self._ext_send_and_check("press_key", {"key": key})
+
+    def scroll(self, amount: int = 600, description: Optional[str] = None, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.scroll(amount=amount, description=description, tab=tab)
+        if description:
+            return self._ext_send_and_check("scroll_to", {"selector": description})
+        return self._ext_send_and_check("scroll_by", {"x": 0, "y": amount})
+
+    def select_dropdown(self, description: str, option: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.select_dropdown(description, option, tab=tab)
+        return self._ext_send_and_check("select_option", {"selector": description, "value": option})
+
+    def set_checkbox(self, description: str, checked: bool = True, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.set_checkbox(description, checked=checked, tab=tab)
+        return self.click(description, tab=tab)
+
+    def click_radio(self, description: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.click_radio(description, tab=tab)
+        return self.click(description, tab=tab)
+
+    def drag_and_drop(self, source_description: str, target_description: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.drag_and_drop(source_description, target_description, tab=tab)
+        return {"success": False, "error": "drag_and_drop not available in Edge Extension backend"}
+
+    def upload_file(self, description: str, file_path: str, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.upload_file(description, file_path, tab=tab)
+        return {"success": False, "error": "upload_file not available in Edge Extension backend"}
+
+    # ================================================================== #
+    # Forms
+    # ================================================================== #
+
+    def fill_form(self, fields: dict, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.fill_form(fields, tab=tab)
+        if not isinstance(fields, dict) or not fields:
+            return {"success": False, "error": "fill_form requires a non-empty dict of field -> value"}
+        payload = [{"field": str(k), "value": v} for k, v in fields.items()]
+        return self._ext_send_and_check("fill_form", {"fields": payload})
+
+    # ================================================================== #
+    # Downloads
+    # ================================================================== #
+
+    def download_via(self, trigger_description: str, destination_dir: Optional[str] = None, tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.download_via(trigger_description, destination_dir=destination_dir, tab=tab)
+        return {"success": False, "error": "download_via not available in Edge Extension backend"}
+
+    # ================================================================== #
+    # Auth
+    # ================================================================== #
+
+    def wait_for_login(self, tab: Optional[str] = None, timeout_seconds: int = 120) -> dict:
+        if self._legacy:
+            return self._legacy.wait_for_login(tab=tab, timeout_seconds=timeout_seconds)
+        return {"success": False, "error": "wait_for_login not available in Edge Extension backend"}
+
+    # ================================================================== #
+    # Action verification
+    # ================================================================== #
+
+    def verify_navigation(self, tab: Optional[str] = None, before_url: str = "", before_title: str = "") -> dict:
+        if self._legacy:
+            return self._legacy.verify_navigation(tab=tab, before_url=before_url, before_title=before_title)
+        result = self._ext_send("get_tab_info")
+        return _map_result({
+            "success": True,
+            "url_changed": result.get("url", "") != before_url,
+            "current_url": result.get("url", ""),
+            "title": result.get("title", ""),
+        })
+
+    def verify_element_appeared(self, description: str, tab: Optional[str] = None, timeout: int = 5000) -> dict:
+        if self._legacy:
+            return self._legacy.verify_element_appeared(description, tab=tab, timeout=timeout)
+        return self._ext_send_and_check("wait_for_selector", {"selector": description, "timeout": timeout})
+
+    # ================================================================== #
+    # Vision
+    # ================================================================== #
+
+    def vision(self, question: str = "What do you see on this page?", tab: Optional[str] = None) -> dict:
+        if self._legacy:
+            return self._legacy.vision(question=question, tab=tab)
+        return {"success": False, "error": "vision not available in Edge Extension backend"}
+
+    # ================================================================== #
+    # Memory / State  (local-only, no browser needed)
+    # ================================================================== #
+
+    def get_state(self) -> dict:
+        state = dict(self._memory)
+        state["opened_urls"] = dict(self._opened_urls)
+        state["tab_labels"] = {str(k): v for k, v in self._tab_labels.items()}
+        return {"success": True, "state": state}
+
+    def set_task(self, description: str, total_steps: int = 0) -> dict:
+        self._memory["task"] = {"description": description, "total_steps": total_steps, "current_step": 0}
+        return {"success": True}
+
+    def update_progress(self, note: str) -> dict:
+        self._memory.setdefault("progress_log", []).append(note)
+        return {"success": True}
+
+    def complete_step(self, step_description: str) -> dict:
+        if "task" in self._memory:
+            self._memory["task"]["current_step"] += 1
+        self._memory.setdefault("completed_steps", []).append(step_description)
+        return {"success": True}
+
+    def plan(self, goal: str, steps: list[str]) -> dict:
+        self._memory["plan"] = {"goal": goal, "steps": steps}
+        return {"success": True}
 
     def note(self, key: str, value: str) -> dict:
-        """Store a session-level note (cross-tab working memory).
-        Unlike record_data which is per-tab, notes are global to the
-        whole session — use for things like 'cheapest_flight=₹25,000'
-        that span multiple tabs."""
-        self.memory.set_note(key, value)
-        return {"success": True, "key": key, "value": value}
+        self._memory.setdefault("notes", {})[key] = value
+        return {"success": True}
 
-    def summarize_session(self, format: str = "text") -> dict:
-        """Collect all extracted data, notes, page summaries, and
-        progress into a final structured digest. Use this when you've
-        completed a multi-tab workflow and need to present results."""
-        state = self.memory.get_state(self.tabs.list_tabs())
-        tabs = self.tabs.list_tabs()
-        summary = {
-            "goal": state.get("current_task", ""),
-            "plan": state.get("plan", []),
-            "plan_progress": state.get("plan_progress", []),
-            "completed_steps": state.get("completed_steps", []),
-            "notes": state.get("notes", {}),
-            "extracted_data": state.get("extracted_data", {}),
-            "page_summaries": state.get("page_summaries", {}),
-            "open_tabs": [
-                {"label": t.label, "url": t.url, "title": t.title}
-                for t in tabs
-            ],
-        }
-        return {"success": True, "format": format, "summary": summary}
+    def summarize_session(self, fmt: str = "text") -> dict:
+        return {"success": True, "summary": str(self._memory)}
 
-    def record_data(self, key: str, data, tab: str | None = None) -> dict:
-        """Store extracted data (prices, search results, etc.) in browser
-        memory so the agent can reference it later without re-reading."""
-        try:
-            resolved_tab = self.tabs.resolve(tab) if tab else self.tabs.get_current()
-            tab_id = resolved_tab.id
-        except Exception:
-            tab_id = "default"
-        self.memory.record_extracted_data(tab_id, key, data)
-        return {"success": True, "key": key, "tab_id": tab_id}
+    def record_data(self, key: str, data, tab: Optional[str] = None) -> dict:
+        self._memory.setdefault("recorded_data", {})[key] = data
+        return {"success": True}
 
-    # ------------------------------------------------------------------ #
-    # Legacy-compatible helpers (used by tools/browser_tool.py shim so
-    # skills/youtube.py needs zero changes)
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    # Legacy helper methods
+    # ================================================================== #
 
-    def youtube_search(self, query: str) -> str:
-        _, page = self._page_for(None)
-        navigator.goto(page, "https://www.youtube.com")
-        page.wait_for_selector('input[name="search_query"]', timeout=10000)
-        page.locator('input[name="search_query"]').fill(query)
-        page.keyboard.press("Enter")
-        page.wait_for_selector("ytd-video-renderer", timeout=10000)
-        return f"Searched YouTube for '{query}'"
+    def youtube_search(self, query: str) -> dict:
+        search_url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+        nav = self.goto(search_url)
+        if not nav.get("success"):
+            return nav
+        return {"success": True, "message": f"Navigated to YouTube search: {query}"}
 
-    def youtube_play_url(self, url: str) -> str:
-        if not url.startswith("http"):
-            url = f"https://www.youtube.com/watch?v={url}"
-        _, page = self._page_for(None)
-        navigator.goto(page, url)
-        page.wait_for_load_state("domcontentloaded")
-        return f"Playing {url}"
+    def youtube_play_url(self, url: str) -> dict:
+        return self.goto(url)
 
-    def youtube_play_first_result(self) -> str:
-        _, page = self._page_for(None)
-        page.wait_for_selector("a#video-title", timeout=10000)
-        page.locator("a#video-title").first.click()
-        page.wait_for_load_state("domcontentloaded")
-        return "Playing first YouTube video."
+    def youtube_play_first_result(self) -> dict:
+        return {"success": False, "error": "youtube_play_first_result not available in Edge Extension backend"}
 
-    def google_search(self, query: str) -> str:
-        _, page = self._page_for(None)
-        navigator.goto(page, "https://www.google.com")
-        page.wait_for_selector('textarea[name="q"]', timeout=10000)
-        page.locator('textarea[name="q"]').fill(query)
-        page.keyboard.press("Enter")
-        page.wait_for_load_state("domcontentloaded")
-        return f"Searched Google for '{query}'"
+    def google_search(self, query: str) -> dict:
+        search_url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
+        nav = self.goto(search_url)
+        if not nav.get("success"):
+            return nav
+        return {"success": True, "message": f"Navigated to Google search: {query}"}
 
 
+# Module-level singleton – same pattern as the original.
 browser_agent = BrowserAgent()

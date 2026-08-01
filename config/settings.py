@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from .paths import get_nova_memory_dir
 
@@ -54,6 +55,24 @@ class Settings:
     ollama_url: str = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "gemma3:12b")
 
+    # Research pipeline (Tavily). research_dir defaults to ~/Downloads/Nova Research
+    # on Windows (Path.home() / "Downloads"). Empty env value falls back to default.
+    research_provider: str = os.getenv("RESEARCH_PROVIDER", "tavily") or "tavily"
+    tavily_api_key: str = os.getenv("TAVILY_API_KEY", "") or ""
+    research_dir: str = os.getenv("RESEARCH_DIR", "") or str(
+        Path.home() / "Downloads" / "Nova Research"
+    )
+    research_max_sources: int = int(os.getenv("RESEARCH_MAX_SOURCES", "12"))
+    research_max_images: int = int(os.getenv("RESEARCH_MAX_IMAGES", "6"))
+    research_max_papers: int = int(os.getenv("RESEARCH_MAX_PAPERS", "2"))
+
+    # Role-split: a dedicated, stronger model runs the planner (decisions,
+    # tool selection, recovery) while the main model above handles cheap
+    # work (page summaries, document drafts). Falls back to the main model
+    # automatically if the planner model is unavailable (e.g. not pulled).
+    planner_provider: str = os.getenv("PLANNER_PROVIDER", "ollama")
+    planner_model: str = os.getenv("PLANNER_MODEL", "qwen3:14b")
+
     memory_dir: str = os.getenv("MEMORY_DIR", str(get_nova_memory_dir()))
     recommendation_pool_size: int = int(os.getenv("RECOMMENDATION_POOL_SIZE", "80"))
     recommendation_top_n: int = int(os.getenv("RECOMMENDATION_TOP_N", "10"))
@@ -71,7 +90,14 @@ class Settings:
     voice_language: str = os.getenv("VOICE_LANGUAGE", "en")
     voice_silence_seconds: float = float(os.getenv("VOICE_SILENCE_SECONDS", "1.5"))
     voice_device: str = os.getenv("VOICE_DEVICE", "")
-    tts_voice: str = os.getenv("TTS_VOICE", "af_heart")
+    # TTS engine: "piper" (default, more natural voices) or "kokoro".
+    tts_engine: str = os.getenv("TTS_ENGINE", "piper")
+    piper_voice: str = os.getenv("PIPER_VOICE", "en_US-ryan-high")
+    piper_voice_dir: str = os.getenv("PIPER_VOICE_DIR", "") or str(
+        Path.home() / ".cache" / "piper-voices"
+    )
+    kokoro_repo_id: str = os.getenv("KOKORO_REPO_ID", "hexgrad/Kokoro-82M")
+    kokoro_voice: str = os.getenv("KOKORO_VOICE", "us_puck")
     tts_speed: float = float(os.getenv("TTS_SPEED", "1.0"))
 
 
