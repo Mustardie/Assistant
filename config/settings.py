@@ -84,6 +84,22 @@ class Settings:
     agent_max_iterations: int = int(os.getenv("AGENT_MAX_ITERATIONS", "20"))
     agent_max_recovery_attempts: int = int(os.getenv("AGENT_MAX_RECOVERY_ATTEMPTS", "3"))
 
+    # Skills subsystem (semantic desktop automation). Skills are always
+    # stored OUTSIDE the project folder -- Downloads/Nova/Skills by default.
+    skills_dir: str = os.getenv("SKILLS_DIR", "") or str(
+        Path.home() / "Downloads" / "Nova" / "Skills"
+    )
+    skills_capture_interval_ms: int = int(os.getenv("SKILLS_CAPTURE_INTERVAL_MS", "400"))
+    skills_screenshot_quality: int = int(os.getenv("SKILLS_SCREENSHOT_QUALITY", "70"))
+    skills_min_suggest_frequency: int = int(
+        os.getenv("SKILLS_MIN_SUGGEST_FREQUENCY", "3")
+    )
+    skills_suggest_window_days: int = int(os.getenv("SKILLS_SUGGEST_WINDOW_DAYS", "14"))
+    skills_auto_play_threshold: float = float(
+        os.getenv("SKILLS_AUTO_PLAY_THRESHOLD", "0.7")
+    )
+    skills_mouse_poll_hz: int = int(os.getenv("SKILLS_MOUSE_POLL_HZ", "20"))
+
     # Voice settings
     voice_sample_rate: int = int(os.getenv("VOICE_SAMPLE_RATE", "16000"))
     voice_model: str = os.getenv("VOICE_MODEL", "base")
@@ -102,3 +118,21 @@ class Settings:
 
 
 settings = Settings()
+
+
+def apply_runtime_overrides(**overrides: str) -> None:
+    """Apply settings changes at runtime without a restart.
+
+    ``Settings`` is frozen and instantiated once at import; every consumer
+    (LLM clients, Brain, TTS, skills, ...) reads from that same shared
+    instance. Mutating it in place via ``object.__setattr__`` (bypassing
+    the frozen guard) plus setting the matching environment variable
+    (``OPENROUTER_API_KEY`` -> ``openrouter_api_key``, etc.) makes the new
+    value visible to code that is rebuilt after the change.
+    """
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        if hasattr(settings, key):
+            object.__setattr__(settings, key, value)
+        os.environ[key.upper()] = str(value)

@@ -1,0 +1,96 @@
+{
+ "fad499302fb0": {
+  "title": "Summarize my Gmail from this week",
+  "messages": [
+   {
+    "role": "user",
+    "text": "Summarize my Gmail from this week",
+    "ts": 1785644655.518793
+   },
+   {
+    "role": "assistant",
+    "text": "You have **23 new emails** this week. Here's the breakdown:\n\n• 5 from work — 2 meeting invites, 1 urgent approval, 2 newsletters\n• 12 promotions / marketing — mostly ignored\n• 3 personal — including the trip plan we discussed\n\nThe most important one is the **invoice approval** from Sarah — it expires tomorrow. Want me to draft a reply?",
+    "ts": 1785644655.5197952
+   },
+   {
+    "role": "user",
+    "text": "Yes, draft it and also find my recent notes",
+    "ts": 1785644655.5197952
+   },
+   {
+    "role": "user",
+    "text": "What's on my screen right now?",
+    "ts": 1785644657.043992
+   },
+   {
+    "role": "assistant",
+    "text": "You're on the Nova project README. The file has 3 sections and the installation steps are at the end. Want me to run the setup script?",
+    "ts": 1785644657.043992
+   },
+   {
+    "role": "user",
+    "text": "test",
+    "ts": 1785657565.234705
+   },
+   {
+    "role": "assistant",
+    "text": "reply",
+    "ts": 1785657565.234705
+   }
+  ],
+  "updated": 1785657565.234705
+ },
+ "_active": "9098d3fe74ce",
+ "abc123": {
+  "title": "Plan a weekend trip",
+  "messages": [],
+  "updated": 1722600000
+ },
+ "def456": {
+  "title": "Fix the bridge bug",
+  "messages": [],
+  "updated": 1723000000
+ },
+ "ghi789": {
+  "title": "Summarize my Gmail",
+  "messages": [],
+  "updated": 1722500000
+ },
+ "0294a5d8beaf": {
+  "title": "New conversation",
+  "messages": [],
+  "updated": 1785658096.4148176
+ },
+ "9098d3fe74ce": {
+  "title": "research on ai neural networks",
+  "messages": [
+   {
+    "role": "user",
+    "text": "research on ai neural networks",
+    "ts": 1785661277.3898234
+   },
+   {
+    "role": "assistant",
+    "text": "Starting in-depth research on ai neural networks. This takes a couple of minutes.\n\nResearch on ai neural networks is done. The report and sources are saved in D:\\Research Files\\ai-neural-networks.\n\nResearch on subnautica peeper is done. The report and sources are saved in D:\\Research Files\\subnautica-peeper.",
+    "ts": 1785661277.3898234
+   }
+  ],
+  "updated": 1785661546.413134
+ },
+ "4b02b2cc9af6": {
+  "title": "research on subnautica peeper",
+  "messages": [
+   {
+    "role": "user",
+    "text": "research on subnautica peeper",
+    "ts": 1785661530.5024657
+   },
+   {
+    "role": "assistant",
+    "text": "Starting in-depth research on subnautica peeper. This takes a couple of minutes.",
+    "ts": 1785661530.5124824
+   }
+  ],
+  "updated": 1785661530.513985
+ }
+}
