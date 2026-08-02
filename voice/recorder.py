@@ -12,6 +12,18 @@ class Recorder:
         self.silence_duration = silence_duration or settings.voice_silence_seconds
         self.device = device or (settings.voice_device or None)
         self._threshold = 0.01
+        self._stop = threading.Event()
+
+    def reset(self):
+        """Clear any previous stop request before a new session."""
+        self._stop.clear()
+
+    def stop(self):
+        """Ask record() to return as soon as possible (mic toggle)."""
+        self._stop.set()
+
+    def stop_requested(self) -> bool:
+        return self._stop.is_set()
 
     def record(self) -> np.ndarray:
         chunk = int(self.sample_rate * 0.1)
@@ -43,8 +55,11 @@ class Recorder:
             blocksize=chunk,
             callback=callback,
         ):
-            done.wait()
+            while not done.is_set() and not self._stop.is_set():
+                done.wait(0.1)
 
+        if self._stop.is_set() and not voice_active:
+            return np.zeros(0, dtype=np.float32)
         if not audio_buf:
             return np.zeros(0, dtype=np.float32)
         return np.concatenate(audio_buf).ravel()

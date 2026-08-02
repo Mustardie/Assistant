@@ -3,10 +3,12 @@ import hashlib
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from config.settings import settings
+from skills.manager import skill_manager
 from recommendation.errors import RecommendationConfigurationError
 from tools.browser.browser_agent import browser_agent
 from tools.tool_registry import clear_tool_context, run_tool
@@ -713,6 +715,181 @@ def _detect_complex_task(goal: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Skills subsystem: deterministic command detection (watch me / do the X
+# skill / show my skills / ...). Runs before the planner so skill commands
+# never depend on the LLM; playback then drives itself with its own
+# vision loop and only pauses when the user's input is genuinely needed.
+# ---------------------------------------------------------------------------
+
+_SKILL_LIST_PATTERN = re.compile(
+    r"\b(?:show|list|see|what)\b[^.!?]{0,40}\bskills?\b", re.IGNORECASE
+)
+
+_SKILL_RECORD_STOP_PATTERN = re.compile(
+    r"\b(?:stop|end|finish|done|save)\s+(?:the\s+|this\s+|my\s+)?recording\b"
+    r"|\bsave\s+the\s+skill\b"
+    r"|\b(?:i'?m|im)\s+done\b",
+    re.IGNORECASE,
+)
+
+_SKILL_RECORD_PAUSE_PATTERN = re.compile(r"\bpause\s+(?:the\s+)?recording\b", re.IGNORECASE)
+_SKILL_RECORD_RESUME_PATTERN = re.compile(
+    r"\b(?:resume|continue)\s+(?:the\s+)?recording\b", re.IGNORECASE
+)
+_SKILL_RECORD_CANCEL_PATTERN = re.compile(
+    r"\b(?:cancel|discard|abandon|forget)\s+(?:the\s+)?recording\b", re.IGNORECASE
+)
+
+_SKILL_RECORD_START_PATTERN = re.compile(
+    r"\bwatch me\b"
+    r"|\blearn this\b"
+    r"|\b(?:start|begin)\s+recording\b"
+    r"|\brecord\s+(?:a\s+|this\s+|my\s+|the\s+|a\s+new\s+)?"
+    r"(?:skill|workflow|routine|macro|this|it)\b"
+    r"|\b(?:teach|train)\s+me\b[^.!?]{0,30}\bskill\b",
+    re.IGNORECASE,
+)
+
+_SKILL_RECORD_NAME_PATTERN = re.compile(
+    r"\b(?:skill|workflow|routine|macro)\s+(?:called|named)\s+[\"']?([^\"'.!?]{2,60})[\"']?",
+    re.IGNORECASE,
+)
+
+_SKILL_PLAY_PATTERN = re.compile(
+    r"\b(?:do|run|play|execute|start|perform|repeat|use)\b"
+    r"\s+(?:the\s+|your\s+|my\s+|our\s+|a\s+)?([\w][\w .\-']{1,60}?)\s+skill\b",
+    re.IGNORECASE,
+)
+
+_SKILL_RENAME_PATTERN = re.compile(
+    r"\brename\s+(?:the\s+)?(?:skill\s+)?[\"']?([^\"']{2,60}?)[\"']?"
+    r"(?:\s+skill)?\s+(?:to|as)\s+[\"']?([^\"']{2,60})[\"']?\b",
+    re.IGNORECASE,
+)
+
+_SKILL_DELETE_PATTERN = re.compile(
+    r"\b(?:delete|remove|erase)\s+(?:the\s+)?(?:skill\s+)?[\"']?([^\"']{2,60})[\"']?\b",
+    re.IGNORECASE,
+)
+
+_SKILL_EXPORT_PATTERN = re.compile(
+    r"\bexport\s+(?:the\s+)?(?:skill\s+)?[\"']?([^\"']{2,60})[\"']?\b",
+    re.IGNORECASE,
+)
+
+_SKILL_DUPLICATE_PATTERN = re.compile(
+    r"\b(?:duplicate|copy)\s+(?:the\s+)?(?:skill\s+)?[\"']?([^\"']{2,60}?)[\"']?"
+    r"(?:\s+skill)?(?:\s+(?:as|to)\s+[\"']?([^\"']{2,60})[\"']?)?\b",
+    re.IGNORECASE,
+)
+
+_SKILL_IMPORT_PATTERN = re.compile(
+    r"\bimport\s+(?:a\s+|the\s+)?skill\s+(?:from\s+)?[\"']?([^\"']{2,120})[\"']?\b",
+    re.IGNORECASE,
+)
+
+# Goals that should never auto-run a skill even on a high match: file
+# operations and media playback go through their own deterministic paths.
+_SKILL_AUTO_PLAY_BLOCKED = re.compile(
+    r"\b(file|folder|directory|download|pdf|docx?|xlsx?|pptx?|zip|rar|tar|"
+    r"video|music|song|playlist|watch)\b",
+    re.IGNORECASE,
+)
+
+
+def _skill_edit_cue(goal: str) -> bool:
+    """Editing commands (rename/delete/export/duplicate) only count as
+    skill commands when the word 'skill' appears or the name is quoted --
+    otherwise 'delete my old videos' would be swallowed as a skill
+    command and never reach the file/planner paths."""
+    return bool(re.search(r"\bskill\b", goal, re.IGNORECASE)) \
+        or '"' in goal or "'" in goal
+
+
+def _detect_skill_request(goal: str) -> dict | None:
+    """Detect an explicit skill command. Returns {"intent", "args"} or
+    None when the goal is not a skill command."""
+    goal = goal or ""
+
+    if _SKILL_LIST_PATTERN.search(goal):
+        return {"intent": "list", "args": {}}
+    if _SKILL_RECORD_STOP_PATTERN.search(goal):
+        return {"intent": "record_stop", "args": {}}
+    if _SKILL_RECORD_PAUSE_PATTERN.search(goal):
+        return {"intent": "record_pause", "args": {}}
+    if _SKILL_RECORD_RESUME_PATTERN.search(goal):
+        return {"intent": "record_resume", "args": {}}
+    if _SKILL_RECORD_CANCEL_PATTERN.search(goal):
+        return {"intent": "record_cancel", "args": {}}
+    if _SKILL_RECORD_START_PATTERN.search(goal):
+        name_match = _SKILL_RECORD_NAME_PATTERN.search(goal)
+        return {"intent": "record_start", "args": {"name": name_match.group(1) if name_match else None}}
+
+    if _SKILL_RENAME_PATTERN.search(goal) and _skill_edit_cue(goal):
+        match = _SKILL_RENAME_PATTERN.search(goal)
+        return {"intent": "rename", "args": {"name": match.group(1), "new_name": match.group(2)}}
+    if _SKILL_DELETE_PATTERN.search(goal) and _skill_edit_cue(goal):
+        match = _SKILL_DELETE_PATTERN.search(goal)
+        return {"intent": "delete", "args": {"name": match.group(1)}}
+    if _SKILL_EXPORT_PATTERN.search(goal) and _skill_edit_cue(goal):
+        match = _SKILL_EXPORT_PATTERN.search(goal)
+        return {"intent": "export", "args": {"name": match.group(1)}}
+    if _SKILL_DUPLICATE_PATTERN.search(goal) and _skill_edit_cue(goal):
+        match = _SKILL_DUPLICATE_PATTERN.search(goal)
+        return {"intent": "duplicate",
+                "args": {"name": match.group(1), "new_name": match.group(2)}}
+    if _SKILL_IMPORT_PATTERN.search(goal):
+        match = _SKILL_IMPORT_PATTERN.search(goal)
+        return {"intent": "import", "args": {"path": match.group(1)}}
+
+    play_match = _SKILL_PLAY_PATTERN.search(goal)
+    if play_match:
+        return {"intent": "play", "args": {"name": play_match.group(1).strip()}}
+
+    return None
+
+
+def _user_accepted(text: str) -> bool:
+    """Did the user say yes to an improvement offer?"""
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return False
+    if re.search(
+        r"\b(no|nope|nah|don'?t|do not|never|keep it|leave it|as is)\b", lowered
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(yes|yeah|yep|sure|ok|okay|improve|update|go ahead|do it|please|y)\b",
+            lowered,
+        )
+    )
+
+
+def _skills_runtime_active() -> bool:
+    """Unit tests must never touch the real skills directory."""
+    import os
+
+    return "PYTEST_CURRENT_TEST" not in os.environ
+
+
+def _goal_looks_like_file_request(goal: str) -> bool:
+    """Guard against auto-running a skill for goals that should go through
+    the file manager's deterministic intent detection instead."""
+    goal = goal or ""
+    if not re.search(
+        r"\b(open|find|search|show|list|rename|move|copy|delete|extract|unzip|"
+        r"compress|zip|reveal|properties|where is|look for)\b", goal, re.IGNORECASE
+    ):
+        return False
+    return bool(re.search(
+        r"\b(pdf|docx?|xlsx?|pptx?|file|folder|directory|archive|zip|rar|tar|"
+        r"downloads?|screenshot|notes|document|project|code|image|photo|picture)\b",
+        goal, re.IGNORECASE,
+    ))
+
+
 def _read_resolved_page(page: dict) -> list[dict]:
     """Switch to the resolved tab and read it, returning observation dicts.
 
@@ -879,6 +1056,12 @@ class AgentLoop:
         self._loop_guard_blocks = 0
         self._browser_ask_guard_fired = False
         self._pending_tab_choice = None
+        # Skills subsystem state (persists across turns like _pending_tab_choice):
+        # a playback paused on a user question, a completed playback waiting
+        # on the improvement offer, and suggestions shown this session.
+        self._pending_skill_session = None
+        self._pending_improvement_session = None
+        self._suggested_phrases: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Deterministic complex-task handlers (pre-planner)
@@ -1045,6 +1228,121 @@ class AgentLoop:
             return False
         return handler(user, goal)
 
+    # ------------------------------------------------------------------ #
+    # Skills subsystem handlers (pre-planner, deterministic)
+    # ------------------------------------------------------------------ #
+
+    def _handle_skill_request(self, user: str, goal: str, parsed: dict) -> str:
+        """Handle an explicit skill command. Returns "done" (fully
+        handled), "paused" (playback paused on a user question), or None
+        (not handled -- let the planner try)."""
+        intent = parsed.get("intent")
+        args = parsed.get("args") or {}
+        try:
+            if intent == "record_start":
+                result = skill_manager.start_recording(args.get("name"))
+                self.speak(result["speak"])
+                return "done"
+            if intent == "record_stop":
+                result = skill_manager.stop_recording(args.get("name"))
+                self.speak(result["speak"])
+                return "done"
+            if intent == "record_pause":
+                result = skill_manager.pause_recording()
+                self.speak(result["speak"])
+                return "done"
+            if intent == "record_resume":
+                result = skill_manager.resume_recording()
+                self.speak(result["speak"])
+                return "done"
+            if intent == "record_cancel":
+                result = skill_manager.cancel_recording()
+                self.speak(result["speak"])
+                return "done"
+
+            if intent == "list":
+                self._speak_skill_list()
+                return "done"
+
+            if intent == "rename":
+                result = skill_manager.rename_skill(args.get("name"), args.get("new_name"))
+                self.speak(result["speak"])
+                return "done"
+            if intent == "delete":
+                result = skill_manager.delete_skill(args.get("name"))
+                self.speak(result["speak"])
+                return "done"
+            if intent == "export":
+                result = skill_manager.export_skill(args.get("name"))
+                self.speak(result["speak"])
+                return "done"
+            if intent == "duplicate":
+                result = skill_manager.duplicate_skill(
+                    args.get("name"), args.get("new_name")
+                )
+                self.speak(result["speak"])
+                return "done"
+            if intent == "import":
+                result = skill_manager.import_skill(args.get("path"))
+                self.speak(result["speak"])
+                return "done"
+
+            if intent == "play":
+                name = args.get("name")
+                if not name:
+                    self.speak("Which skill should I run? Say 'do the <skill name> skill'.")
+                    return "done"
+                return self._start_skill_playback(name)
+        except Exception as exc:
+            logger.exception("[Skills] Skill request '%s' failed", intent)
+            self.speak(f"Something went wrong with that skill request: {exc}")
+            return "done"
+        return None
+
+    def _speak_skill_list(self) -> None:
+        skills = skill_manager.list_skills()
+        if not skills:
+            self.speak(
+                "You don't have any skills yet. Say 'watch me' and perform a task "
+                "once -- I'll learn it as a reusable skill."
+            )
+            return
+        lines = []
+        for skill in skills:
+            name = skill.get("name", "")
+            description = skill.get("description", "")
+            used = skill.get("last_used")
+            suffix = f" (last used {used[:10]})" if used else ""
+            lines.append(f"{name} -- {description or 'no description'}{suffix}")
+        summary = "; ".join(lines)
+        self.speak(f"You have {len(skills)} skill{'s' if len(skills) != 1 else ''}: {summary}")
+
+    def _start_skill_playback(self, name: str) -> str:
+        result = skill_manager.play(name)
+        return self._consume_playback_result(result)
+
+    def _continue_skill_playback(self, session, user: str) -> str:
+        result = skill_manager.continue_playback(session, user)
+        return self._consume_playback_result(result)
+
+    def _consume_playback_result(self, result: dict) -> str:
+        """Drive one step of playback. Returns "paused" when the user's
+        input is needed (the loop pauses and resumes next turn), else
+        "done" (playback finished or failed)."""
+        status = result.get("status")
+        if status == "need_input":
+            self._pending_skill_session = result.get("session")
+            self.speak(result.get("message") or "")
+            return "paused"
+        self._pending_skill_session = None
+        if status == "done":
+            self.speak(result.get("message") or "The skill playback finished.")
+            if result.get("improvement_offer"):
+                self._pending_improvement_session = result.get("session")
+            return "done"
+        self.speak(result.get("message") or "The skill playback stopped.")
+        return "done"
+
     def run(
         self,
         user: str,
@@ -1099,6 +1397,26 @@ class AgentLoop:
             self._unproductive_tools = set()
             self._pending_tab_choice = None
 
+        # Skills subsystem resume: a playback paused on a user question, or
+        # a finished playback waiting on the improvement offer. These states
+        # live on the loop (like _pending_tab_choice) so they survive turns.
+        if resume_goal and self._pending_improvement_session is not None:
+            session = self._pending_improvement_session
+            self._pending_improvement_session = None
+            try:
+                result = skill_manager.apply_improvement(session, accept=_user_accepted(user))
+                self.speak(result["speak"])
+            except Exception as exc:
+                logger.exception("[Skills] Improvement decision failed")
+                self.speak(f"I couldn't apply that change to the skill: {exc}")
+            return None
+
+        if resume_goal and self._pending_skill_session is not None:
+            outcome = self._continue_skill_playback(self._pending_skill_session, user)
+            if outcome == "paused":
+                return {"goal": goal, "observations": list(observations)}
+            return None
+
         # Deterministic complex-task handling: fresh goals that match a
         # known multi-step workflow (Google Docs writing, document saved
         # into a new folder, flight/hotel search) run through a
@@ -1113,6 +1431,51 @@ class AgentLoop:
                 handled = self._handle_complex_task(user, goal, task)
                 if handled:
                     return None
+
+            # Skills subsystem -- explicit skill commands ("watch me",
+            # "do the X skill", "show my skills", ...) run deterministically
+            # before the planner ever sees them.
+            skill_request = _detect_skill_request(goal)
+            if skill_request:
+                logger.info("[Skills] Detected request '%s' for goal: %s",
+                            skill_request["intent"], goal[:120])
+                outcome = self._handle_skill_request(user, goal, skill_request)
+                if outcome == "paused":
+                    return {"goal": goal, "observations": list(observations)}
+                if outcome == "done":
+                    return None
+                logger.info("[Skills] Request '%s' unhandled -- falling through to planner",
+                            skill_request["intent"])
+
+            # Skills subsystem -- implicit integration: track repeated
+            # requests for learning suggestions (Phase 5) and auto-run a
+            # matching skill instead of rebuilding the workflow.
+            if _skills_runtime_active():
+                try:
+                    suggestion = skill_manager.observe_request(goal)
+                    if suggestion:
+                        key = suggestion[:30]
+                        if key not in self._suggested_phrases:
+                            self._suggested_phrases.add(key)
+                            self.speak(suggestion)
+                    if (
+                        not self._pending_skill_session
+                        and not _SKILL_AUTO_PLAY_BLOCKED.search(goal)
+                        and not _goal_looks_like_file_request(goal)
+                    ):
+                        auto = skill_manager.auto_play_candidate(goal)
+                        if auto:
+                            name = auto.get("name")
+                            logger.info("[Skills] Auto-running matching skill '%s'", name)
+                            self.speak(
+                                f"I have a skill for that -- '{name}'. Running it now."
+                            )
+                            outcome = self._start_skill_playback(name)
+                            if outcome == "paused":
+                                return {"goal": goal, "observations": list(observations)}
+                            return None
+                except Exception:
+                    logger.exception("[Skills] Automatic matching failed -- continuing normally")
 
         # Deterministic page resolution: when the goal asks to CONSUME a
         # page ("summarise my chatgpt tab", "what's on the page") and no

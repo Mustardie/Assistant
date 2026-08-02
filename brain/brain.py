@@ -227,6 +227,25 @@ Desktop control:
 
 Vision:
 - vision(prompt)        <- looks at the current screen and answers a question about it
+
+Skills (Nova's learned desktop workflows -- handled automatically, no planner work needed):
+- Users record a skill by saying "watch me" and performing a task once.
+- Users run a skill by saying "do the <skill name> skill" -- Nova replays
+  it with vision-guided adaptation (finds buttons by text/position, adapts
+  to resolution changes, and pauses to ask when the UI is unexpected).
+- The system ALSO auto-matches skills before planning: if a saved skill
+  fits the current request (e.g. "generate my monthly report"), it runs
+  the skill instead of rebuilding the workflow. Skills you may manage as
+  tools:
+- skill_list()              <- list all saved skills
+- skill_record_start(name)  <- begin recording a new skill (usually "watch me")
+- skill_record_stop(name)   <- finish recording and save the skill
+- skill_rename(name, new_name)
+- skill_delete(name)
+- skill_duplicate(name, new_name)
+- skill_export(name, destination)
+- skill_run is NOT a planner tool -- skill playback always goes through
+  Nova's deterministic skill engine so it can pause for user input safely.
 """
 
 

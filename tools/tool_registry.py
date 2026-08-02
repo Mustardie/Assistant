@@ -732,6 +732,53 @@ def file_ops_capture_screenshot(directory=None):
     return capture_screenshot_tool(directory=directory)
 
 
+# ---------------- Skills wrappers ---------------- #
+# Thin facade over the Skills subsystem. Skill playback ("do the X skill",
+# "watch me") is handled deterministically by the agent loop before the
+# planner runs -- these tools exist so the planner can also manage skills.
+
+def skill_record_start(name=None):
+    from skills.manager import skill_manager
+
+    return skill_manager.start_recording(name)
+
+
+def skill_record_stop(name=None):
+    from skills.manager import skill_manager
+
+    return skill_manager.stop_recording(name)
+
+
+def skill_list():
+    from skills.manager import skill_manager
+
+    return skill_manager.list_skills()
+
+
+def skill_rename(name, new_name):
+    from skills.manager import skill_manager
+
+    return skill_manager.rename_skill(name, new_name)
+
+
+def skill_delete(name):
+    from skills.manager import skill_manager
+
+    return skill_manager.delete_skill(name)
+
+
+def skill_export(name, destination=None):
+    from skills.manager import skill_manager
+
+    return skill_manager.export_skill(name, destination)
+
+
+def skill_duplicate(name, new_name=None):
+    from skills.manager import skill_manager
+
+    return skill_manager.duplicate_skill(name, new_name)
+
+
 def pause_indexing():
     return file_manager_service.pause_indexing()
 
@@ -908,6 +955,15 @@ TOOLS = {
     "wait": wait,
 
     "vision": vision_tool,
+
+    # Skills subsystem
+    "skill_record_start": skill_record_start,
+    "skill_record_stop": skill_record_stop,
+    "skill_list": skill_list,
+    "skill_rename": skill_rename,
+    "skill_delete": skill_delete,
+    "skill_export": skill_export,
+    "skill_duplicate": skill_duplicate,
 }
 
 # Context for sequential tool executions. Each tool result is stored under

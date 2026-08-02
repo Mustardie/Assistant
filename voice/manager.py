@@ -1,6 +1,7 @@
 import logging
 import threading
 
+from config.settings import settings
 from voice.player import Player
 from voice.recorder import Recorder
 from voice.transcriber import Transcriber
@@ -10,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_spoken_text(text: str) -> str:
-    """Strip anything that is not the Nova assistant's spoken response.
+    """Strip anything that is not the assistant's spoken response.
     The conversation history may contain tool logs or reasoning mixed in
     with the response; this heuristic keeps only the actual output."""
     if not text:
@@ -28,9 +29,10 @@ def _extract_spoken_text(text: str) -> str:
             continue
         spoken.append(line)
     result = "\n".join(spoken).strip()
-    # Remove leading "Nova:" prefix if present (already redundant for TTS)
-    if result.startswith("Nova:"):
-        result = result[5:].strip()
+    # Remove the "Name:" prefix if present (already redundant for TTS)
+    prefix = f"{settings.assistant_name}:"
+    if result.startswith(prefix):
+        result = result[len(prefix):].strip()
     return result
 
 
@@ -50,14 +52,17 @@ class VoiceManager:
         self._warmup_done = threading.Event()
         self._last_spoken_text = ""
 
-        # Register callback on agent so TTS fires immediately when
-        # Nova speaks (instead of waiting for agent.run() to finish).
-        self.agent.set_voice_callback(self._on_agent_speak)
+    def set_agent(self, agent):
+        """Point the manager at a (rebuilt) agent."""
+        self.agent = agent
 
-    def _on_agent_speak(self, message: str):
-        """Called from agent._speak() the moment Nova: is printed.
-        Synthesises and plays immediately on a background thread so
-        it doesn't block the agent loop."""
+    def is_running(self) -> bool:
+        return self._running
+
+    def handle_speak(self, message: str):
+        """Called from the agent's speak hook (wired by main.py) the moment
+        the assistant speaks. Synthesises and plays immediately on a
+        background thread so it doesn't block the agent loop."""
         spoken = _extract_spoken_text(message)
         if not spoken:
             return
@@ -76,6 +81,25 @@ class VoiceManager:
             logger.info("[TTS] Playback started: %s", spoken[:80])
         except Exception:
             logger.exception("TTS failed in live callback")
+
+    def stop(self):
+        """Abort a running voice session (mic toggle / hotkey press again)."""
+        self.player.stop()
+        self.player.resume()
+        self.recorder.stop()
+
+    def reset_voice(self, engine: str, voice: str, speed: float):
+        """Apply voice-engine/voice/speed changes at runtime: drop the cached
+        TTS pipeline and rebuild the wrapper so the next utterance uses the
+        newly selected engine/voice. Keeps the previous setup on failure."""
+        TTS._pipeline = None
+        TTS._engine = None
+        try:
+            self.tts = TTS(voice=voice or None, speed=speed)
+            logger.info("Voice re-initialized: engine=%s voice=%s speed=%s",
+                        engine, voice, speed)
+        except Exception:
+            logger.exception("Failed to re-initialize TTS; keeping previous voice")
 
     def warmup(self):
         try:
@@ -101,6 +125,7 @@ class VoiceManager:
                 logger.warning("Voice: already running, dropping duplicate session")
                 return
             self._running = True
+            self.recorder.reset()
             # Cancel any previous playback immediately
             self.player.stop()
             self.player.resume()
@@ -114,6 +139,9 @@ class VoiceManager:
             self._last_spoken_text = ""
             self._emit("on_listening")
             audio = self.recorder.record()
+            if self._stop_requested():
+                logger.info("Voice: session stopped by user")
+                return
             if audio.size == 0:
                 logger.warning("No audio captured")
                 return
@@ -133,6 +161,9 @@ class VoiceManager:
         finally:
             self._running = False
             self._emit("on_idle")
+
+    def _stop_requested(self) -> bool:
+        return self.recorder.stop_requested()
 
     def _get_last_response(self) -> str:
         try:
