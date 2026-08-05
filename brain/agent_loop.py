@@ -756,15 +756,49 @@ _SKILL_RECORD_NAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_SKILL_SAVE_AS_NAME_PATTERN = re.compile(
+    r"\bsave\s+(?:it\s+|this\s+|the\s+skill\s+)?(?:recording\s+)?as\s+"
+    r"[\"']?([^\"'.!?]+?)[\"']?"
+    r"(?=\s*(?:,|\.|!|\?| and | then | after |,|\bplease\b|$))",
+    re.IGNORECASE,
+)
+
+_STOP_INSTRUCTION_LEADERS = (
+    r"^(?:and|then|also|after|please|finally|next|now|remember to|also to)\b\s*"
+)
+
+
+def _record_stop_instructions(goal: str) -> list[str]:
+    """Extract written instructions the user typed alongside the stop
+    command, e.g. "stop recording, save the skill as school files, read the
+    title before downloading and navigate through the pages" ->
+    ["read the title before downloading", "navigate through the pages"].
+    These are captured as narration so the model understands them even when
+    the user could not speak during the demo."""
+    text = goal or ""
+    text = _SKILL_SAVE_AS_NAME_PATTERN.sub(" ", text)
+    text = _SKILL_RECORD_STOP_PATTERN.sub(" ", text)
+    instructions = []
+    for part in re.split(r"[,;]", text):
+        part = re.sub(_STOP_INSTRUCTION_LEADERS, "", part.strip(), flags=re.IGNORECASE)
+        part = re.sub(r"\s{2,}", " ", part).strip(" .,!?")
+        if part:
+            instructions.append(part)
+    return instructions
+
 _SKILL_PLAY_PATTERN = re.compile(
     r"\b(?:do|run|play|execute|start|perform|repeat|use)\b"
-    r"\s+(?:the\s+|your\s+|my\s+|our\s+|a\s+)?([\w][\w .\-']{1,60}?)\s+skill\b",
+    r"\s+(?:the\s+|your\s+|my\s+|our\s+|a\s+)?"
+    r"([\w][\w .\-']{1,60}?)"
+    r"(?=\s+(?:skill|workflow|routine|macro)\b|[.!?]|$)",
     re.IGNORECASE,
 )
 
 _SKILL_RENAME_PATTERN = re.compile(
-    r"\brename\s+(?:the\s+)?(?:skill\s+)?[\"']?([^\"']{2,60}?)[\"']?"
-    r"(?:\s+skill)?\s+(?:to|as)\s+[\"']?([^\"']{2,60})[\"']?\b",
+    r"\b(?:rename|re-title|change)\s+"
+    r"(?:the\s+|this\s+|that\s+|it\s+|its\s+)?(?:skill\s+)?"
+    r"(?:[\"']?([^\"']{2,60}?)[\"']?(?:\s+(?:skill|workflow|routine))?\s+)?"
+    r"(?:to|as)\s+[\"']?([^\"',.!?]{2,60})(?:\s+(?:skill|workflow|routine))?[\"']?",
     re.IGNORECASE,
 )
 
@@ -807,6 +841,37 @@ def _skill_edit_cue(goal: str) -> bool:
         or '"' in goal or "'" in goal
 
 
+def _fuzzy_skill_name(name: str, floor: float = 0.55) -> str | None:
+    """Resolve a (possibly vague) spoken name to a saved skill using
+    token similarity, so 'do the save school' finds 'save school
+    document'. Returns the canonical skill name or None."""
+    needle = (name or "").strip().lower()
+    if not needle:
+        return None
+    best, best_score = None, 0.0
+    try:
+        from rapidfuzz import fuzz
+    except Exception:
+        fuzz = None
+    for record in skill_manager.list_skills():
+        candidate = (record.get("name") or "").strip()
+        if not candidate:
+            continue
+        if needle == candidate.lower():
+            return candidate
+        try:
+            if fuzz is not None:
+                score = float(fuzz.token_set_ratio(needle, candidate.lower()))
+            else:
+                import difflib
+                score = difflib.SequenceMatcher(None, needle, candidate.lower()).ratio() * 100
+        except Exception:
+            continue
+        if score > best_score:
+            best, best_score = candidate, score
+    return best if best_score >= floor * 100 else None
+
+
 def _detect_skill_request(goal: str) -> dict | None:
     """Detect an explicit skill command. Returns {"intent", "args"} or
     None when the goal is not a skill command."""
@@ -815,7 +880,10 @@ def _detect_skill_request(goal: str) -> dict | None:
     if _SKILL_LIST_PATTERN.search(goal):
         return {"intent": "list", "args": {}}
     if _SKILL_RECORD_STOP_PATTERN.search(goal):
-        return {"intent": "record_stop", "args": {}}
+        save_match = _SKILL_SAVE_AS_NAME_PATTERN.search(goal)
+        return {"intent": "record_stop",
+                "args": {"name": save_match.group(1) if save_match else None,
+                         "instructions": _record_stop_instructions(goal)}}
     if _SKILL_RECORD_PAUSE_PATTERN.search(goal):
         return {"intent": "record_pause", "args": {}}
     if _SKILL_RECORD_RESUME_PATTERN.search(goal):
@@ -828,7 +896,10 @@ def _detect_skill_request(goal: str) -> dict | None:
 
     if _SKILL_RENAME_PATTERN.search(goal) and _skill_edit_cue(goal):
         match = _SKILL_RENAME_PATTERN.search(goal)
-        return {"intent": "rename", "args": {"name": match.group(1), "new_name": match.group(2)}}
+        new_name = re.sub(
+            r"\s+(?:skill|workflow|routine|macro)$", "", match.group(2), flags=re.IGNORECASE
+        ).strip()
+        return {"intent": "rename", "args": {"name": match.group(1), "new_name": new_name}}
     if _SKILL_DELETE_PATTERN.search(goal) and _skill_edit_cue(goal):
         match = _SKILL_DELETE_PATTERN.search(goal)
         return {"intent": "delete", "args": {"name": match.group(1)}}
@@ -845,7 +916,13 @@ def _detect_skill_request(goal: str) -> dict | None:
 
     play_match = _SKILL_PLAY_PATTERN.search(goal)
     if play_match:
-        return {"intent": "play", "args": {"name": play_match.group(1).strip()}}
+        name = play_match.group(1).strip()
+        explicit_skill = bool(re.search(r"\bskill\b", goal, re.IGNORECASE))
+        # Without the literal word "skill" ("do the save school"), only
+        # accept the play intent when the spoken name actually matches a
+        # saved skill -- otherwise "do the dishes" would be hijacked.
+        if explicit_skill or _fuzzy_skill_name(name):
+            return {"intent": "play", "args": {"name": name}}
 
     return None
 
@@ -1244,6 +1321,8 @@ class AgentLoop:
                 self.speak(result["speak"])
                 return "done"
             if intent == "record_stop":
+                for instruction in (args.get("instructions") or []):
+                    skill_manager.add_narration(instruction)
                 result = skill_manager.stop_recording(args.get("name"))
                 self.speak(result["speak"])
                 return "done"
@@ -1265,7 +1344,11 @@ class AgentLoop:
                 return "done"
 
             if intent == "rename":
-                result = skill_manager.rename_skill(args.get("name"), args.get("new_name"))
+                old_name = args.get("name")
+                new_name = args.get("new_name")
+                result = skill_manager.rename_skill(
+                    self._editable_skill_name(old_name), new_name
+                )
                 self.speak(result["speak"])
                 return "done"
             if intent == "delete":
@@ -1298,6 +1381,28 @@ class AgentLoop:
             self.speak(f"Something went wrong with that skill request: {exc}")
             return "done"
         return None
+
+    def _editable_skill_name(self, raw: str | None) -> str | None:
+        """Resolve a name for rename/delete/duplicate. Pronouns like
+        'it'/'this'/'that'/'the last one' (or a missing name, as in
+        'change it to X skill') resolve to the most recently recorded
+        skill. Returns None only when nothing can be resolved."""
+        if not raw:
+            return None
+        cleaned = raw.strip().strip('"\'')
+        if cleaned.lower() in ("it", "this", "that", "this one", "the last one",
+                                "the previous one", "the skill"):
+            return self._most_recent_skill_name()
+        return raw.strip()
+
+    def _most_recent_skill_name(self) -> str | None:
+        skills = skill_manager.list_skills()
+        if not skills:
+            return None
+
+        def sort_key(record):
+            return record.get("last_used") or record.get("created") or ""
+        return max(skills, key=sort_key).get("name")
 
     def _speak_skill_list(self) -> None:
         skills = skill_manager.list_skills()
@@ -1446,6 +1551,24 @@ class AgentLoop:
                     return None
                 logger.info("[Skills] Request '%s' unhandled -- falling through to planner",
                             skill_request["intent"])
+
+            # While a recording is active, any speech that is NOT a skill
+            # command is narration: the user is explaining the task as they
+            # demonstrate it ("read the title of the document before
+            # downloading..."). Capture it into the recording instead of
+            # dispatching it to the planner as a brand-new task. This never
+            # touches the skills directory -- it only appends to the active
+            # recorder's in-memory event log -- so it is safe even when the
+            # manager is mocked or a recording is inactive (add_narration
+            # returns captured=False in those cases).
+            if skill_manager.is_recording:
+                if not skill_request:
+                    note = skill_manager.add_narration(goal)
+                    if note.get("captured"):
+                        logger.info("[Skills] Captured narration while recording: %s",
+                                    goal[:120])
+                        self.speak(note.get("speak", ""))
+                        return None
 
             # Skills subsystem -- implicit integration: track repeated
             # requests for learning suggestions (Phase 5) and auto-run a

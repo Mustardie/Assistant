@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -124,11 +125,20 @@ class FileIndexManager:
             return str(pattern).lower()
 
     def _prepare_exclude_patterns(self) -> None:
-        self._exclude_patterns = [
-            self._normalize_exclude_pattern(pattern)
-            for pattern in self.config.get("exclude", [])
-            if isinstance(pattern, str)
-        ]
+        # Turn each exclude entry into a case-insensitive regex. A literal
+        # '*' becomes a wildcard that spans a single path component, so
+        # entries like "C:/Users/*/AppData" actually match real usernames
+        # instead of being compared as literal '*' text.
+        self._exclude_patterns = []
+        for pattern in self.config.get("exclude", []):
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            escaped = re.escape(self._normalize_exclude_pattern(pattern))
+            escaped = escaped.replace(r"\*", r"[^\\/]*")
+            try:
+                self._exclude_patterns.append(re.compile(escaped, re.IGNORECASE))
+            except re.error:
+                self._exclude_patterns.append(re.compile(re.escape(pattern), re.IGNORECASE))
 
     def _cache_folder_schema(self) -> None:
         try:
@@ -371,8 +381,8 @@ class FileIndexManager:
 
     def _should_exclude(self, path: str) -> bool:
         normalized = self._normalize_path(path)
-        for exclude in self._exclude_patterns:
-            if exclude in normalized:
+        for exclude_re in self._exclude_patterns:
+            if exclude_re.search(normalized):
                 return True
         return False
 
@@ -422,6 +432,14 @@ class FileIndexManager:
                     time.time(),
                 )
             )
+        except FileNotFoundError:
+            # File was deleted between the directory walk and this stat
+            # (e.g. Claude's ephemeral AppData session cache). Skip quietly;
+            # there is never anything worth recovering here.
+            self._warn_file = getattr(self, "_warn_file", None)
+            if self._warn_file != path:
+                self._warn_file = path
+                logger.debug("Skipping file that disappeared mid-scan: %s", path)
         except Exception as exc:
             logger.exception("Failed to index file %s: %s", path, exc)
 

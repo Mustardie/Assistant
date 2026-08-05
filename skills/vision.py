@@ -306,8 +306,13 @@ class ScreenVision:
     # -- providers --------------------------------------------------- #
 
     def _get_gemini(self):
-        if self._gemini is None and settings.gemini_api_key:
-            self._gemini = _GeminiVision(settings.gemini_model, settings.gemini_api_key)
+        # Ignore placeholder/missing keys so we don't waste time on a 403
+        # before falling back to the local Ollama vision model.
+        key = (settings.gemini_api_key or "").strip()
+        if not key or "your " in key.lower() or key.lower() in ("placeholder", "none", "null"):
+            return None
+        if self._gemini is None:
+            self._gemini = _GeminiVision(settings.gemini_model, key)
         return self._gemini
 
     def _get_ollama(self):
@@ -365,12 +370,18 @@ class ScreenVision:
         self._cache_put(key, result)
         return result
 
-    def locate(self, image, description: str) -> dict | None:
+    def locate(self, image, description: str, context: str | None = None) -> dict | None:
         """Ask the vision model where an element described in natural
         language is. Returns a UIObject dict or None. Used as the recovery
-        step when matching against stored objects fails."""
+        step when matching against stored objects fails. `context` may carry
+        extra instruction text (e.g. narration from the recording) to help
+        the model understand what to look for."""
         prompt = (
             f'Locate the UI element described as: "{description}".\n'
+        )
+        if context:
+            prompt += f'Additional context from the skill author: "{context}".\n'
+        prompt += (
             'Return JSON: {"found": true, "object": {"type": "...", "text": "...", '
             '"bbox": [x, y, width, height], "confidence": 0.0-1.0}} if you see it, '
             'or {"found": false}.'

@@ -20,6 +20,7 @@ class FakeRecorder:
         self.session_dir = Path(session_dir)
         self._running = False
         self._paused = False
+        self._extra_events = []
 
     def start(self):
         self._running = True
@@ -27,7 +28,7 @@ class FakeRecorder:
     def stop(self):
         self._running = False
         return {
-            "events": list(EVENTS),
+            "events": list(EVENTS) + list(self._extra_events),
             "screenshots": [],
             "vision": {},
             "screen": {"width": 1920, "height": 1080, "scale": 1.0},
@@ -41,6 +42,9 @@ class FakeRecorder:
 
     def cancel(self):
         self._running = False
+
+    def add_narration(self, text):
+        self._extra_events.append({"t": 1.5, "type": "narration", "text": text})
 
     @property
     def is_recording(self):
@@ -125,6 +129,26 @@ def test_pause_resume_cancel(monkeypatch):
     assert not manager.is_recording
     # Cancel removed the draft folder.
     assert storage.list_skills() == []
+
+
+def test_narration_captured_and_persisted(tmp_path, monkeypatch):
+    manager = _manager_with_fake_recorder(monkeypatch)
+    manager.start_recording()
+    note = manager.add_narration("read the title of the document before downloading")
+    assert note["captured"]
+    assert note["success"]
+    result = manager.stop_recording("School Files")
+    assert result["success"]
+    timeline = storage.load_timeline("School Files")
+    assert "read the title of the document before downloading" in timeline.get("instructions", [])
+    meta = storage.load_metadata("School Files")
+    assert "read the title" in meta.get("instructions", [])[0]
+
+
+def test_narration_ignored_when_not_recording():
+    manager = SkillManager()
+    note = manager.add_narration("some instruction")
+    assert not note["captured"]
 
 
 def test_recording_commands_require_active_session():

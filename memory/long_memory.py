@@ -12,6 +12,7 @@ from config.settings import settings
 from llm.gemini_client import GeminiClient
 from llm.ollama_client import OllamaClient
 from llm.openrouter_client import OpenRouterClient, OpenRouterConfigurationError
+from llm.factory import make_llm_client
 
 logger = logging.getLogger(__name__)
 
@@ -475,12 +476,7 @@ class LongTermMemory:
     def _get_llm_client(self):
         if self._llm_client is None:
             provider = settings.llm_provider
-            if provider == "ollama":
-                self._llm_client = OllamaClient()
-            elif provider == "gemini":
-                self._llm_client = GeminiClient()
-            else:
-                self._llm_client = OpenRouterClient()
+            self._llm_client = make_llm_client(provider)
             logger.info("Long-term memory using provider=%s client=%s", provider, self._llm_client.__class__.__name__)
         return self._llm_client
 

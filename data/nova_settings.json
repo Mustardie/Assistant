@@ -1,1 +1,31 @@
-{"assistant_name": "Nova", "model": "Ollama \u2014 qwen2.5vl:7b (local multimodal)", "provider": "Ollama", "theme": "space_black", "hotkey": "ctrl+space"}
+{
+ "accent": 3,
+ "always_on_top": false,
+ "api_keys": {
+  "Anthropic": "",
+  "DeepSeek": "",
+  "Gemini": "",
+  "Groq": "",
+  "OpenAI": "",
+  "OpenRouter": ""
+ },
+ "assistant_name": "Assistant",
+ "auto_speak": true,
+ "compact": false,
+ "hotkey": "ctrl+space",
+ "models": {
+  "Anthropic": "claude-3-5-haiku-latest",
+  "DeepSeek": "deepseek-chat",
+  "Gemini": "gemini-2.5-flash",
+  "Groq": "llama-3.3-70b-versatile",
+  "Ollama": "qwen2.5vl:7b",
+  "OpenAI": "gpt-4o-mini",
+  "OpenRouter": "meta-llama/llama-3.3-70b-instruct"
+ },
+ "provider": "Ollama",
+ "show_timestamps": true,
+ "speed": 1.21,
+ "theme": "light_brown",
+ "voice": "Ryan — en_US-ryan-high",
+ "voice_engine": "kokoro"
+}

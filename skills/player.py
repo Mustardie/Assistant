@@ -53,6 +53,7 @@ class PlaybackSession:
         self.screen = self.timeline.get("screen") or {}
         self.recorded_steps = self.timeline.get("semantic") or []
         self.variables = self.timeline.get("variables") or []
+        self.instructions = list(self.timeline.get("instructions") or [])
 
         self.status = "running"
         self._step_index = 0
@@ -358,7 +359,11 @@ class PlaybackSession:
                 element, strategy, confidence = nearby["element"], nearby["strategy"], nearby["confidence"]
 
         if not element:
-            located = screen_vision.locate(self._current_image, self._describe_expected(expected, step))
+            located = screen_vision.locate(
+                self._current_image,
+                self._describe_expected(expected, step),
+                context=" ".join(self.instructions[:3]) if self.instructions else None,
+            )
             if located:
                 element, strategy, confidence = located, "vision_locate", located.get("confidence", 0.6)
 
@@ -427,10 +432,16 @@ class PlaybackSession:
     def _missing_element_message(self, step: dict, expected: dict, action_label: str) -> str:
         screen_hint = self._screen_summary()
         target = self._describe_expected(expected, step)
+        instruction_hint = ""
+        if self.instructions:
+            instruction_hint = (
+                "\nInstructions you gave when recording this skill: "
+                + " ".join(self.instructions[:3])
+            )
         return (
             f"I'm stuck on step {self._step_index + 1} of {self.total_steps}: "
             f"I need to {action_label} {target}, but I can't find it on the screen. "
-            f"Right now I can see: {screen_hint}. "
+            f"Right now I can see: {screen_hint}.{instruction_hint} "
             "Should I skip this step, stop, or will the element appear if I wait? "
             "(say 'skip' / 'stop' / 'wait a moment')"
         )
