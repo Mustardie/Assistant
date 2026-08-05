@@ -5,6 +5,7 @@ from config.settings import settings
 from llm.openrouter_client import OpenRouterClient, OpenRouterConfigurationError
 from llm.gemini_client import GeminiClient, GeminiConfigurationError
 from llm.ollama_client import OllamaClient, OllamaConfigurationError
+from llm.factory import make_llm_client
 from memory.memory_manager import MemoryManager
 
 logger = logging.getLogger(__name__)
@@ -782,12 +783,10 @@ class Brain:
 
     def _make_client(self, provider: str, *, model: str | None = None):
         """Build an LLM client for the given provider, optionally pinned
-        to a specific model (used for the role-split planner)."""
-        if provider == "ollama":
-            return OllamaClient(model=model)
-        if provider == "gemini":
-            return GeminiClient(model=model)
-        return OpenRouterClient(model=model)
+        to a specific model (used for the role-split planner). Delegates to
+        the shared factory in llm/factory.py -- see that module to add a
+        new provider in one place instead of duplicating this chain."""
+        return make_llm_client(provider, model=model)
 
     def _format_conversation(self, conversation: list) -> str:
         if not conversation:

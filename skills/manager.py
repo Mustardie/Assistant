@@ -80,6 +80,17 @@ class SkillManager:
         self._recorder.resume()
         return {"success": True, "speak": "Recording resumed."}
 
+    def add_narration(self, text: str) -> dict:
+        """Capture a spoken instruction while a recording is in progress.
+        Returns a dict with 'captured' so the agent loop knows the text was
+        consumed as narration (it must NOT also be dispatched to the
+        planner)."""
+        if not self.is_recording:
+            return {"success": False, "captured": False}
+        self._recorder.add_narration(text)
+        return {"success": True, "captured": True,
+                "speak": "Got it, I'll remember that instruction."}
+
     def cancel_recording(self) -> dict:
         if not self.is_recording:
             return {"success": False, "speak": "I'm not recording right now."}
@@ -108,7 +119,8 @@ class SkillManager:
             llm = self._make_llm()
             parsed = parser_module.parse_recording(capture, llm=llm)
             profile = parser_module.llm_skill_profile(
-                llm, parsed["semantic"], fallback_name=draft
+                llm, parsed["semantic"], fallback_name=draft,
+                instructions=parsed.get("instructions"),
             )
         except Exception as exc:
             logger.exception("[Skills] Parsing recording failed")
@@ -124,6 +136,7 @@ class SkillManager:
             "semantic": parsed["semantic"],
             "raw": parsed["raw"],
             "variables": parsed["variables"],
+            "instructions": parsed.get("instructions") or [],
             "screenshots": capture.get("screenshots") or [],
             "screen": capture.get("screen") or {},
         }
@@ -141,6 +154,8 @@ class SkillManager:
             "detected_variables": parsed["variables"],
             "improvement_history": [],
         })
+        if parsed.get("instructions"):
+            meta["instructions"] = parsed["instructions"]
         storage.save_metadata(final, meta)
 
         record = {

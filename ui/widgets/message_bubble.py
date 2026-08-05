@@ -31,7 +31,12 @@ def _bubble_font(size=FONT_BODY, weight="normal"):
 
 
 def fade_in(widget, duration=260):
-    """Fade a widget in from transparent."""
+    """Fade a widget in from transparent.
+
+    The opacity effect is removed as soon as the animation finishes:
+    keeping it would force the widget to render through an offscreen
+    texture, which glitches inside a QScrollArea (messages appear cut
+    off / stutter while scrolling)."""
     effect = QGraphicsOpacityEffect(widget)
     widget.setGraphicsEffect(effect)
     anim = QPropertyAnimation(effect, b"opacity", widget)
@@ -39,6 +44,7 @@ def fade_in(widget, duration=260):
     anim.setStartValue(0.0)
     anim.setEndValue(1.0)
     anim.setEasingCurve(QEasingCurve.OutCubic)
+    anim.finished.connect(lambda: widget.setGraphicsEffect(None))
     anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
 

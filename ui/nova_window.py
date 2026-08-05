@@ -93,9 +93,6 @@ class _Welcome(QWidget):
         layout.setSpacing(14)
         layout.addStretch(3)
 
-        self.avatar = NovaAvatar(size=84)
-        layout.addWidget(self.avatar, 0, Qt.AlignHCenter)
-
         self.greeting = QLabel("Good evening")
         self.greeting.setAlignment(Qt.AlignCenter)
         self.greeting.setStyleSheet(
@@ -356,6 +353,7 @@ class NovaWindow(QWidget):
 
         # ---- welcome ----
         self._welcome = _Welcome(self._messages_host)
+        self._messages_layout.insertWidget(0, self._welcome)
         self._welcome.setVisible(False)
         self._welcome.suggestionPicked.connect(self._send_suggestion)
 
@@ -447,9 +445,11 @@ class NovaWindow(QWidget):
         )
         self._rename_assistant_rows(name)
 
-        model = settings.get("model", "")
+        provider = settings.get("provider", "Ollama")
+        models = settings.get("models") or {}
+        model = (models.get(provider) or settings.get("model") or "").strip()
         short = model.split("—")[-1].split("(")[0].strip() if "—" in model else model
-        self._model_chip.setText(f"Model · {short}")
+        self._model_chip.setText(f"Model · {short or provider}")
         if settings.get("always_on_top"):
             self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
             self.show()
@@ -529,19 +529,20 @@ class NovaWindow(QWidget):
             self._render_message(msg["role"], msg["text"], ts=msg.get("ts"))
 
     def _clear_messages(self):
-        while self._messages_layout.count() > 1:
-            item = self._messages_layout.takeAt(0)
+        """Remove every message row while keeping the welcome (index 0)
+        and the trailing stretch pinned in the layout."""
+        for i in range(self._messages_layout.count() - 2, 0, -1):
+            item = self._messages_layout.takeAt(i)
             w = item.widget()
-            if w is not None and w is not self._welcome:
+            if w is not None:
                 w.deleteLater()
 
     # ------------------------------------------------------------------ #
     # welcome
     # ------------------------------------------------------------------ #
     def _show_welcome(self, visible: bool):
-        if visible and self._welcome.parent() is None:
-            self._welcome = _Welcome(self._messages_host)
-            self._welcome.suggestionPicked.connect(self._send_suggestion)
+        if self._messages_layout.indexOf(self._welcome) < 0:
+            self._messages_layout.insertWidget(0, self._welcome)
         self._welcome.setVisible(visible)
         if visible:
             self._welcome.set_greeting()
@@ -765,8 +766,9 @@ class NovaWindow(QWidget):
 
     def _layout_settings_panel(self):
         w = 380
+        inset = 10
         self.settings_panel.setGeometry(
-            self._shell.width() - w, 0, w, self._shell.height()
+            self._shell.width() - w - inset, inset, w, self._shell.height() - inset * 2
         )
         self.settings_panel.raise_()
 

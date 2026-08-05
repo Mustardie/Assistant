@@ -229,6 +229,15 @@ class Recorder:
             self._paused.clear()
             self._append_event({"t": time.time(), "type": "resume"})
 
+    def add_narration(self, text: str) -> None:
+        """Attach a spoken instruction from the user to the recording. The
+        text is timestamped into the event stream so the parser can align
+        it with the actions happening at the moment it was spoken."""
+        text = (text or "").strip()
+        if not text or not self._recording:
+            return
+        self._append_event({"t": time.time(), "type": "narration", "text": text[:500]})
+
     @property
     def is_recording(self) -> bool:
         return self._recording

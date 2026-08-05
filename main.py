@@ -29,33 +29,39 @@ _ROOT = Path(__file__).resolve().parent
 # are pushed into the environment BEFORE config.settings / brain / ui are
 # imported, so every component built at startup picks them up.
 # ------------------------------------------------------------------ #
-from config.settings import apply_runtime_overrides
+from config.settings import apply_runtime_overrides, PROVIDER_MODEL_FIELD, PROVIDER_API_KEY_FIELD
+from llm.factory import DISPLAY_TO_PROVIDER_KEY
+
+_ENV_VAR_FOR_FIELD = {
+    "ollama_model": "OLLAMA_MODEL",
+    "gemini_model": "GEMINI_MODEL", "gemini_api_key": "GEMINI_API_KEY",
+    "openrouter_model": "OPENROUTER_MODEL", "openrouter_api_key": "OPENROUTER_API_KEY",
+    "openai_model": "OPENAI_MODEL", "openai_api_key": "OPENAI_API_KEY",
+    "anthropic_model": "ANTHROPIC_MODEL", "anthropic_api_key": "ANTHROPIC_API_KEY",
+    "groq_model": "GROQ_MODEL", "groq_api_key": "GROQ_API_KEY",
+    "deepseek_model": "DEEPSEEK_MODEL", "deepseek_api_key": "DEEPSEEK_API_KEY",
+}
 
 
-def _apply_model_to_env(provider: str, model: str, api_key: str):
+def _apply_provider_to_env(provider_display: str, model: str, api_key: str):
+    """Push the selected provider's model/key into the environment using
+    the generic provider->field lookup tables in config/settings.py,
+    instead of matching against specific model-name substrings. Works for
+    every registered provider (Ollama, OpenRouter, Gemini, OpenAI,
+    Anthropic, Groq, DeepSeek) with no per-provider special-casing here.
+    """
+    provider_key = DISPLAY_TO_PROVIDER_KEY.get(provider_display, (provider_display or "ollama").lower())
+    os.environ["LLM_PROVIDER"] = provider_key
+
+    model = (model or "").strip()
+    model_field = PROVIDER_MODEL_FIELD.get(provider_key)
+    if model and model_field and model_field in _ENV_VAR_FOR_FIELD:
+        os.environ[_ENV_VAR_FOR_FIELD[model_field]] = model
+
     key = (api_key or "").strip()
-    if "qwen2.5vl" in model:
-        os.environ["LLM_PROVIDER"] = "ollama"
-        os.environ["OLLAMA_MODEL"] = "qwen2.5vl:7b"
-    elif "gemma3" in model:
-        os.environ["LLM_PROVIDER"] = "ollama"
-        os.environ["OLLAMA_MODEL"] = "gemma3:12b"
-    elif "openrouter" in model.lower():
-        os.environ["LLM_PROVIDER"] = "openrouter"
-        os.environ["OPENROUTER_MODEL"] = "openrouter/free"
-        if key:
-            os.environ["OPENROUTER_API_KEY"] = key
-    elif "gemini" in model.lower():
-        os.environ["LLM_PROVIDER"] = "gemini"
-        os.environ["GEMINI_MODEL"] = "gemini-2.5-flash"
-        if key:
-            os.environ["GEMINI_API_KEY"] = key
-    else:
-        os.environ["LLM_PROVIDER"] = "ollama"
-        os.environ["OLLAMA_MODEL"] = "qwen2.5vl:7b"
-    if key:
-        os.environ["OPENROUTER_API_KEY"] = key
-        os.environ["GEMINI_API_KEY"] = key
+    key_field = PROVIDER_API_KEY_FIELD.get(provider_key)
+    if key and key_field and key_field in _ENV_VAR_FOR_FIELD:
+        os.environ[_ENV_VAR_FOR_FIELD[key_field]] = key
 
 
 def _apply_persisted_settings_to_env():
@@ -76,15 +82,24 @@ def _apply_persisted_settings_to_env():
         os.environ["NOVA_THEME"] = theme
 
     provider = data.get("provider") or "Ollama"
-    model = data.get("model") or ""
-    _apply_model_to_env(provider, model, data.get("api_key", ""))
+    models = data.get("models") or {}
+    api_keys = data.get("api_keys") or {}
+    # Back-compat: fall back to the old flat "model" / "api_key" fields if
+    # this settings file predates the per-provider schema.
+    model = models.get(provider) or data.get("model") or ""
+    api_key = api_keys.get(provider) or data.get("api_key") or ""
+    _apply_provider_to_env(provider, model, api_key)
 
     voice_engine = (data.get("voice_engine") or "").strip().lower()
     if voice_engine:
         os.environ["TTS_ENGINE"] = voice_engine
     voice = data.get("voice") or ""
-    if "—" in voice:
-        os.environ["PIPER_VOICE"] = voice.split("—")[-1].strip()
+    # The label is "Name — voice_id" (some older files stored a mangled
+    # separator, so take the id after the LAST space instead of matching a
+    # specific dash character).
+    voice_id = voice.rsplit(" ", 1)[-1].strip() if voice.strip() else ""
+    if voice_id:
+        os.environ["PIPER_VOICE"] = voice_id
     try:
         speed = float(data.get("speed", 1.0))
         os.environ["TTS_SPEED"] = str(speed)
@@ -292,24 +307,26 @@ def _rebuild_agent(provider: str, model: str, api_key: str):
     """Rebuild the agent so provider/model/API-key changes take effect
     immediately. Skipped (with a warning) while a run is in progress."""
     global agent
-    if not agent._run_lock.acquire(blocking=False):
+    old_agent = agent
+    if not old_agent._run_lock.acquire(blocking=False):
         logger.warning(
             "Agent is busy -- provider/model change will apply on next launch"
         )
         return
     try:
-        _apply_model_to_env(provider, model, api_key)
+        _apply_provider_to_env(provider, model, api_key)
         # Push the new values into the frozen Settings singleton too, so
         # code that was built BEFORE the change (Brain, LLM clients, TTS)
         # picks them up on rebuild -- not just code reading env at import.
-        apply_runtime_overrides(
-            llm_provider=os.environ.get("LLM_PROVIDER", ""),
-            ollama_model=os.environ.get("OLLAMA_MODEL", ""),
-            openrouter_model=os.environ.get("OPENROUTER_MODEL", ""),
-            gemini_model=os.environ.get("GEMINI_MODEL", ""),
-            openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
-            gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
-        )
+        # Every field in _ENV_VAR_FOR_FIELD is refreshed from the
+        # environment we just updated, so this covers all 7 providers
+        # rather than only OpenRouter/Gemini.
+        overrides = {
+            field: os.environ[env_var]
+            for field, env_var in _ENV_VAR_FOR_FIELD.items()
+            if os.environ.get(env_var)
+        }
+        apply_runtime_overrides(llm_provider=os.environ.get("LLM_PROVIDER", ""), **overrides)
         new_agent = Agent()
         new_agent.set_voice_callback(_on_agent_speak)
         _voice_manager.set_agent(new_agent)
@@ -318,7 +335,7 @@ def _rebuild_agent(provider: str, model: str, api_key: str):
     except Exception:
         logger.exception("Agent rebuild failed; keeping current agent")
     finally:
-        agent._run_lock.release()
+        old_agent._run_lock.release()
 
 
 def _on_settings_changed_main(settings: dict):
@@ -334,8 +351,8 @@ def _on_settings_changed_main(settings: dict):
         apply_runtime_overrides(nova_theme=theme)
 
     provider = settings.get("provider") or "Ollama"
-    model = settings.get("model") or ""
-    api_key = settings.get("api_key") or ""
+    model = (settings.get("models") or {}).get(provider) or ""
+    api_key = (settings.get("api_keys") or {}).get(provider) or ""
     sig = (provider, model, api_key)
     if sig != _prev_backend_sig:
         _prev_backend_sig = sig
@@ -343,7 +360,7 @@ def _on_settings_changed_main(settings: dict):
 
     voice_engine = (settings.get("voice_engine") or "piper").strip().lower()
     voice = settings.get("voice") or ""
-    voice_id = voice.split("—")[-1].strip() if "—" in voice else voice.strip()
+    voice_id = voice.rsplit(" ", 1)[-1].strip() if voice.strip() else ""
     try:
         speed = float(settings.get("speed", 1.0))
     except (TypeError, ValueError):

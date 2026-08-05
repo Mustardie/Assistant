@@ -524,7 +524,8 @@ def build_metadata(steps: list[dict], screen: dict | None) -> dict:
 # LLM refinement (optional)
 # --------------------------------------------------------------------- #
 
-def _llm_descriptions(llm, steps: list[dict], windows: list[str]) -> list[str] | None:
+def _llm_descriptions(llm, steps: list[dict], windows: list[str],
+                      instructions: list[str] | None = None) -> list[str] | None:
     """Ask the LLM to rewrite the steps as high-level semantic actions.
     Returns a description per step, or None on any failure."""
     if llm is None:
@@ -539,13 +540,20 @@ def _llm_descriptions(llm, steps: list[dict], windows: list[str]) -> list[str] |
              "window": s.get("window", {})}
             for s in steps
         ]
+        instruction_block = ""
+        if instructions:
+            instruction_block = (
+                "\n\nSpoken instructions the user gave while demonstrating:\n"
+                + "\n".join(f"- {i}" for i in instructions)
+                + "\nUse them to clarify what each action is for."
+            )
         data = llm(
             "You convert low-level desktop automation actions into clear, "
             "reusable, high-level steps. One short description per action. "
             "Return JSON: {\"descriptions\": [\"...\"]} with exactly "
             f"{len(steps)} entries.",
             f"Windows used: {', '.join(windows) or 'unknown'}.\n"
-            f"Actions: {summary}",
+            f"Actions: {summary}{instruction_block}",
         )
         descriptions = (data or {}).get("descriptions")
         if isinstance(descriptions, list) and len(descriptions) == len(steps):
@@ -555,16 +563,23 @@ def _llm_descriptions(llm, steps: list[dict], windows: list[str]) -> list[str] |
     return None
 
 
-def llm_skill_profile(llm, steps: list[dict], fallback_name: str) -> dict:
+def llm_skill_profile(llm, steps: list[dict], fallback_name: str,
+                      instructions: list[str] | None = None) -> dict:
     """Ask the LLM for a skill name/description/tags. Degrades to a
     sensible default profile when the LLM is unavailable."""
     try:
+        instruction_block = ""
+        if instructions:
+            instruction_block = (
+                "\n\nThe user explained during the demo:\n"
+                + "\n".join(f"- {i}" for i in instructions)
+            )
         data = llm(
             "You help name and describe a reusable desktop automation skill. "
             'Return JSON: {"name": "...", "description": "...", "tags": ["..."]} '
             "with a short name (2-5 words), a one-sentence description, and 3-6 "
             "keyword tags.",
-            f"Steps:\n" + "\n".join(describe_steps(steps)),
+            f"Steps:\n" + "\n".join(describe_steps(steps)) + instruction_block,
         )
         name = str((data or {}).get("name", "")).strip()
         description = str((data or {}).get("description", "")).strip()
@@ -581,6 +596,26 @@ def llm_skill_profile(llm, steps: list[dict], fallback_name: str) -> dict:
             "description": f"Reusable workflow with {len(steps)} steps.",
             "tags": [],
         }
+
+
+# --------------------------------------------------------------------- #
+# Narration (spoken instructions captured during the demo)
+# --------------------------------------------------------------------- #
+
+def collect_narrations(events: list[dict]) -> list[dict]:
+    """Extract spoken-instruction events from a raw capture, in the order
+    they were said, each with the timestamp of when it was spoken."""
+    narrations = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "narration":
+            continue
+        text = str(event.get("text", "")).strip()
+        if not text:
+            continue
+        narrations.append({"t": event.get("t", 0.0), "text": text})
+    return narrations
 
 
 # --------------------------------------------------------------------- #
@@ -603,9 +638,14 @@ def parse_recording(recording: dict, *, llm=None) -> dict:
     frames = recording.get("vision") or {}
     screen = recording.get("screen") or {}
 
+    narrations = collect_narrations(events)
+    instruction_texts = [n["text"] for n in narrations]
+
     actions = group_actions(events)
     steps, variables = build_steps(actions, frames, screen)
-    descriptions = _llm_descriptions(llm, steps, [w for w in (recording.get("windows") or [])])
+    descriptions = _llm_descriptions(
+        llm, steps, [w for w in (recording.get("windows") or [])], instruction_texts
+    )
     for step, description in zip(steps, descriptions or []):
         step["description"] = description
     for step in steps:
@@ -615,6 +655,8 @@ def parse_recording(recording: dict, *, llm=None) -> dict:
     meta = build_metadata(steps, screen)
     meta["raw_event_count"] = len(events)
     meta["action_count"] = len(actions)
+    if narrations:
+        meta["instructions"] = instruction_texts
 
     return {
         "semantic": steps,
@@ -622,6 +664,8 @@ def parse_recording(recording: dict, *, llm=None) -> dict:
         "raw": _mask_raw_events(events, steps),
         "meta": meta,
         "screen": screen,
+        "narrations": narrations,
+        "instructions": instruction_texts,
     }
 
 

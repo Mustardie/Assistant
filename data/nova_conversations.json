@@ -1,96 +1,55 @@
 {
- "fad499302fb0": {
-  "title": "Summarize my Gmail from this week",
-  "messages": [
-   {
-    "role": "user",
-    "text": "Summarize my Gmail from this week",
-    "ts": 1785644655.518793
-   },
-   {
-    "role": "assistant",
-    "text": "You have **23 new emails** this week. Here's the breakdown:\n\n• 5 from work — 2 meeting invites, 1 urgent approval, 2 newsletters\n• 12 promotions / marketing — mostly ignored\n• 3 personal — including the trip plan we discussed\n\nThe most important one is the **invoice approval** from Sarah — it expires tomorrow. Want me to draft a reply?",
-    "ts": 1785644655.5197952
-   },
-   {
-    "role": "user",
-    "text": "Yes, draft it and also find my recent notes",
-    "ts": 1785644655.5197952
-   },
-   {
-    "role": "user",
-    "text": "What's on my screen right now?",
-    "ts": 1785644657.043992
-   },
-   {
-    "role": "assistant",
-    "text": "You're on the Nova project README. The file has 3 sections and the installation steps are at the end. Want me to run the setup script?",
-    "ts": 1785644657.043992
-   },
-   {
-    "role": "user",
-    "text": "test",
-    "ts": 1785657565.234705
-   },
-   {
-    "role": "assistant",
-    "text": "reply",
-    "ts": 1785657565.234705
-   }
-  ],
-  "updated": 1785657565.234705
- },
- "_active": "9098d3fe74ce",
- "abc123": {
-  "title": "Plan a weekend trip",
-  "messages": [],
-  "updated": 1722600000
- },
- "def456": {
-  "title": "Fix the bridge bug",
-  "messages": [],
-  "updated": 1723000000
- },
- "ghi789": {
+ "_active": "6b29eba0566f",
+ "790d27c8d9bc": {
   "title": "Summarize my Gmail",
-  "messages": [],
-  "updated": 1722500000
- },
- "0294a5d8beaf": {
-  "title": "New conversation",
-  "messages": [],
-  "updated": 1785658096.4148176
- },
- "9098d3fe74ce": {
-  "title": "research on ai neural networks",
   "messages": [
    {
     "role": "user",
-    "text": "research on ai neural networks",
-    "ts": 1785661277.3898234
+    "text": "Summarize my Gmail",
+    "ts": 1785938905.0474427
    },
    {
     "role": "assistant",
-    "text": "Starting in-depth research on ai neural networks. This takes a couple of minutes.\n\nResearch on ai neural networks is done. The report and sources are saved in D:\\Research Files\\ai-neural-networks.\n\nResearch on subnautica peeper is done. The report and sources are saved in D:\\Research Files\\subnautica-peeper.",
-    "ts": 1785661277.3898234
+    "text": "Sorry, my thinking engine isn't responding right now — that's the local model server, separate from your browser and internet. Give it a moment and repeat your request.",
+    "ts": 1785938938.4288452
    }
   ],
-  "updated": 1785661546.413134
+  "updated": 1785938938.4303544
  },
- "4b02b2cc9af6": {
-  "title": "research on subnautica peeper",
+ "6b29eba0566f": {
+  "title": "watch me",
   "messages": [
    {
     "role": "user",
-    "text": "research on subnautica peeper",
-    "ts": 1785661530.5024657
+    "text": "watch me",
+    "ts": 1785938967.554486
    },
    {
     "role": "assistant",
-    "text": "Starting in-depth research on subnautica peeper. This takes a couple of minutes.",
-    "ts": 1785661530.5124824
+    "text": "I'm watching. Go ahead and perform the task. Say 'stop recording' when you're done.",
+    "ts": 1785938967.5969317
+   },
+   {
+    "role": "user",
+    "text": "stop recording, save this skill as school notes, i will always ask u to download \"school notes of xxx\", xxx being the name of the document, always read the name of the document and download it, all the highlighted parts i did with my mouse are the names of the documents",
+    "ts": 1785939067.996406
+   },
+   {
+    "role": "assistant",
+    "text": "Done! Saved skill 'Document Downloader' with 15 steps and 6 variables. You can run it anytime by saying 'do the Document Downloader skill'.",
+    "ts": 1785939113.2584436
+   },
+   {
+    "role": "user",
+    "text": "do the document downloader skill and download my english notes",
+    "ts": 1785939167.0453908
+   },
+   {
+    "role": "assistant",
+    "text": "What should the Value1 be?",
+    "ts": 1785939198.910681
    }
   ],
-  "updated": 1785661530.513985
+  "updated": 1785939198.9122257
  }
 }

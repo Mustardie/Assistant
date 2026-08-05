@@ -39,15 +39,27 @@ class Settings:
     # LLM provider: "openrouter" or "gemini"
     llm_provider: str = os.getenv("LLM_PROVIDER", "ollama")
 
-    # Reasoning / planning model (cloud). This is what brain.py and the
-    # long-term memory classifier use for all "thinking" now.
+    # Reasoning / planning model (cloud). Any of the providers below can be
+    # selected as the active llm_provider from Settings -> Provider; each
+    # keeps its own API key and model so switching providers never clobbers
+    # another provider's saved key.
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
-    openrouter_model: str = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    openrouter_model: str = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct")
 
-    # No longer used by brain.py/long_memory.py (replaced by OpenRouter
-    # above) -- left here in case you want to switch back later.
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    anthropic_model: str = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
+
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
+    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
     # Local Ollama is kept only because tools/vision.py talks to a local
     # multimodal model (qwen2.5vl) directly for screen understanding. It is
@@ -118,6 +130,40 @@ class Settings:
 
 
 settings = Settings()
+
+
+# --------------------------------------------------------------------------- #
+# Provider metadata -- maps a provider key (lowercase, e.g. "openrouter") to
+# the Settings field that holds its model / API key. Used by main.py and the
+# Settings UI so applying a provider change is a generic lookup instead of a
+# hardcoded if/elif chain per provider.
+# --------------------------------------------------------------------------- #
+PROVIDER_MODEL_FIELD = {
+    "ollama": "ollama_model",
+    "gemini": "gemini_model",
+    "openrouter": "openrouter_model",
+    "openai": "openai_model",
+    "anthropic": "anthropic_model",
+    "groq": "groq_model",
+    "deepseek": "deepseek_model",
+}
+
+# Ollama is local and needs no API key.
+PROVIDER_API_KEY_FIELD = {
+    "ollama": None,
+    "gemini": "gemini_api_key",
+    "openrouter": "openrouter_api_key",
+    "openai": "openai_api_key",
+    "anthropic": "anthropic_api_key",
+    "groq": "groq_api_key",
+    "deepseek": "deepseek_api_key",
+}
+
+
+def get_provider_default_model(provider_key: str) -> str:
+    """Return the currently configured default model for a provider key."""
+    field = PROVIDER_MODEL_FIELD.get((provider_key or "").strip().lower())
+    return getattr(settings, field, "") if field else ""
 
 
 def apply_runtime_overrides(**overrides: str) -> None:

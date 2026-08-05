@@ -38,6 +38,34 @@ def test_detect_recording_controls():
     assert detect("i'm done")["intent"] == "record_stop"
 
 
+def test_detect_record_stop_extracts_name():
+    parsed = detect(
+        "stop recording, save the skill as school files, read the title "
+        "of the document before downloading"
+    )
+    assert parsed["intent"] == "record_stop"
+    assert parsed["args"]["name"] == "school files"
+    assert detect("stop recording and save it as My Groceries")["args"]["name"] == "My Groceries"
+    assert detect("stop recording")["args"]["name"] is None
+
+
+def test_detect_record_stop_extracts_written_instructions():
+    parsed = detect(
+        "stop recording, save the skill as school files, read the title of "
+        "the document before downloading, and navigate through the pages"
+    )
+    assert parsed["args"]["instructions"] == [
+        "read the title of the document before downloading",
+        "navigate through the pages",
+    ]
+    # No instructions -> empty list, no crash.
+    assert detect("stop recording")["args"]["instructions"] == []
+    # Instructions without a rename clause.
+    parsed = detect("stop recording, read the title before downloading")
+    assert parsed["args"]["name"] is None
+    assert parsed["args"]["instructions"] == ["read the title before downloading"]
+
+
 def test_detect_play():
     parsed = detect("do the powerpoint skill")
     assert parsed["intent"] == "play"
@@ -73,10 +101,15 @@ def test_detect_returns_none_for_normal_requests():
 class FakeSkillManager:
     def __init__(self):
         self.calls = []
+        self.is_recording = False
 
     def _log(self, method, **kwargs):
         self.calls.append((method, kwargs))
         return {"success": True, "speak": f"{method} ok"}
+
+    def add_narration(self, text):
+        self.calls.append(("add_narration", {"text": text}))
+        return {"success": True, "captured": True, "speak": "Got it, I'll remember that instruction."}
 
     def start_recording(self, name=None):
         self.calls.append(("start_recording", {"name": name}))
@@ -156,6 +189,40 @@ def test_stop_recording(loop_and_fake):
     loop, fake, spoken = loop_and_fake
     assert loop.run("stop recording") is None
     assert fake.calls[0][0] == "stop_recording"
+
+
+def test_narration_captured_while_recording(loop_and_fake):
+    loop, fake, spoken = loop_and_fake
+    fake.is_recording = True
+    # Non-command speech while watching -> captured as narration, NOT
+    # dispatched to the planner.
+    assert loop.run("read the title of the document before downloading") is None
+    assert fake.calls[0][0] == "add_narration"
+    assert any("remember that instruction" in line for line in spoken)
+
+
+def test_stop_recording_extracts_name(loop_and_fake):
+    loop, fake, spoken = loop_and_fake
+    fake.is_recording = True
+    assert loop.run("stop recording, save the skill as school files") is None
+    stop_call = [c for c in fake.calls if c[0] == "stop_recording"]
+    assert stop_call and stop_call[0][1]["name"] == "school files"
+
+
+def test_stop_recording_narrates_written_instructions(loop_and_fake):
+    loop, fake, spoken = loop_and_fake
+    fake.is_recording = True
+    assert loop.run(
+        "stop recording, save the skill as school files, read the title "
+        "of the document before downloading, and navigate through the pages"
+    ) is None
+    narrated = [c for c in fake.calls if c[0] == "add_narration"]
+    assert [c[1]["text"] for c in narrated] == [
+        "read the title of the document before downloading",
+        "navigate through the pages",
+    ]
+    stop_call = [c for c in fake.calls if c[0] == "stop_recording"]
+    assert stop_call and stop_call[0][1]["name"] == "school files"
 
 
 def test_play_skill_command(loop_and_fake):
