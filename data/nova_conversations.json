@@ -1,5 +1,5 @@
 {
- "_active": "6b29eba0566f",
+ "_active": "a1777b35ba0e",
  "790d27c8d9bc": {
   "title": "Summarize my Gmail",
   "messages": [
@@ -51,5 +51,170 @@
    }
   ],
   "updated": 1785939198.9122257
+ },
+ "a33c339d60b0": {
+  "title": "watch me",
+  "messages": [
+   {
+    "role": "user",
+    "text": "watch me",
+    "ts": 1786116052.485524
+   },
+   {
+    "role": "assistant",
+    "text": "I'm watching. Go ahead and perform the task. Say 'stop recording' when you're done.",
+    "ts": 1786116052.5205688
+   },
+   {
+    "role": "user",
+    "text": "stop recording, save skill name as download notes, read title name of document before downloading, and the name of the document will be given by user.",
+    "ts": 1786116122.2212005
+   },
+   {
+    "role": "assistant",
+    "text": "Done! Saved skill 'download notes' with 10 steps and 3 variables. You can run it anytime by saying 'do the download notes skill'.",
+    "ts": 1786116155.660406
+   },
+   {
+    "role": "user",
+    "text": "do the download notes skill",
+    "ts": 1786116172.0066967
+   },
+   {
+    "role": "user",
+    "text": "do the download notes skill",
+    "ts": 1786116262.1220527
+   }
+  ],
+  "updated": 1786116262.1220527
+ },
+ "65eb30f0951d": {
+  "title": "what do you think about reliance stocks",
+  "messages": [
+   {
+    "role": "user",
+    "text": "what do you think about reliance stocks",
+    "ts": 1786464465.173293
+   }
+  ],
+  "updated": 1786464465.173293
+ },
+ "db951abd276b": {
+  "title": "what do you think about reliance stocks",
+  "messages": [
+   {
+    "role": "user",
+    "text": "what do you think about reliance stocks",
+    "ts": 1786465603.3489673
+   }
+  ],
+  "updated": 1786465603.3489673
+ },
+ "623e24f9b881": {
+  "title": "what do u think of reliance stocks",
+  "messages": [
+   {
+    "role": "user",
+    "text": "what do u think of reliance stocks",
+    "ts": 1786531620.972597
+   },
+   {
+    "role": "assistant",
+    "text": "Analyzing Reliance stocks using financial forecasting tools. This may take a moment.\n\nBased on the analysis, Reliance Industries (RELIANCE) has a 7-day forecast showing a slight positive expected return of +0.92% with 56% probability of rising. Key indicators include RSI(14) at 58.7 and a positive MACD histogram. However, the confidence is low (edge 0.13), and risks include a potential downside of -4.02% and unpredictable events like earnings surprises or macroeconomic shifts. The model emphasizes this is a probabilistic hypothesis, not a recommendation to buy/sell.",
+    "ts": 1786531812.8791187
+   }
+  ],
+  "updated": 1786531940.3410408
+ },
+ "9154f187f0bd": {
+  "title": "send hi to tarun in whatsapp",
+  "messages": [
+   {
+    "role": "user",
+    "text": "send hi to tarun in whatsapp",
+    "ts": 1786618277.043812
+   }
+  ],
+  "updated": 1786618277.043812
+ },
+ "3923e999877e": {
+  "title": "send hi to tarun on whatsapp",
+  "messages": [
+   {
+    "role": "user",
+    "text": "send hi to tarun on whatsapp",
+    "ts": 1786624334.5217845
+   }
+  ],
+  "updated": 1786624334.5217845
+ },
+ "2960f746d2ea": {
+  "title": "hello",
+  "messages": [
+   {
+    "role": "user",
+    "text": "hello",
+    "ts": 1786629500.075147
+   }
+  ],
+  "updated": 1786629500.075147
+ },
+ "b323431175b1": {
+  "title": "hello",
+  "messages": [
+   {
+    "role": "user",
+    "text": "hello",
+    "ts": 1786629856.1951587
+   },
+   {
+    "role": "assistant",
+    "text": "HTTP 413: Request too large for model `openai/gpt-oss-20b` in organization `org_01kzxphhgxeb0t66wfga7g7hsm` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 10134, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing",
+    "ts": 1786629873.161622
+   }
+  ],
+  "updated": 1786629873.1636333
+ },
+ "481785606f69": {
+  "title": "hello",
+  "messages": [
+   {
+    "role": "user",
+    "text": "hello",
+    "ts": 1786630029.7099943
+   },
+   {
+    "role": "assistant",
+    "text": "HTTP 413: Request too large for model `llama-3.1-8b-instant` in organization `org_01kzxphhgxeb0t66wfga7g7hsm` service tier `on_demand` on tokens per minute (TPM): Limit 6000, Requested 10072, please reduce your message size and try again. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing",
+    "ts": 1786630046.691357
+   }
+  ],
+  "updated": 1786630046.6923568
+ },
+ "a1777b35ba0e": {
+  "title": "send hi to tarun on whatsapp",
+  "messages": [
+   {
+    "role": "user",
+    "text": "send hi to tarun on whatsapp",
+    "ts": 1786631585.811078
+   },
+   {
+    "role": "assistant",
+    "text": "Launching WhatsApp...\n\nI couldn't locate WhatsApp on your system.  Is WhatsApp installed on this PC?  If so, could you tell me the full path to the WhatsApp executable (e.g., C:\\Program Files (x86)\\WhatsApp\\WhatsApp.exe)?  Or would you prefer to send the message via WhatsApp Web in a browser?",
+    "ts": 1786631603.7704177
+   },
+   {
+    "role": "user",
+    "text": "C:\\Program Files\\WindowsApps\\5319275A.WhatsAppDesktop_2.2630.102.0_x64__cv1g1gvanyjgm",
+    "ts": 1786631940.438243
+   },
+   {
+    "role": "assistant",
+    "text": "Searching for the WhatsApp Desktop executable...\n\nSearching for WhatsApp Desktop executable…\n\nI found a few close matches, but I'm not confident enough to guess. Which one did you mean?",
+    "ts": 1786631959.036223
+   }
+  ],
+  "updated": 1786631977.1768682
  }
 }

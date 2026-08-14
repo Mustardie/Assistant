@@ -575,6 +575,12 @@ _RESEARCH_PATTERN = re.compile(
     r"methodology|results?|findings?)\S",
     re.IGNORECASE,
 )
+# Blender requests route to the BlenderLLM specialist deterministically --
+# the weak planner must never be asked to chain "generate code, then run it
+# in Blender" on its own (and the old prompt told the model Blender was
+# impossible). "research ... blender ..." still goes to the research
+# pipeline (the blender check runs after the research check).
+_BLENDER_PATTERN = re.compile(r"\bblender\b|\bbpy\b", re.IGNORECASE)
 _DATE_HINT_PATTERN = re.compile(
     r"\b(?:on|for|until)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|"
     r"sunday|tomorrow|today|this\s+\w+|\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|"
@@ -702,6 +708,8 @@ def _detect_complex_task(goal: str) -> str | None:
     goal = goal or ""
     if _RESEARCH_PATTERN.search(goal):
         return "research"
+    if _BLENDER_PATTERN.search(goal):
+        return "blender"
     if _GDOCS_WRITE_PATTERN.search(goal):
         return "gdocs"
     if _DOC_TO_FOLDER_PATTERN.search(goal):
@@ -757,7 +765,12 @@ _SKILL_RECORD_NAME_PATTERN = re.compile(
 )
 
 _SKILL_SAVE_AS_NAME_PATTERN = re.compile(
-    r"\bsave\s+(?:it\s+|this\s+|the\s+skill\s+)?(?:recording\s+)?as\s+"
+    # Allow any short run of filler words between "save" and "as" (e.g.
+    # "save it", "save this skill", "save my skill", "save that", "save
+    # the recording") instead of a fixed list -- the fixed list used to
+    # miss common phrasings like "save this skill as X" or "save my
+    # skill as X", silently falling through to an auto-generated name.
+    r"\bsave\b[^,.!?]{0,30}?\bas\s+"
     r"[\"']?([^\"'.!?]+?)[\"']?"
     r"(?=\s*(?:,|\.|!|\?| and | then | after |,|\bplease\b|$))",
     re.IGNORECASE,
@@ -1133,11 +1146,20 @@ class AgentLoop:
         self._loop_guard_blocks = 0
         self._browser_ask_guard_fired = False
         self._pending_tab_choice = None
+        # Risk-confirmation state: a medium/high-risk tool call needs the
+        # user's OK before it actually runs. Survives turns (like
+        # _pending_tab_choice) so the next reply ('yes'/'no') completes or
+        # cancels it.
+        self._pending_confirmation = None
         # Skills subsystem state (persists across turns like _pending_tab_choice):
         # a playback paused on a user question, a completed playback waiting
         # on the improvement offer, and suggestions shown this session.
         self._pending_skill_session = None
         self._pending_improvement_session = None
+        # Set when stop_recording() couldn't get a name inline and is
+        # waiting on the user's very next reply to name (and optionally
+        # add instructions to) the skill just recorded.
+        self._pending_skill_finalize = False
         self._suggested_phrases: set[str] = set()
 
     # ------------------------------------------------------------------ #
@@ -1243,6 +1265,33 @@ class AgentLoop:
         self.speak(f"Done. I created the folder '{folder_name}' and saved the document on {topic} there: {path}")
         return True
 
+    def _task_blender(self, user: str, goal: str) -> bool:
+        """Generate Blender Python via the BlenderLLM specialist.
+
+        Generation only -- the specialist never executes anything, and the
+        planner prompt forbids claiming it did. Execution is a separate
+        follow-up the user can request ("run it in Blender"), which then
+        goes through blender_execute's explicit confirmation flow.
+        """
+        try:
+            ok, res = run_tool("blender_generate", {"request": goal})
+        except Exception as exc:
+            logger.error("[ComplexTask] blender_generate failed: %s", exc)
+            self.speak("The Blender specialist hit an error and didn't generate a script.")
+            return True
+        if not ok:
+            self.speak(f"I couldn't generate Blender code: {_short_error(res)}")
+            return True
+        reply = (res.get("reply") if isinstance(res, dict) else None) or str(res)
+        if reply:
+            self.speak(reply)
+        if isinstance(res, dict) and res.get("code_ready"):
+            self.speak(
+                "The script is ready. I can run it in Blender when you want — "
+                "just say so and I'll confirm with you first."
+            )
+        return True
+
     def _task_research(self, user: str, goal: str) -> bool:
         """Run the full research pipeline (research_topic) directly --
         the planner is never asked to pick a tool for these."""
@@ -1300,6 +1349,7 @@ class AgentLoop:
             "flights": self._task_flights,
             "hotels": self._task_hotels,
             "research": self._task_research,
+            "blender": self._task_blender,
         }.get(task)
         if handler is None:
             return False
@@ -1325,6 +1375,9 @@ class AgentLoop:
                     skill_manager.add_narration(instruction)
                 result = skill_manager.stop_recording(args.get("name"))
                 self.speak(result["speak"])
+                if result.get("need_name"):
+                    self._pending_skill_finalize = True
+                    return "paused"
                 return "done"
             if intent == "record_pause":
                 result = skill_manager.pause_recording()
@@ -1521,6 +1574,54 @@ class AgentLoop:
             if outcome == "paused":
                 return {"goal": goal, "observations": list(observations)}
             return None
+
+        if resume_goal and self._pending_skill_finalize:
+            self._pending_skill_finalize = False
+            try:
+                result = skill_manager.finish_recording(user)
+                self.speak(result["speak"])
+            except Exception as exc:
+                logger.exception("[Skills] Finalizing recording failed")
+                self.speak(f"I couldn't finish saving that skill: {exc}")
+            return None
+
+        # Risk confirmation resume: a previous turn paused because a
+        # medium/high-risk tool needed approval. The user's reply decides:
+        # 'yes' -> re-run the exact step with confirm=True; 'no' -> mark it
+        # declined and let the planner pick a different path.
+        if resume_goal and self._pending_confirmation is not None:
+            pending = self._pending_confirmation
+            self._pending_confirmation = None
+            if _user_accepted(user):
+                logger.info(
+                    "[Confirm] User confirmed -- re-running %s with confirm=True",
+                    pending["tool"],
+                )
+                step = {"tool": pending["tool"],
+                        "arguments": dict(pending["arguments"], confirm=True)}
+                try:
+                    outcome = self._execute_tool_step(user, step)
+                except RecommendationConfigurationError as error:
+                    self.speak(str(error))
+                    return None
+                if outcome["stop"]:
+                    return None
+                observations.append({
+                    "step": step,
+                    "success": outcome["success"],
+                    "result": outcome["result"],
+                    "confirmed_by_user": True,
+                })
+                logger.info("[Confirm] Confirmed step executed (success=%s)", outcome["success"])
+            else:
+                logger.info("[Confirm] User declined confirmation for %s", pending["tool"])
+                self.speak("Understood — I'll skip that action.")
+                observations.append({
+                    "step": {"tool": pending["tool"], "arguments": pending["arguments"]},
+                    "success": False,
+                    "result": "User declined confirmation.",
+                    "declined_by_user": True,
+                })
 
         # Deterministic complex-task handling: fresh goals that match a
         # known multi-step workflow (Google Docs writing, document saved
@@ -2029,6 +2130,18 @@ class AgentLoop:
                     safe_print(error)
                     return None
 
+                # A medium/high-risk tool asked for user approval: pause the
+                # loop, remember the step, and end this turn asking the user.
+                # Their next reply ('yes'/'no') re-runs or cancels the step.
+                if outcome.get("needs_confirmation"):
+                    self._pending_confirmation = outcome.get("pending_confirmation")
+                    self.speak(
+                        outcome["result"].get(
+                            "message", "This action needs your confirmation."
+                        )
+                    )
+                    return _pending_result()
+
                 if outcome["stop"]:
                     return None
 
@@ -2173,6 +2286,21 @@ class AgentLoop:
 
         raw_success, result = run_tool(tool, arguments)
         success = _tool_reported_success(raw_success, result)
+
+        # Risk gate: a tool returned requires_confirmation (medium/high risk).
+        # Do NOT treat this as a failure for recovery -- pause and ask the
+        # user; their next reply re-runs the step with confirm=True.
+        if isinstance(result, dict) and result.get("requires_confirmation"):
+            logger.info("[Confirm] %s needs user confirmation before running", tool)
+            pending = {
+                "tool": tool,
+                "arguments": arguments,
+                "message": result.get("message", f"{tool} needs your confirmation."),
+            }
+            self._pending_confirmation = pending
+            return {"success": False, "result": result, "stop": False,
+                    "needs_confirmation": True,
+                    "pending_confirmation": pending}
 
         if success and self.track_file_action and tool in {"file_rename", "file_move"}:
             self.track_file_action(tool, arguments)

@@ -94,10 +94,19 @@ def test_record_and_stop_saves_skill(tmp_path, monkeypatch):
     started = manager.start_recording()
     assert started["success"] and manager.is_recording
 
-    result = manager.stop_recording()
+    # No name given inline -> the manager holds the recording and asks,
+    # instead of silently saving under a guessed name.
+    stopped = manager.stop_recording()
+    assert stopped["success"]
+    assert stopped.get("need_name")
+    assert not manager.is_recording
+    assert manager.awaiting_skill_name
+
+    result = manager.finish_recording("My Skill")
     assert result["success"]
     assert "Saved skill" in result["speak"]
-    assert not manager.is_recording
+    assert result["name"] == "My Skill"
+    assert not manager.awaiting_skill_name
 
     folder = storage.skill_dir(result["name"])
     assert (folder / "skill.json").exists()
@@ -108,6 +117,23 @@ def test_record_and_stop_saves_skill(tmp_path, monkeypatch):
     timeline = storage.load_timeline(result["name"])
     assert timeline["semantic"]
     assert not manager.is_recording
+
+
+def test_stop_without_name_then_finish_with_instructions(monkeypatch):
+    """finish_recording() splits the reply into a name plus any extra
+    instructions tacked on after a comma/'and'."""
+    manager = _manager_with_fake_recorder(monkeypatch)
+    manager.start_recording()
+    stopped = manager.stop_recording()
+    assert stopped.get("need_name")
+
+    result = manager.finish_recording(
+        "school notes, read the title before downloading"
+    )
+    assert result["success"]
+    assert result["name"] == "school notes"
+    timeline = storage.load_timeline("school notes")
+    assert "read the title before downloading" in timeline["instructions"]
 
 
 def test_stop_with_explicit_name(monkeypatch):

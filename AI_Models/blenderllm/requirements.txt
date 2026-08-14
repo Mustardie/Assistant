@@ -1,0 +1,3 @@
+# BlenderLLM V0.1
+# The only runtime dependency is the official Ollama Python client.
+ollama>=0.4.0

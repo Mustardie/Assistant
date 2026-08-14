@@ -25,6 +25,65 @@ from tools.computer_tool import (
     move_mouse,
     wait,
 )
+from tools.universal_tools import (
+    read_messages,
+    search_messages,
+    send_message,
+    reply_to_message,
+    identify_sender,
+    inspect_attachment,
+    download_attachment,
+    create_event,
+    update_event,
+    delete_event,
+    list_events,
+    create_task,
+    update_task,
+    list_tasks,
+    create_reminder,
+    play_media,
+    pause_media,
+    skip_media,
+    search_media,
+    control_volume,
+    now_playing,
+    set_volume,
+    toggle_shuffle,
+    toggle_repeat,
+    save_media,
+    add_to_queue,
+    open_app,
+    close_app,
+    focus_app,
+    get_active_window,
+    inspect_window,
+    inspect_accessibility_tree,
+    inspect_ui_elements,
+    read_visible_text,
+    locate_ui_element,
+    interact_with_ui_element,
+    click,
+    select_text_copy,
+    copy as copy_clipboard,
+    paste,
+    wait_for_ui,
+    detect_ui_change,
+    read_document,
+    read_pdf,
+    read_docx,
+    read_xlsx,
+    read_pptx,
+    extract_text,
+    summarize_document,
+    get_system_info,
+    get_running_apps,
+    launch_process,
+    terminate_process,
+    get_notifications,
+    get_clipboard,
+    set_volume,
+    get_volume,
+)
 from tools.web_research import web_research
 from tools.research_tool import research_topic
 from tools.file_ops import (
@@ -44,6 +103,20 @@ from tools.file_ops import (
     search_files,
 )
 from tools.screenshot import capture_screenshot as capture_screenshot_tool
+from tools.blender_tool import (
+    blender_generate,
+    blender_execute,
+    blender_status,
+    blender_session_clear,
+)
+from tools.stockllm_tool import (
+    stockllm_predict,
+    stockllm_track,
+    stockllm_untrack,
+    stockllm_watchlist,
+    stockllm_tracking_report,
+    stockllm_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -954,7 +1027,89 @@ TOOLS = {
     "move_mouse": move_mouse,
     "wait": wait,
 
+    # ---------------- Universal Computer / UI tools ---------------- #
+    "open_app": open_app,
+    "close_app": close_app,
+    "focus_app": focus_app,
+    "get_active_window": get_active_window,
+    "inspect_window": inspect_window,
+    "inspect_accessibility_tree": inspect_accessibility_tree,
+    "inspect_ui_elements": inspect_ui_elements,
+    "read_visible_text": read_visible_text,
+    "locate_ui_element": locate_ui_element,
+    "interact_with_ui_element": interact_with_ui_element,
+    "select_text_copy": select_text_copy,
+    "copy": copy_clipboard,
+    "paste": paste,
+    "wait_for_ui": wait_for_ui,
+    "detect_ui_change": detect_ui_change,
+
+    # ---------------- Universal Documents ---------------- #
+    "read_document": read_document,
+    "read_pdf": read_pdf,
+    "read_docx": read_docx,
+    "read_xlsx": read_xlsx,
+    "read_pptx": read_pptx,
+    "extract_text": extract_text,
+    "summarize_document": summarize_document,
+
+    # ---------------- Universal Communication ---------------- #
+    "read_messages": read_messages,
+    "search_messages": search_messages,
+    "send_message": send_message,
+    "reply_to_message": reply_to_message,
+    "identify_sender": identify_sender,
+    "inspect_attachment": inspect_attachment,
+    "download_attachment": download_attachment,
+
+    # ---------------- Universal Calendar / Tasks ---------------- #
+    "create_event": create_event,
+    "update_event": update_event,
+    "delete_event": delete_event,
+    "list_events": list_events,
+    "create_task": create_task,
+    "update_task": update_task,
+    "list_tasks": list_tasks,
+    "create_reminder": create_reminder,
+
+    # ---------------- Universal Media ---------------- #
+    "play_media": play_media,
+    "pause_media": pause_media,
+    "skip_media": skip_media,
+    "search_media": search_media,
+    "control_volume": control_volume,
+    "now_playing": now_playing,
+    "set_volume": set_volume,
+    "toggle_shuffle": toggle_shuffle,
+    "toggle_repeat": toggle_repeat,
+    "save_media": save_media,
+    "add_to_queue": add_to_queue,
+
+    # ---------------- Universal System ---------------- #
+    "get_system_info": get_system_info,
+    "get_running_apps": get_running_apps,
+    "launch_process": launch_process,
+    "terminate_process": terminate_process,
+    "get_notifications": get_notifications,
+    "get_clipboard": get_clipboard,
+    "set_volume": set_volume,
+    "get_volume": get_volume,
+
     "vision": vision_tool,
+
+    # Blender specialist (BlenderLLM)
+    "blender_generate": blender_generate,
+    "blender_execute": blender_execute,
+    "blender_status": blender_status,
+    "blender_session_clear": blender_session_clear,
+
+    # StockLLM specialist (stock forecasting)
+    "stockllm_predict": stockllm_predict,
+    "stockllm_track": stockllm_track,
+    "stockllm_untrack": stockllm_untrack,
+    "stockllm_watchlist": stockllm_watchlist,
+    "stockllm_tracking_report": stockllm_tracking_report,
+    "stockllm_status": stockllm_status,
 
     # Skills subsystem
     "skill_record_start": skill_record_start,

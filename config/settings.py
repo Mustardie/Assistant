@@ -36,6 +36,15 @@ class Settings:
     youtube_api_key: str = os.getenv("YOUTUBE_API_KEY", "")
     assistant_name: str = os.getenv("ASSISTANT_NAME", "Nova")
 
+    # Integration tokens (Connections page). Env vars beat the secure
+    # token store (connections/secrets.py) at read time.
+    discord_bot_token: str = os.getenv("DISCORD_BOT_TOKEN", "")
+    discord_user_token: str = os.getenv("DISCORD_USER_TOKEN", "")
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    slack_bot_token: str = os.getenv("SLACK_BOT_TOKEN", "")
+    notion_api_token: str = os.getenv("NOTION_API_TOKEN", "")
+    todoist_api_token: str = os.getenv("TODOIST_API_TOKEN", "")
+
     # LLM provider: "openrouter" or "gemini"
     llm_provider: str = os.getenv("LLM_PROVIDER", "ollama")
 

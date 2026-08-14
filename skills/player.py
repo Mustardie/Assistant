@@ -21,6 +21,7 @@ confirmations), and answer() feeds the reply back in.
 """
 
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -173,6 +174,26 @@ class PlaybackSession:
         variable = step.get("variable") or {}
         return bool(variable.get("name")) and variable["name"] not in self._values
 
+    # Names that are just a type fallback ("Value", "Text", "Number2", ...)
+    # rather than a real field label -- these should never be echoed back
+    # to the user verbatim (e.g. "What should the Text be?").
+    _GENERIC_VARIABLE_NAMES = re.compile(
+        r"^(?:Value|Text|Number|Date|URL|File|Folder)\d*$"
+    )
+
+    def _variable_subject(self, step: dict, variable: dict) -> str:
+        """A human-friendly name for what we're asking about: the real
+        field label when we have one, otherwise the on-screen target text,
+        otherwise a neutral fallback -- never a generic internal name like
+        'Value1'."""
+        name = (variable.get("name") or "").strip()
+        if name and not self._GENERIC_VARIABLE_NAMES.match(name):
+            return name
+        target = (step.get("target") or "").strip()
+        if target and target not in ("text field", "password field"):
+            return target
+        return "value"
+
     def _build_variable_question(self, step: dict) -> str:
         variable = step.get("variable") or {}
         vtype = variable.get("type", "text")
@@ -184,13 +205,14 @@ class PlaybackSession:
                 f"For this skill I need the {subject} value that was entered during "
                 f"recording. What should I type? I will not store it."
             )
+        subject = self._variable_subject(step, variable)
         prompts = {
-            "text": f"What should the {variable.get('name', 'value')} be?",
-            "number": f"What number should the {variable.get('name', 'value')} be?",
-            "date": f"What date should the {variable.get('name', 'value')} be?",
-            "url": f"What URL should the {variable.get('name', 'value')} be?",
-            "path": f"Which file should I use for the {variable.get('name', 'value')}?",
-            "folder": f"Which folder should I use for the {variable.get('name', 'value')}?",
+            "text": f"What should the {subject} be?",
+            "number": f"What number should the {subject} be?",
+            "date": f"What date should the {subject} be?",
+            "url": f"What URL should the {subject} be?",
+            "path": f"Which file should I use for the {subject}?",
+            "folder": f"Which folder should I use for the {subject}?",
         }
         question = prompts.get(vtype, prompts["text"])
         if example:

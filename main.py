@@ -145,6 +145,27 @@ def _shutdown_bridge():
 
 atexit.register(_shutdown_bridge)
 
+# ------------------------------------------------------------------ #
+# Integration layer: adapters + event workflows
+# ------------------------------------------------------------------ #
+# Registers every built-in adapter (Discord, WhatsApp, Google, ...) into
+# the ConnectionManager so the Connections page can list them and the
+# universal tools can route capability calls to connected services.
+from adapters import register_all as register_adapters
+from workflows import register_all as register_workflows
+
+try:
+    _adapter_count = register_adapters()
+    logger.info("[Startup] Registered %d integration adapters.", _adapter_count)
+except Exception:
+    logger.exception("[Startup] Adapter registration failed")
+
+try:
+    register_workflows()
+    logger.info("[Startup] Registered event workflows.")
+except Exception:
+    logger.exception("[Startup] Workflow registration failed")
+
 agent = Agent()
 
 

@@ -14,6 +14,7 @@ The recorder/player imports are lazy so importing this module stays cheap.
 """
 
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +31,7 @@ class SkillManager:
         self._draft_name = None
         self._session = None
         self._last_result = None
+        self._pending_finalize = None  # holds a stopped-but-unnamed recording
 
     # ------------------------------------------------------------------ #
     # Recording (Phase 1)
@@ -43,10 +45,18 @@ class SkillManager:
     def is_paused(self) -> bool:
         return self._recorder is not None and self._recorder.is_paused
 
+    @property
+    def awaiting_skill_name(self) -> bool:
+        return self._pending_finalize is not None
+
     def start_recording(self, name: str | None = None) -> dict:
         if self.is_recording:
             return {"success": False,
                     "speak": "I'm already watching. Say 'stop recording' when you're done."}
+        if self._pending_finalize is not None:
+            return {"success": False,
+                    "speak": "I still need a name for the last skill you recorded -- "
+                             "what should I call it?"}
         if self._session is not None:
             return {"success": False,
                     "speak": "Finish the current skill playback before recording."}
@@ -128,6 +138,62 @@ class SkillManager:
             return {"success": False,
                     "speak": f"I had a problem understanding what I recorded: {exc}."}
 
+        if not final_name:
+            # Don't silently guess the name -- hold the recording and ask.
+            # This doubles as a natural opening for the user to add any
+            # extra requirements they couldn't narrate while their hands
+            # were busy (e.g. "read the title before downloading").
+            self._pending_finalize = {
+                "draft": draft, "capture": capture, "parsed": parsed, "profile": profile,
+            }
+            suggested = profile.get("name") or draft
+            return {
+                "success": True,
+                "need_name": True,
+                "speak": (
+                    f"Got it, recording stopped. What should I call this skill? "
+                    f"(I'd suggest '{suggested}'.) Let me know now if there's anything "
+                    "else I should do each time, like reading a title before downloading."
+                ),
+            }
+
+        return self._finalize(draft, capture, parsed, profile, final_name)
+
+    def finish_recording(self, reply: str) -> dict:
+        """Complete a stop_recording() that was left waiting on a name.
+
+        Accepts a free-form reply: the part before the first comma/'and'
+        is treated as the skill name, anything after that is folded in as
+        extra playback instructions -- e.g. "school notes, read the title
+        before downloading" -> name="school notes", instructions += [...].
+        """
+        pending = self._pending_finalize
+        if pending is None:
+            return {"success": False, "speak": "I wasn't waiting on a name for a skill."}
+        self._pending_finalize = None
+
+        reply = (reply or "").strip()
+        fallback_name = pending["profile"].get("name") or pending["draft"]
+        if not reply:
+            name = fallback_name
+            extra_instructions: list[str] = []
+        else:
+            parts = re.split(r"[,;]|\band\b", reply, maxsplit=1)
+            name = parts[0].strip().strip('"\'') or fallback_name
+            extra_instructions = [p.strip(" .,!?") for p in parts[1:] if p.strip(" .,!?")]
+
+        if extra_instructions:
+            pending["parsed"]["instructions"] = list(
+                pending["parsed"].get("instructions") or []
+            ) + extra_instructions
+
+        return self._finalize(
+            pending["draft"], pending["capture"], pending["parsed"],
+            pending["profile"], name,
+        )
+
+    def _finalize(self, draft: str, capture: dict, parsed: dict, profile: dict,
+                   final_name: str | None) -> dict:
         final = storage.sanitize_name(final_name or profile.get("name") or draft)
         if final.lower() != draft.lower():
             storage.rename_skill(draft, final)

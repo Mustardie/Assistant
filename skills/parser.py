@@ -134,12 +134,22 @@ def mask_text(value: str) -> str:
     return "•" * max(6, min(len(value), 20))
 
 
-def suggest_variable_name(label: str, value: str, index: int) -> str:
+def suggest_variable_name(label: str, value: str, index: int, var_type: str = "text") -> str:
     words = re.findall(r"[A-Za-z0-9]+", label or "")
     words = [w for w in words if w.lower() not in _PASSWORD_FIELD_HINTS]
     if words:
         return "".join(w[:1].upper() + w[1:] for w in words)
-    return f"Value{index + 1}"
+    # No usable field label (vision couldn't read it, or the click->type
+    # window missed it). Fall back to a name derived from the value's
+    # detected type ("Date", "Url", ...) instead of a generic "Value1" --
+    # that generic name otherwise leaks verbatim into the playback
+    # question ("What should the Value1 be?"), which sounds broken.
+    type_names = {
+        "number": "Number", "date": "Date", "url": "URL",
+        "path": "File", "folder": "Folder", "text": "Text",
+    }
+    base = type_names.get(var_type, "Value")
+    return base if index == 0 else f"{base}{index + 1}"
 
 
 # --------------------------------------------------------------------- #
@@ -422,7 +432,7 @@ def build_steps(actions: list[dict], frames: dict, screen: dict | None) -> list[
                 })
                 continue
             if var_type is not None:
-                name = suggest_variable_name(field_label, raw_text, len(variables))
+                name = suggest_variable_name(field_label, raw_text, len(variables), var_type)
                 steps.append({
                     "type": "type", "text": f"{{{{{name}}}}}", "is_variable": True,
                     "variable": {"name": name, "type": var_type},

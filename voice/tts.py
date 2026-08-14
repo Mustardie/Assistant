@@ -232,9 +232,20 @@ class TTS:
         if TTS._pipeline is not None and TTS._engine == self.engine_name():
             return
         if self.engine_name() == "piper":
-            self._load_piper()
-        else:
-            self._load_kokoro()
+            try:
+                self._load_piper()
+                return
+            except ImportError:
+                # piper-tts isn't installed -- fall back to the kokoro
+                # engine (also bundled in requirements.txt) instead of
+                # failing startup or breaking voice output.
+                logger.warning(
+                    "piper-tts is not installed; falling back to the "
+                    "kokoro TTS engine for this session."
+                )
+                from config.settings import apply_runtime_overrides
+                apply_runtime_overrides(tts_engine="kokoro")
+        self._load_kokoro()
 
     @staticmethod
     def engine_name() -> str:

@@ -1,0 +1,2 @@
+# The official Ollama Python library (talks to your local Ollama server).
+ollama

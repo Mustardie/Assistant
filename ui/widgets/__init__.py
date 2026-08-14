@@ -1,34 +1,44 @@
 """
-Reusable building blocks for the Nova interface:
+Reusable building blocks for the Nova redesign:
 
-    IconButton      — compact hover/press icon control
-    NovaAvatar      — the glowing Nova orb
-    MessageBubble   — user + assistant bubbles and the typing indicator
-    ChatInputBar    — the premium floating input dock
-    AttachmentMenu  — floating attach popup
-    TitleBar        — frameless window chrome
-    Sidebar         — conversations + navigation
-    SettingsPanel   — slide-over settings
+    NovaOrb         — the animated glowing Nova orb
+    GlassButton etc — the glass control kit
+    UserBubble      — user message bubble
+    AssistantRow    — assistant glass-card message with markdown
+    TypingIndicator — three-dot thinking indicator
+    InputDock       — the floating input pill
+    NavRail         — left navigation column
+    TopBar          — the app bar with links + window controls
+    ChatPage        — flagship chat view (messages + welcome + input)
+    HistoryPage     — grouped conversation history
+    LibraryPage     — knowledge library grid
+    TemplatesPage   — templates placeholder
+    SettingsPage    — full-page settings
+    WelcomeView     — new-chat empty state with prompt cards
 """
-from .icon_button import IconButton
-from .avatar import NovaAvatar
-from .message_bubble import UserBubble, AssistantBubble, AssistantRow, TypingIndicator
-from .chat_input import ChatInputBar
-from .attach_menu import AttachmentMenu
-from .title_bar import TitleBar
-from .sidebar import Sidebar
-from .settings_panel import SettingsPanel
+from .nova_orb import NovaOrb
+from .glass import (
+    GlassButton, GlassIconButton, GlassLineEdit, GlassCombo, GlassToggle,
+    GlassSlider, GlassCard, SectionHeader, label, divider,
+)
+from .message_bubble import UserBubble, AssistantRow, TypingIndicator, fade_in
+from .chat_input import InputDock, ChatInputBar
+from .nav_rail import NavRail
+from .top_bar import TopBar
+from .welcome_view import WelcomeView
+from .chat_page import ChatPage
+from .history_page import HistoryPage
+from .library_page import LibraryPage, TemplatesPage
+from .settings_page import SettingsPage
+from .connections_page import ConnectionsPage
 
 __all__ = [
-    "IconButton",
-    "NovaAvatar",
-    "UserBubble",
-    "AssistantBubble",
-    "AssistantRow",
-    "TypingIndicator",
-    "ChatInputBar",
-    "AttachmentMenu",
-    "TitleBar",
-    "Sidebar",
-    "SettingsPanel",
+    "NovaOrb",
+    "GlassButton", "GlassIconButton", "GlassLineEdit", "GlassCombo",
+    "GlassToggle", "GlassSlider", "GlassCard", "SectionHeader", "label", "divider",
+    "UserBubble", "AssistantRow", "TypingIndicator", "fade_in",
+    "InputDock", "ChatInputBar",
+    "NavRail", "TopBar", "WelcomeView",
+    "ChatPage", "HistoryPage", "LibraryPage", "TemplatesPage", "SettingsPage",
+    "ConnectionsPage",
 ]

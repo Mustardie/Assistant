@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+data/raw/*.csv
+data/watchlist.json
+datasets/*.csv.gz
+datasets/*.jsonl
+models/
+logs/
+backtesting/results/*.csv
+research/*.sqlite

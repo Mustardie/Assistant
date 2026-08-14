@@ -1,5 +1,7 @@
 import json
 import logging
+import re
+import time
 
 from config.settings import settings
 from llm.openrouter_client import OpenRouterClient, OpenRouterConfigurationError
@@ -226,8 +228,80 @@ Desktop control:
 - move_mouse(x, y)
 - wait(seconds)         <- pause before the next action (e.g. after launching an app)
 
+Universal tools (capability-dispatched -- you don't pick the app, Jarvis routes to whatever is connected):
+Communication:
+- read_messages(limit, source)      <- recent messages from any connected chat service
+- search_messages(query, limit)     <- search chat history
+- send_message(recipient, text)     <- HIGH risk: Jarvis pauses for your confirmation first
+- reply_to_message(message_id, text)
+- identify_sender(message)
+- inspect_attachment(message, index)
+- download_attachment(message, index, destination)
+Calendar & tasks:
+- create_event(summary, start, end) <- MEDIUM risk: confirmed first
+- update_event(event_id, ...)
+- delete_event(event_id)            <- HIGH risk: confirmed first
+- list_events(start, end, limit)
+- create_task(title, due)           <- MEDIUM risk: confirmed first
+- update_task(task_id, ...)
+- list_tasks(limit)
+- create_reminder(text, when)       <- MEDIUM risk: confirmed first
+Media:
+- play_media(query) / pause_media() / skip_media(direction)
+- search_media(query)
+- control_volume(direction)
+Local system:
+- get_system_info() / get_running_apps(limit)
+- launch_process(command) / terminate_process(pid, name)
+- get_clipboard() / set_clipboard(text)
+- get_volume() / set_volume(direction)
+- get_notifications()
+- read_document(path)               <- extract text from pdf/docx/xlsx/pptx/txt
+- summarize_document(path)
+- get_active_window() / list_windows()
+- read_visible_text() / locate_ui_element(description)
+- interact_with_ui_element(description, action, text)
+Confirmation: when a tool needs user approval (medium/high risk) it returns
+"requires_confirmation" -- set ask_user=true, explain the exact action you
+want to take in "response", and stop. Run the tool again only after the user
+agrees. Never bypass the confirmation by calling the underlying tool
+directly, and never claim the action happened when it was only confirmed.
+
 Vision:
 - vision(prompt)        <- looks at the current screen and answers a question about it
+
+Blender (BlenderLLM specialist -- dedicated local Blender code model):
+- blender_generate(request)  <- Generate Blender Python for ANY Blender
+  request (create/modify objects, materials, scenes, animations, renders;
+  "create a cube", "make a procedural staircase", "give it a material").
+  Uses the dedicated Blender model and returns PLAN / BLENDER PYTHON /
+  NOTES plus the extracted script. Generation only -- nothing is executed,
+  never claim otherwise.
+- blender_execute(code, confirm)  <- Execute the last generated script in
+  Blender 5.2 through the local BlenderLLM bridge. This RUNS Python inside
+  Blender: NEVER call it with confirm=True on the first attempt -- always
+  ask the user first and only pass confirm=True after they explicitly
+  agree. Blender must be open with the BlenderLLM Bridge add-on started;
+  if the bridge is down, report it and suggest starting it.
+- blender_status()  <- Check the Blender specialist: model, knowledge
+  topics, whether the Blender bridge is reachable, pending code.
+- blender_session_clear()  <- Reset the Blender specialist's conversation
+  ("forget the blender conversation", "start fresh").
+
+StockLLM (stock market forecasting specialist -- local models, offline):
+- stockllm_predict(ticker, horizon)  <- Forecast one stock: direction,
+  P(up), expected return, drivers, and a full text report. horizon is
+  optional ('7d' default; also '3d', '2 weeks', '1 month', '1 quarter').
+  The report in the result is the model's own analysis -- summarize it in
+  your own words, do not just dump it.
+- stockllm_track(ticker, interval_min, horizon)  <- Add a stock to the
+  monitoring watchlist and run one prediction cycle for it immediately.
+- stockllm_untrack(ticker)  <- Remove a stock from the monitoring
+  watchlist.
+- stockllm_watchlist()  <- Show what's currently being monitored.
+- stockllm_tracking_report()  <- Ledger of past predictions and their
+  actual outcomes (win rate, open predictions).
+- stockllm_status()  <- Registered model horizons and system status.
 
 Skills (Nova's learned desktop workflows -- handled automatically, no planner work needed):
 - Users record a skill by saying "watch me" and performing a task once.
@@ -278,6 +352,18 @@ Before acting, always think through:
 - Have I already reached the page where the answer exists?
 - If not, what interaction should I perform next instead of reading?
 - After this action, how will I verify it succeeded?
+
+Follow this reasoning loop on every task:
+  OBSERVE    -- read the current situation (message, file, page, screen).
+  UNDERSTAND -- identify the intent, the actors, and the deadline/constraints.
+  PLAN       -- pick the next smallest tool step.
+  ACT        -- execute exactly ONE tool call in "step".
+  VERIFY     -- after the tool result, confirm the goal is actually done
+                (the result says success, the file exists, the event is on
+                the calendar). If it isn't, take another step.
+  RESPOND    -- once verified, set done=true and write the final answer.
+Only set done=true after VERIFY. If an action needs confirmation (medium/high
+risk tool), ask the user with ask_user=true first.
 
 ## Response format
 
@@ -759,11 +845,468 @@ Never output markdown. Output ONLY valid JSON.
 """
 
 
+# ---------------------------------------------------------------------------
+# Dynamic prompt modules.
+#
+# The static TOOLS and AGENT_SYSTEM_PROMPT blocks above describe every domain
+# the assistant can act on. Sending all of them on every request wastes input
+# tokens, so the prose is sliced into named modules and only the modules that
+# are relevant to the current request are included. The original text is
+# reused 1:1 -- nothing is rewritten, so capability is unchanged.
+# ---------------------------------------------------------------------------
+
+_TOOL_LINES = TOOLS.splitlines()  # 0-indexed; index 0 is a blank line
+
+# Every tool name advertised in the catalog prose (bullet lines "- name(...)").
+_ALL_TOOL_NAMES = {
+    match.group(1)
+    for line in _TOOL_LINES
+    for match in [re.match(r"^-\s*([a-z_][a-z0-9_]*)\(", line.strip())]
+    if match
+}
+
+# (start, end) INCLUSIVE line ranges into _TOOL_LINES for each module.
+_TOOL_MODULE_RANGES = {
+    "core": [
+        (54, 55),    # Screenshot
+        (204, 213),  # Desktop control
+        (215, 252),  # Universal tools (Communication/Calendar/Media/Local + confirmation note)
+        (254, 255),  # Vision
+    ],
+    "browser": [
+        (57, 66), (68, 72), (74, 76), (78, 84), (86, 104), (106, 107),
+        (109, 110), (112, 113), (115, 117), (119, 129), (131, 156),
+        (158, 160), (162, 171),  # incl. Recipe system
+    ],
+    "files": [
+        (3, 26),   # File Management (search first, then act)
+        (28, 31),  # Folder Management
+        (33, 39),  # File Operations
+        (41, 46),  # Archive Management
+        (48, 52),  # File Searching
+    ],
+    "research": [(173, 188)],
+    "media": [(190, 192)],  # YouTube
+    "gmail": [(194, 202)],
+    "specialists": [(257, 273), (275, 288), (290, 307)],  # Blender / StockLLM / Skills
+}
+
+# Modules are emitted in this order (matches the layout of the original block).
+_TOOL_MODULE_ORDER = ("core", "browser", "files", "research", "media", "gmail", "specialists")
+
+# Deterministic request -> tool-module triggers. The user request (and the
+# parsed goal) is lower-cased and scanned for these substrings; a single hit
+# adds the whole module. Triggers are deliberately generous -- sending an
+# extra module costs a little more context, while missing one would break
+# capability.
+_TOOL_MODULE_TRIGGERS = {
+    "browser": (
+        "open", "go to", "navigat", "visit", "load ", " tab", "url", "web",
+        "online", "google", "look up", "website", "browser", "chrome", "page",
+        "browse", "login", "log in", "sign in", "flight", "hotel", "amazon",
+        "order", "stream", "news", "summar", "read this",
+        "download", "site", "youtube", "video", "search",
+    ),
+    "files": (
+        "file", "folder", "directory", "path", "drive", "archive", "zip",
+        "unzip", "extract", "document", "docx", "pdf", "download", "installed",
+        "where is", "rename", "my downloads", "desktop folder",
+    ),
+    "research": (
+        "research", "how does", "how to", "what is", "tell me about", "learn",
+        "explain", "define", "find out",
+    ),
+    "media": ("youtube", "video", "song", "music", "playlist", "album", "artist", "spotify"),
+    "gmail": ("email", "gmail", "mail", "inbox", "send an email"),
+    "specialists": (
+        "blender", "stock", "stockllm", "forecast", " ticker", "invest",
+        "market", "watch me", "skill", "monitor",
+    ),
+}
+
+
+def _select_tool_modules(goal: str) -> tuple:
+    """Choose the tool modules relevant to a request. Core is always included."""
+    text = (goal or "").lower()
+    selected = {"core"}
+    for module, triggers in _TOOL_MODULE_TRIGGERS.items():
+        if any(trigger in text for trigger in triggers):
+            selected.add(module)
+    return tuple(module for module in _TOOL_MODULE_ORDER if module in selected)
+
+
+# ---------------------------------------------------------------------------
+# Compact always-on core sections. These replace the verbose original prose
+# for the core module only -- every distinct behavioral rule is preserved,
+# wording is deduplicated. Module-specific sections (browser/files/...)
+# still use the original text parsed above.
+# ---------------------------------------------------------------------------
+
+_CORE_IDENTITY = (
+    "You are Jarvis, a desktop AI assistant with autonomous reasoning. "
+    "You MUST reply ONLY with valid JSON."
+)
+
+_CORE_CATALOG = """launch_app(query)  <- ONLY for executables (Chrome, Spotify, VS Code, ...); for documents/images/videos/folders use the file tools
+Desktop control (acts on the physical screen):
+- type_text(text) / press_key(key) / hotkey(["ctrl", "c"]) / left_click() / double_click() / right_click()
+- scroll(amount) / move_mouse(x, y) / wait(seconds)
+Universal tools (capability-dispatched -- Jarvis routes to whichever app is connected):
+Communication:
+- read_messages(limit, source) / search_messages(query, limit)
+- send_message(recipient, text)  [HIGH risk: confirm first]
+- reply_to_message(message_id, text) / identify_sender(message)
+- inspect_attachment(message, index) / download_attachment(message, index, destination)
+Calendar & tasks:
+- create_event(summary, start, end) [MEDIUM risk] / update_event(event_id, ...)
+- delete_event(event_id) [HIGH risk] / list_events(start, end, limit)
+- create_task(title, due) [MEDIUM risk] / update_task(task_id, ...) / list_tasks(limit)
+- create_reminder(text, when) [MEDIUM risk]
+Media:
+- play_media(query) / pause_media() / skip_media(direction) / search_media(query) / control_volume(direction)
+Local system:
+- get_system_info() / get_running_apps(limit) / launch_process(command) / terminate_process(pid, name)
+- get_clipboard() / set_clipboard(text) / get_volume() / set_volume(direction) / get_notifications()
+- read_document(path) / summarize_document(path)  <- extract text from pdf/docx/xlsx/pptx/txt
+- get_active_window() / list_windows() / read_visible_text() / locate_ui_element(description)
+- interact_with_ui_element(description, action, text)
+Vision:
+- vision(prompt)  <- looks at the current screen and answers a question about it
+Screenshot:
+- capture_screenshot(directory)  <- full-screen PNG
+Confirmation: when a tool needs approval (medium/high risk) it returns "requires_confirmation" -- set ask_user=true, explain the exact action in "response", and stop. Re-run only after the user agrees. Never bypass by calling the underlying tool directly."""
+
+_CORE_HOW = """## How you work
+
+You operate in an agent loop: on each turn you decide ONE action, not a batch.
+"reasoning" is your private analysis (never shown); "response" is what the
+user sees.
+
+Reasoning loop on every task:
+  OBSERVE -- read the current situation (message, file, screen).
+  PLAN    -- pick the next smallest tool step, or ask when information is
+             genuinely missing.
+  ACT     -- execute exactly ONE tool call in "step".
+  VERIFY  -- after the tool result, confirm the goal is actually done
+             (success flag, file exists, event on the calendar).
+  RESPOND -- once verified, set done=true and write the final answer.
+Only set done=true after VERIFY. Medium/high-risk tools ask the user first."""
+
+_CORE_RESPONSE = """## Response format
+
+Return ONLY valid JSON in this shape:
+{"reasoning": "private analysis", "response": "user-facing text", "done": false, "ask_user": false, "step": {"tool": "tool_name", "arguments": {}}}
+
+Field rules:
+- reasoning: required every turn.
+- response: required when done=true, ask_user=true, or giving a progress update.
+- done: true only when the goal is fully complete.
+- ask_user: true only when clarification is needed; set step to null.
+- step: exactly ONE tool call, or null when done/asking/waiting.
+
+If "response" describes an action you are about to take ("Opening...",
+"Searching..."), that action MUST be the "step" in this SAME turn. Never
+narrate a future action ("I will now...") and then set done=true or
+ask_user=true with step=null -- that leaves the action permanently undone.
+If you intend to act, act.
+
+FINISH RULE: when the previous tool results already contain everything
+needed, do NOT call more tools. Set done=true and write the complete final
+answer from that data. Calling the same tool again for data you already have
+is blocked."""
+
+_CORE_RULES_COMPACT = {
+    "1": (
+        "1. NEVER guess when information is ambiguous -- ask the user instead "
+        "(\"delete old videos\" -> what does \"old\" mean?)."
+    ),
+    "2t": (
+        "2. Users often type/speak with typos, missing punctuation, and slang "
+        "(\"dawg\", \"fr\", \"bet\", \"sus\"). ALWAYS interpret the intent -- never "
+        "refuse, complain about spelling, or ask \"did you mean X?\"."
+    ),
+    "3": (
+        "3. NEVER repeat a tool call that already failed with the same arguments. "
+        "Analyze the error; try a different approach or ask the user."
+    ),
+    "4": (
+        "4. If a capability does not exist in the tool list, say honestly what "
+        "would need to be implemented -- never pretend you can do it."
+    ),
+    "7": (
+        "7. launch_app is ONLY for executable applications (Chrome, Spotify, VS "
+        "Code, ...). For documents, images, videos, folders use file_search + "
+        "file_open."
+    ),
+    "8b": (
+        "8b. Desktop control tools act on the physical screen. If you are not "
+        "certain what is on screen or where something is, use vision(prompt) "
+        "first; use wait(seconds) after launching an app before interacting."
+    ),
+    "9": (
+        "9. You may chain tools across turns: previous results appear in "
+        "OBSERVATIONS. Use paths and data from those results -- never invent values."
+    ),
+    "10": (
+        "10. Reference prior tool results in arguments with {{field.path}} "
+        "placeholders when you know the exact path."
+    ),
+    "11": (
+        "11. NEVER ask permission for normal, non-destructive actions (opening "
+        "apps/sites, searching, filling forms, reading pages, opening Settings, "
+        "...) -- the user's request IS the permission: set ask_user=false and "
+        "put the call directly in \"step\". ONLY set ask_user=true before acting "
+        "when (a) information is genuinely missing or ambiguous (rule 1), or "
+        "(b) the action is destructive or sensitive: deleting files/folders, "
+        "formatting drives, sending an email or message, purchases/payments, "
+        "shutdown, or closing unsaved work. file_delete/delete_folder already "
+        "enforce their own confirm -- never pass confirm=true on the first attempt."
+    ),
+    "12": (
+        "12. \"done\" and \"ask_user\" both end the turn without a step. Before "
+        "setting either to true, check: does \"response\" describe an action? "
+        "If yes, return the step instead."
+    ),
+    "13": (
+        "13. NEVER ask the user for information you can obtain yourself with "
+        "your tools (page content, open tabs, files, search results, prices, "
+        "titles) -- find it yourself."
+    ),
+}
+
+_CORE_MULTI = """## Multi-step workflows (3+ steps)
+
+Goals needing a CHAIN of actions (creating a document, filling a multi-field
+form):
+1. In "reasoning", write out the numbered step list ONCE at the start, then
+   execute one step per turn IN ORDER -- never re-plan from scratch later.
+2. After every navigation or page change, verify before the next interaction.
+3. Tasks mix domains freely: "write a document about X and save it in a new
+   folder" = create the folder first, then the document.
+4. Address buttons and fields by their VISIBLE TEXT; after typing in a field,
+   press Enter when the site needs it.
+5. Do not stop mid-chain: opening a page or creating an empty folder is not
+   the goal. The FINAL turn must be done=true with the finished result.
+6. If an intermediate step fails, retry once with a different approach, then
+   move on -- never loop the same failed call."""
+
+_CORE_EXAMPLES = [
+    'User: "Delete my old videos."\n'
+    '{"reasoning": "Old is ambiguous - ask what it means.", '
+    '"response": "What do you mean by old? By date, size, unwatched, ...?", '
+    '"done": false, "ask_user": true, "step": null}',
+    'User: "What is the capital of Japan?"\n'
+    '{"reasoning": "General knowledge, no tools needed.", '
+    '"response": "The capital of Japan is Tokyo.", '
+    '"done": true, "ask_user": false, "step": null}',
+]
+
+# Emission order for merged core + module rules (compact core + original module text).
+_CORE_RULE_ORDER = (
+    "1", "2t", "2f", "3", "4", "5", "6", "7", "8", "8a", "8b",
+    "8c", "8d", "8e", "9", "10", "11", "12", "13",
+)
+
+
+def _tool_catalog(modules) -> str:
+    """Assemble the tool-catalog prose for the selected modules."""
+    blocks = []
+    for module in _TOOL_MODULE_ORDER:
+        if module not in modules:
+            continue
+        if module == "core":
+            blocks.append(_CORE_CATALOG)
+            continue
+        section = []
+        for start, end in _TOOL_MODULE_RANGES[module]:
+            section.append("\n".join(_TOOL_LINES[start:end + 1]))
+        blocks.append("\n".join(section).strip("\n"))
+    return "\n\n".join(blocks).strip("\n")
+
+
+def _assemble_system_prompt(modules) -> str:
+    """Build the system prompt for the selected modules."""
+    if not _PROMPT_MODULES_OK:
+        return _AGENT_RENDERED
+    parts = [
+        _CORE_IDENTITY,
+        "\n\nAvailable tools:\n\n",
+        _tool_catalog(modules),
+        "\n\n",
+        _CORE_HOW,
+        "\n\n",
+        _CORE_RESPONSE,
+    ]
+    merged_rules = dict(_CORE_RULES_COMPACT)
+    for rule_id, text in _CORE_RULES:
+        module = _RULE_MODULE.get(rule_id, "core")
+        if module != "core" and module in modules:
+            merged_rules[rule_id] = text
+    rule_texts = [
+        merged_rules[rule_id] for rule_id in _CORE_RULE_ORDER if rule_id in merged_rules
+    ]
+    if rule_texts:
+        parts.append("\n\n## Core rules\n\n" + "\n\n".join(rule_texts))
+    if "browser" in modules:
+        parts.append("\n\n" + _SECTION_BROWSER)
+    parts.append("\n\n" + _CORE_MULTI)
+    examples = list(_CORE_EXAMPLES)
+    examples += [
+        example for example in _EXAMPLES
+        if _example_module(example) in modules and _example_module(example) != "core"
+    ]
+    if examples:
+        parts.append("\n\n## Examples\n\n" + "\n\n".join(examples))
+    parts.append("\n\n" + _EXAMPLES_FOOTER)
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# System-prompt modules (parsed once from the monolithic prompt above).
+# ---------------------------------------------------------------------------
+
+_AGENT_RENDERED = AGENT_SYSTEM_PROMPT
+
+_EXAMPLES_FOOTER = "Never output markdown. Output ONLY valid JSON."
+
+_RULE_RE = re.compile(r"^([0-9]{1,2}[a-e]?)\.\s")
+_EXAMPLE_RE = re.compile(r"(?m)^User: ")
+
+# Which tool module each Core-rule number belongs to.
+_RULE_MODULE = {
+    "1": "core", "2t": "core", "2f": "files", "3": "core", "4": "core",
+    "5": "media", "6": "media", "7": "core", "8": "browser", "8a": "research",
+    "8b": "core", "8c": "browser", "8d": "browser", "8e": "browser",
+    "9": "core", "10": "core", "11": "core", "12": "core", "13": "core",
+}
+
+
+def _split_core_rules(text: str):
+    """Split a ## Core rules block into (rule_id, text) chunks in order.
+    The duplicated "2." is disambiguated into "2t" (typos, core) and
+    "2f" (file paths, files)."""
+    chunks = []
+    counts = {}
+    current = None
+    for line in text.splitlines():
+        match = _RULE_RE.match(line)
+        if match:
+            rule_id = match.group(1)
+            if rule_id == "2":
+                counts["2"] = counts.get("2", 0) + 1
+                rule_id = "2f" if counts["2"] > 1 else "2t"
+            chunks.append((rule_id, [line]))
+            current = chunks[-1]
+        elif current is not None:
+            current[1].append(line)
+    return [(rule_id, "\n".join(block).rstrip()) for rule_id, block in chunks]
+
+
+def _split_examples(text: str):
+    """Split the ## Examples block into per-example chunks and the footer."""
+    parts = _EXAMPLE_RE.split(text)
+    chunks = []
+    for chunk in parts[1:]:
+        if _EXAMPLES_FOOTER in chunk:
+            body, _, _ = chunk.partition(_EXAMPLES_FOOTER)
+            chunks.append(body.strip())
+        else:
+            chunks.append(chunk.strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _example_module(text: str) -> str:
+    low = text.lower()
+    if any(key in low for key in ("browser_open", "flight", "youtube", " tab")):
+        return "browser"
+    if any(key in low for key in ("create_folder", "downloads folder")):
+        return "files"
+    if "blender" in low:
+        return "specialists"
+    return "core"
+
+
+try:
+    _IDX_HOW = _AGENT_RENDERED.index("## How you work")
+    _IDX_RES = _AGENT_RENDERED.index("## Response format")
+    _IDX_RULES = _AGENT_RENDERED.index("## Core rules")
+    _IDX_BRO = _AGENT_RENDERED.index("## Browser decision procedure")
+    _IDX_MULTI = _AGENT_RENDERED.index("## Multi-step workflows")
+    _IDX_EX = _AGENT_RENDERED.index("## Examples")
+
+    _IDENTITY = _AGENT_RENDERED[:_AGENT_RENDERED.index("Available tools:") + len("Available tools:")].rstrip()
+    _SECTION_HOW = _AGENT_RENDERED[_IDX_HOW:_IDX_RES].strip()
+    _SECTION_RESPONSE = _AGENT_RENDERED[_IDX_RES:_IDX_RULES].strip()
+    _CORE_RULES_RAW = _AGENT_RENDERED[_IDX_RULES + len("## Core rules"):_IDX_BRO].strip()
+    _SECTION_BROWSER = _AGENT_RENDERED[_IDX_BRO:_IDX_MULTI].strip()
+    _SECTION_MULTI = _AGENT_RENDERED[_IDX_MULTI:_IDX_EX].strip()
+    _EXAMPLES_RAW = _AGENT_RENDERED[_IDX_EX + len("## Examples"):].strip()
+
+    _CORE_RULES = _split_core_rules(_CORE_RULES_RAW)
+    _EXAMPLES = _split_examples(_EXAMPLES_RAW)
+    _PROMPT_MODULES_OK = True
+except Exception as _prompt_error:  # pragma: no cover - defensive fallback
+    logger.error(
+        "Prompt sectioning failed (%s) -- falling back to the monolithic prompt", _prompt_error
+    )
+    _PROMPT_MODULES_OK = False
+    _CORE_RULES = []
+    _EXAMPLES = []
+
+
+def _assemble_system_prompt(modules) -> str:
+    """Build the system prompt for the selected modules."""
+    if not _PROMPT_MODULES_OK:
+        return _AGENT_RENDERED
+    parts = [
+        _CORE_IDENTITY,
+        "\n\nAvailable tools:\n\n",
+        _tool_catalog(modules),
+        "\n\n",
+        _CORE_HOW,
+        "\n\n",
+        _CORE_RESPONSE,
+    ]
+    merged_rules = dict(_CORE_RULES_COMPACT)
+    for rule_id, text in _CORE_RULES:
+        module = _RULE_MODULE.get(rule_id, "core")
+        if module != "core" and module in modules:
+            merged_rules[rule_id] = text
+    rule_texts = [
+        merged_rules[rule_id] for rule_id in _CORE_RULE_ORDER if rule_id in merged_rules
+    ]
+    if rule_texts:
+        parts.append("\n\n## Core rules\n\n" + "\n\n".join(rule_texts))
+    if "browser" in modules:
+        parts.append("\n\n" + _SECTION_BROWSER)
+    parts.append("\n\n" + _CORE_MULTI)
+    examples = list(_CORE_EXAMPLES)
+    examples += [
+        example for example in _EXAMPLES
+        if _example_module(example) in modules and _example_module(example) != "core"
+    ]
+    if examples:
+        parts.append("\n\n## Examples\n\n" + "\n\n".join(examples))
+    parts.append("\n\n" + _EXAMPLES_FOOTER)
+    return "".join(parts)
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap token estimate (~1 token per 4 ASCII chars, 1 per non-ASCII char)."""
+    if not text:
+        return 0
+    ascii_chars = sum(1 for ch in text if ord(ch) < 128)
+    non_ascii = len(text) - ascii_chars
+    return max(1, ascii_chars // 4 + non_ascii)
+
+
 class Brain:
 
     def __init__(self, memory_manager: MemoryManager | None = None):
         self.memory_manager = memory_manager or MemoryManager()
         self.client = self._make_client(settings.llm_provider)
+        self.request_stats = []
+        self.last_request_stats = {}
         self.planner = None
         try:
             planner_provider = settings.planner_provider or settings.llm_provider
@@ -798,6 +1341,8 @@ class Brain:
             content = str(message.get("content", "")).strip()
             if not content:
                 continue
+            if len(content) > 1000:
+                content = content[:1000] + " ...(truncated)"
 
             if role == "user":
                 formatted.append(f"User: {content}")
@@ -817,22 +1362,41 @@ class Brain:
         if not observations:
             return "No tool results yet — this is the first turn."
 
+        # Keep the block small: the most recent result stays readable, older
+        # ones are truncated, and the whole block is capped. The model can
+        # always re-read with the relevant tool if it needs the full payload.
+        recent_cap = 3500
+        older_cap = 900
+        total_cap = 8000
         lines = []
+        total = 0
+        count = len(observations)
         for index, observation in enumerate(observations, start=1):
             step = observation.get("step", {})
             tool = step.get("tool", "unknown")
             success = observation.get("success", False)
             result = observation.get("result")
             status = "SUCCESS" if success else "FAILED"
+            cap = recent_cap if index == count else older_cap
             try:
-                result_text = json.dumps(result, indent=2, default=str, ensure_ascii=False)
+                result_text = json.dumps(result, ensure_ascii=False, default=str, separators=(",", ":"))
             except TypeError:
                 result_text = str(result)
-            lines.append(
+            if len(result_text) > cap:
+                result_text = (
+                    result_text[:cap]
+                    + f"... [truncated {len(result_text)} chars; re-read with the tool if you need more]"
+                )
+            arguments_text = json.dumps(step.get("arguments", {}), ensure_ascii=False, separators=(",", ":"))
+            block = (
                 f"Step {index}: {tool} → {status}\n"
-                f"Arguments: {json.dumps(step.get('arguments', {}), ensure_ascii=False)}\n"
+                f"Arguments: {arguments_text}\n"
                 f"Result: {result_text}"
             )
+            if total + len(block) > total_cap:
+                break
+            total += len(block)
+            lines.append(block)
         return "\n\n".join(lines)
 
     @staticmethod
@@ -850,7 +1414,9 @@ class Brain:
         lines.append("")
         return "\n".join(lines)
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, goal: str | None = None) -> str:
+        modules = _select_tool_modules(goal or "")
+        system_prompt = _assemble_system_prompt(modules)
         user_memory = self.memory_manager.get_user_memory()
         comm = user_memory.get("communication_style", {})
         memory_lines = []
@@ -868,7 +1434,7 @@ class Brain:
                 memory_lines.append(f"- {label}: {'; '.join(items)}")
         memory_text = "\n".join(memory_lines) if memory_lines else "No stored information yet."
         return (
-            f"{AGENT_SYSTEM_PROMPT}\n\n"
+            f"{system_prompt}\n\n"
             "## User Profile\n\n"
             f"{memory_text}\n\n"
             "Retrieve additional relevant memories with the remember/forget tools.\n"
@@ -885,8 +1451,14 @@ class Brain:
         recipe: dict | None = None,
     ) -> str:
         history = self.memory_manager.get_conversation_history()
-        if len(history) > 15:
-            history = history[-15:]
+        # The current user message is already the USER REQUEST below, and tool
+        # results are fully present in OBSERVATIONS -- drop both duplicates.
+        if history and history[-1].get("role") == "user":
+            history = history[:-1]
+        if observations:
+            history = [message for message in history if message.get("role") != "tool"]
+        if len(history) > 10:
+            history = history[-10:]
         conversation_text = self._format_conversation(history)
         if observations and len(observations) > 5:
             observations = observations[-5:]
@@ -895,7 +1467,10 @@ class Brain:
         relevant_memories = self.memory_manager.get_relevant_memories(query=user, limit=4)
         memories_text = ""
         if relevant_memories:
-            mem_lines = [f"- [{m.get('category','fact')}] {m.get('text','')}" for m in relevant_memories]
+            mem_lines = [
+                f"- [{m.get('category', 'fact')}] {str(m.get('text', ''))[:200]}"
+                for m in relevant_memories
+            ]
             memories_text = "RELEVANT MEMORIES:\n" + "\n".join(mem_lines) + "\n\n"
 
         query = goal or user
@@ -931,11 +1506,42 @@ class Brain:
         return "\n\n".join(parts)
 
     def _call(self, system_prompt, user_prompt, *, client=None):
-        output = (client or self.client).chat_json(system_prompt, user_prompt)
-
+        start = time.monotonic()
+        client = client or self.client
+        output = client.chat_json(system_prompt, user_prompt)
+        elapsed = time.monotonic() - start
+        self._record_request(system_prompt, user_prompt, output, elapsed, client)
         logger.debug("AI output: %s", json.dumps(output, ensure_ascii=False))
-
         return output
+
+    def _record_request(self, system_prompt, user_prompt, output, elapsed, client) -> None:
+        """Record per-request token-usage telemetry for visibility and tuning."""
+        input_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
+        try:
+            output_text = json.dumps(output, ensure_ascii=False)
+        except TypeError:
+            output_text = str(output)
+        output_tokens = _estimate_tokens(output_text)
+        tools_count = sum(1 for name in _ALL_TOOL_NAMES if name in system_prompt)
+        stats = {
+            "provider": client.__class__.__name__,
+            "model": getattr(client, "model", "?"),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "tools_in_prompt": tools_count,
+            "messages": 2,
+            "latency_s": round(elapsed, 2),
+            "system_prompt_chars": len(system_prompt),
+            "user_prompt_chars": len(user_prompt),
+        }
+        self.request_stats.append(stats)
+        self.last_request_stats = stats
+        logger.info(
+            "LLM request: %s/%s | input=%d output=%d total=%d tools=%d msgs=%d latency=%.2fs",
+            stats["provider"], stats["model"], input_tokens, output_tokens,
+            stats["total_tokens"], tools_count, 2, elapsed,
+        )
 
     def _planner_call(self, system_prompt, user_prompt):
         """Run a decision call on the dedicated planner model when one is
@@ -1046,7 +1652,7 @@ class Brain:
     ):
         try:
             decision = self._planner_call(
-                self._build_system_prompt(),
+                self._build_system_prompt(goal or user),
                 self._build_user_prompt(
                     user,
                     goal=goal,
@@ -1096,7 +1702,7 @@ class Brain:
         )
 
         try:
-            decision = self._planner_call(self._build_system_prompt(), prompt)
+            decision = self._planner_call(self._build_system_prompt(goal), prompt)
             return self._normalize_decision(decision)
         except (OpenRouterConfigurationError, GeminiConfigurationError, OllamaConfigurationError) as error:
             return {

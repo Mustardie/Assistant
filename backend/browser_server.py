@@ -511,6 +511,7 @@ def start_bridge(host: str = "127.0.0.1", port: int = 8742,
         log_level="warning",
         ws_ping_interval=None,
         ws_ping_timeout=None,
+        log_config=None,
     )
     _bridge_server = uvicorn.Server(config)
     _bridge_thread = threading.Thread(
