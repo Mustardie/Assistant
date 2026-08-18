@@ -646,3 +646,79 @@ class TestTextStyles:
         merged = engine._style_params({"style": "brand"})
         assert merged["size"] == 120
         assert merged["color"] == "#00FFAA"
+
+
+class TestMarkers:
+    def test_marker_add_passes_through(self, engine, bridge):
+        result = engine.run({"ops": [{
+            "op": "marker.add", "time": 12.5, "name": "beat",
+            "type": "chapter",
+        }]})
+        assert result["success"], result
+        payload = bridge.payload("marker.add")
+        assert payload["time"] == 12.5
+        assert payload["type"] == "chapter"
+
+    def test_marker_list_is_read_only(self, engine, bridge):
+        engine.run({"ops": [{"op": "marker.list"}]})
+        assert "project.checkpoint" not in bridge.ops()
+
+    def test_timecode_marker_time_is_converted(self, engine, bridge):
+        engine.run({"ops": [{"op": "marker.add", "time": "00:00:10:15"}]})
+        assert bridge.payload("marker.add")["time"] == pytest.approx(10.5)
+
+    def test_marker_remove_needs_a_target(self):
+        from premiere.errors import ValidationError as VE
+        from premiere.validator import validate_operation
+        with pytest.raises(VE, match="needs 'at', 'range', 'name', or all"):
+            validate_operation({"op": "marker.remove"})
+
+    def test_marker_remove_all_is_explicit(self):
+        from premiere.validator import validate_operation
+        out = validate_operation({"op": "marker.remove", "all": True})
+        assert out["params"]["all"] is True
+
+
+class TestCopyAttributes:
+    def test_copies_from_one_clip_to_many(self, engine, bridge):
+        result = engine.run({"ops": [{
+            "op": "clip.copy_attributes",
+            "from": {"track": "V1", "index": 0},
+            "to": {"track": "V1", "range": [10.0, 60.0]},
+        }]})
+        assert result["success"], result
+        payload = bridge.payload("clip.copy_attributes")
+        assert payload["from"]["index"] == 0
+        assert payload["to"]["range"] == [10.0, 60.0]
+
+    def test_source_must_be_a_single_clip(self):
+        from premiere.errors import ValidationError as VE
+        from premiere.validator import validate_operation
+        with pytest.raises(VE, match="copies from a single clip"):
+            validate_operation({
+                "op": "clip.copy_attributes",
+                "from": {"track": "V1", "all": True},
+                "to": {"track": "V2", "index": 0},
+            })
+
+    def test_include_filter_is_validated(self):
+        from premiere.errors import ValidationError as VE
+        from premiere.validator import validate_operation
+        with pytest.raises(VE):
+            validate_operation({
+                "op": "clip.copy_attributes",
+                "from": {"track": "V1", "index": 0},
+                "to": {"track": "V1", "index": 1},
+                "include": ["effects", "colour"],
+            })
+
+    def test_empty_include_is_rejected(self):
+        from premiere.errors import ValidationError as VE
+        from premiere.validator import validate_operation
+        with pytest.raises(VE, match="nothing would be copied"):
+            validate_operation({
+                "op": "clip.copy_attributes",
+                "from": {"track": "V1", "index": 0},
+                "to": {"track": "V1", "index": 1},
+                "include": [],
+            })
