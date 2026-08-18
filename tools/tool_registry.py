@@ -44,6 +44,13 @@ from tools.file_ops import (
     search_files,
 )
 from tools.screenshot import capture_screenshot as capture_screenshot_tool
+from premiere.tool import (
+    premiere_capabilities,
+    premiere_edit,
+    premiere_inspect,
+    premiere_status,
+    premiere_undo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -894,6 +901,16 @@ TOOLS = {
     "browser_note": browser_note,
     "browser_summarize_session": browser_summarize_session,
     "recipe_save": recipe_save,
+
+    # Adobe Premiere Pro editing. Five tools, not fifty: the expressive power
+    # lives in the EditPlan passed to premiere_edit (see premiere/catalog.py
+    # for the ~75 operations it accepts), so new creative capabilities do not
+    # mean new tool names for the planner to learn.
+    "premiere_status": premiere_status,
+    "premiere_capabilities": premiere_capabilities,
+    "premiere_inspect": premiere_inspect,
+    "premiere_edit": premiere_edit,
+    "premiere_undo": premiere_undo,
 
     "file_search": file_search,
     "file_open": file_open,

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Nova Premiere Bridge - CEP extension manifest.
+
+  Hosts a small Node HTTP server inside Premiere (see main.js) and forwards
+  structured operations to the ExtendScript host (host/index.jsx). Node is
+  enabled via the CEFCommandLine parameters below; without --enable-nodejs the
+  panel loads but cannot open a socket, which is the single most common cause
+  of "bridge unreachable".
+
+  The host version range is deliberately wide: the JSX side feature-detects
+  every API it uses and reports what is missing through caps.probe, so a newer
+  or older Premiere degrades with a clear message instead of failing to load.
+-->
+<ExtensionManifest Version="7.0"
+                   ExtensionBundleId="com.nova.premierebridge"
+                   ExtensionBundleVersion="1.0.0"
+                   ExtensionBundleName="Nova Premiere Bridge">
+  <ExtensionList>
+    <Extension Id="com.nova.premierebridge.panel" Version="1.0.0"/>
+  </ExtensionList>
+
+  <ExecutionEnvironment>
+    <HostList>
+      <Host Name="PPRO" Version="[14.0,99.9]"/>
+    </HostList>
+    <LocaleList>
+      <Locale Code="All"/>
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="9.0"/>
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+
+  <DispatchInfoList>
+    <Extension Id="com.nova.premierebridge.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./index.html</MainPath>
+          <ScriptPath>./host/index.jsx</ScriptPath>
+          <CEFCommandLine>
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+            <Parameter>--allow-file-access-from-files</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>Nova Premiere Bridge</Menu>
+          <Geometry>
+            <Size><Height>340</Height><Width>380</Width></Size>
+            <MinSize><Height>180</Height><Width>260</Width></MinSize>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>
