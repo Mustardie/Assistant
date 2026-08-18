@@ -145,6 +145,7 @@ class SelfTest:
             self.color()
             self.text_and_graphics()
             self.captions()
+            self.markers()
             self.arrangement()
             self.safety()
         finally:
@@ -507,6 +508,31 @@ class SelfTest:
         self.check("captions", "captions.build (graphic overlays)",
                    lambda: self.edit([{"op": "captions.build", "mode": "graphic",
                                        "segments": segments}]))
+
+    def markers(self):
+        self.check("marker", "marker.add (comment)",
+                   lambda: self.edit([{"op": "marker.add", "time": 1.0,
+                                       "name": "selftest-marker",
+                                       "comment": "placed by the self test"}]))
+        self.check("marker", "marker.add (chapter)",
+                   lambda: self.edit([{"op": "marker.add", "time": 2.0,
+                                       "name": "Chapter 1", "type": "chapter"}]))
+        found = self.check("marker", "marker.list",
+                           lambda: self.edit([{"op": "marker.list"}]))
+        if found:
+            data = found["results"][0]["result"] or {}
+            self.report.add("marker", "markers readable", OK,
+                            f"{data.get('count', 0)} marker(s) on the sequence")
+        self.check("marker", "marker.remove",
+                   lambda: self.edit([{"op": "marker.remove",
+                                       "name": "selftest-marker"}]))
+        self.check("consistency", "clip.copy_attributes",
+                   lambda: self.edit([{
+                       "op": "clip.copy_attributes",
+                       "from": self.video_clip,
+                       "to": {"track": self.video_clip["track"], "all": True},
+                       "include": ["effects", "transform"],
+                   }]))
 
     def arrangement(self):
         self.check("arrange", "clip.split",

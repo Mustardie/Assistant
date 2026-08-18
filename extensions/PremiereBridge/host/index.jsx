@@ -20,6 +20,7 @@
 #include "modules/clips.jsx"
 #include "modules/effects.jsx"
 #include "modules/media.jsx"
+#include "modules/markers.jsx"
 #include "modules/caps.jsx"
 
 var NovaBridge = (function () {
@@ -103,6 +104,13 @@ var NovaBridge = (function () {
         'mogrt.params':      function (p) { return NovaMedia.listMGTParams(p); },
         'captions.import':   function (p) { return NovaMedia.importCaptions(p); },
         'adjustment.create': function (p) { return NovaMedia.createAdjustment(p); },
+
+        // -- markers and attribute copying -------------------------------
+        'marker.list':       function (p) { return NovaMarkers.list(p); },
+        'marker.add':        function (p) { return NovaMarkers.add(p); },
+        'marker.remove':     function (p) { return NovaMarkers.remove(p); },
+        'clip.copy_attributes':
+                             function (p) { return NovaMarkers.copyAttributes(p); },
 
         // -- capability discovery ----------------------------------------
         'caps.probe':        function (p) { return NovaCaps.probe(p); },

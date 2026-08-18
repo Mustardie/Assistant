@@ -1037,6 +1037,76 @@ _op(OpSpec(
 ))
 
 # --------------------------------------------------------------------------
+# Markers -- beat syncing and YouTube chapters
+# --------------------------------------------------------------------------
+
+_op(OpSpec(
+    "marker.list", category="marker", mutating=False,
+    summary="Read markers on the sequence (or on an asset). This is how the "
+            "editor finds beats, chapter points and notes the user left: place "
+            "markers on the music, read them here, then cut and time animations "
+            "against those exact times.",
+    fields={
+        "asset": F("string", doc="read a project item's markers instead of the "
+                                 "sequence's"),
+        "type": F("enum", choices=["comment", "chapter", "weblink", "segmentation"]),
+        "range": F("list", item=F("time"), min=2, max=2),
+    },
+))
+
+_op(OpSpec(
+    "marker.add", category="marker",
+    summary="Add a marker. Chapter markers become YouTube chapters on export; "
+            "comment markers are useful for leaving structure notes on the "
+            "timeline.",
+    fields={
+        "time": F("time", required=True),
+        "name": F("string"),
+        "comment": F("string"),
+        "duration": F("duration", doc="makes it a range marker rather than a point"),
+        "type": F("enum", choices=["comment", "chapter", "weblink", "segmentation"],
+                  default="comment"),
+        "asset": F("string", doc="add to a project item instead of the sequence"),
+    },
+))
+
+_op(OpSpec(
+    "marker.remove", category="marker",
+    summary="Remove markers by time, range, name, or all of them.",
+    fields={
+        "at": F("time"),
+        "range": F("list", item=F("time"), min=2, max=2),
+        "name": F("string"),
+        "all": F("boolean", default=False),
+        "asset": F("string"),
+    },
+))
+
+# --------------------------------------------------------------------------
+# Consistency: make other clips match one you already got right
+# --------------------------------------------------------------------------
+
+_op(OpSpec(
+    "clip.copy_attributes", category="clip", multi=True,
+    summary="Copy effects, transform values and keyframes from one clip onto "
+            "others. This is the 'grade one shot, then make the rest match' "
+            "operation -- and the same mechanism applies a hero clip's animation "
+            "to every other clip in a sequence.",
+    fields={
+        "from": F("clip", required=True, doc="the clip to copy FROM"),
+        "to": CLIP_MULTI,
+        "include": F("list", item=F("enum", choices=["effects", "transform",
+                                                     "keyframes"]),
+                     doc="default: all three"),
+        "replace": F("boolean", default=False,
+                     doc="strip the targets' existing effects first"),
+    },
+    notes="Premiere exposes no scripted Paste Attributes. This reads the source "
+          "clip's components and parameter values (keyframes included) and "
+          "replays them onto each target, which reaches the same result.",
+))
+
+# --------------------------------------------------------------------------
 # Safety: history, undo, revisions
 # --------------------------------------------------------------------------
 

@@ -193,6 +193,33 @@ def _semantic(op_name: str, params: dict) -> None:
                 path="shape",
             )
 
+    if op_name == "marker.remove":
+        if not params.get("all") and not any(
+                k in params for k in ("at", "range", "name")):
+            raise ValidationError(
+                "marker.remove needs 'at', 'range', 'name', or all=true",
+                hint="removing every marker requires all=true, so it cannot "
+                     "happen by accident",
+            )
+
+    if op_name == "clip.copy_attributes":
+        # The op is multi over its targets, which exempts every clip field from
+        # the generic guard -- but the SOURCE must still be exactly one clip.
+        from premiere.schema import selector_is_multi
+        if selector_is_multi(params.get("from", {})):
+            raise ValidationError(
+                "clip.copy_attributes copies from a single clip",
+                hint="use index/at/id to name one source clip",
+                path="from",
+            )
+        if params.get("include") == []:
+            raise ValidationError(
+                "clip.copy_attributes: 'include' is empty, so nothing would "
+                "be copied",
+                hint="omit it to copy effects, transform and keyframes",
+                path="include",
+            )
+
     if op_name == "sequence.activate":
         _need_one_of(params, ("name", "id"), op_name)
 
