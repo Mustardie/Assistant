@@ -100,6 +100,7 @@ var NovaBridge = (function () {
 
         // -- media, graphics, captions -----------------------------------
         'overlay.place':     function (p) { return NovaMedia.place(p); },
+        'frame.export':      function (p) { return NovaMedia.exportFrame(p); },
         'mogrt.import':      function (p) { return NovaMedia.importMGT(p); },
         'mogrt.params':      function (p) { return NovaMedia.listMGTParams(p); },
         'captions.import':   function (p) { return NovaMedia.importCaptions(p); },

@@ -1036,6 +1036,23 @@ _op(OpSpec(
                 "LUT and apply it with color.lut",
 ))
 
+_op(OpSpec(
+    "frame.export", category="timeline", mutating=False,
+    summary="Export a still of the program monitor at a time, so the editing "
+            "model can LOOK at the frame it is about to cut on instead of "
+            "reasoning blind from clip names and timings.",
+    fields={
+        "time": F("time", required=True, doc="sequence time"),
+        "path": F("string", required=True,
+                  doc="absolute output path ending in .png"),
+    },
+    notes="Frame export is not in Premiere's public scripting reference and has "
+          "moved between versions. The host tries the known call shapes and "
+          "reports unsupported if none exist -- in which case read the frame "
+          "from the source file directly (timeline.snapshot gives source_path, "
+          "start and in_point, which is enough to seek to the same frame).",
+))
+
 # --------------------------------------------------------------------------
 # Markers -- beat syncing and YouTube chapters
 # --------------------------------------------------------------------------
