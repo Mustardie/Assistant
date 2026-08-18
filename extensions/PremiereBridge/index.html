@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Nova Premiere Bridge</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; padding: 18px 16px;
+      font: 13px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #1e1e1e; color: #d6d6d6;
+    }
+    h1 { font-size: 14px; margin: 0 0 2px; color: #f0f0f0; letter-spacing: .2px; }
+    .sub { color: #8b8b8b; font-size: 11px; margin-bottom: 16px; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 7px 0; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b6b6b; flex: none; }
+    .dot.ok { background: #4caf50; }
+    .dot.bad { background: #e5533d; }
+    .dot.warn { background: #e0a300; }
+    .label { color: #9a9a9a; min-width: 96px; }
+    .value { color: #e8e8e8; font-variant-numeric: tabular-nums; }
+    #log {
+      margin-top: 14px; padding: 9px 10px; height: 120px; overflow-y: auto;
+      background: #161616; border: 1px solid #2e2e2e; border-radius: 5px;
+      font-family: Consolas, "SF Mono", monospace; font-size: 11px; color: #9fb8a0;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    #log .err { color: #ff9c8a; }
+    .hint {
+      margin-top: 12px; font-size: 11px; color: #7d7d7d;
+      border-top: 1px solid #2b2b2b; padding-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Nova Premiere Bridge</h1>
+  <div class="sub">Structured editing interface for Adobe Premiere Pro</div>
+
+  <div class="row">
+    <span class="dot" id="dot-server"></span>
+    <span class="label">Server</span><span class="value" id="v-server">starting…</span>
+  </div>
+  <div class="row">
+    <span class="dot" id="dot-host"></span>
+    <span class="label">Host script</span><span class="value" id="v-host">checking…</span>
+  </div>
+  <div class="row">
+    <span class="dot" id="dot-project"></span>
+    <span class="label">Project</span><span class="value" id="v-project">—</span>
+  </div>
+  <div class="row">
+    <span class="dot" id="dot-ops"></span>
+    <span class="label">Operations</span><span class="value" id="v-ops">0</span>
+  </div>
+
+  <div id="log"></div>
+  <div class="hint">
+    Keep this panel open while the assistant is editing. Closing it stops the
+    bridge; Premiere itself is unaffected.
+  </div>
+
+  <script src="./lib/csinterface.js"></script>
+  <script src="./main.js"></script>
+</body>
+</html>
