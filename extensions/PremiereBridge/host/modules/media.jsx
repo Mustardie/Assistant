@@ -377,8 +377,68 @@ var NovaMedia = (function () {
         };
     }
 
+    // ------------------------------------------------------------------
+    // Frame export
+    // ------------------------------------------------------------------
+
+    /**
+     * Export a still of the program monitor at a given time.
+     *
+     * This is what lets a *visual* editing model work: it can look at the
+     * frame it is about to cut on rather than reasoning blind from clip names
+     * and timings.
+     *
+     * The call that does this has moved around between Premiere versions and
+     * is not in the public scripting reference, so rather than pin one shape,
+     * try the known ones and report honestly if none exist. The named
+     * alternative (pull the frame from the source file directly) is something
+     * the assistant can genuinely do outside Premiere, so a negative answer
+     * here is still actionable.
+     */
+    function exportFrame(params) {
+        var sequence = U.activeSequence();
+        var at = Number(params.time || 0);
+        var path = String(params.path);
+        var ticks = U.ticksOf(at);
+
+        var attempts = [
+            function () { return sequence.exportFramePNG(ticks, path); },
+            function () { return sequence.exportFramePNG(at, path); },
+            function () { return sequence.exportFrameJPEG(ticks, path); },
+            function () {
+                var qe = U.qeDom();
+                if (!qe || !qe.source) { return false; }
+                qe.source.exportFramePNG(U.timecode(at, U.sequenceFps(sequence)),
+                                         path);
+                return true;
+            }
+        ];
+
+        var errors = [];
+        for (var i = 0; i < attempts.length; i++) {
+            try {
+                var outcome = attempts[i]();
+                if (outcome === false) { continue; }
+                if (File(path).exists) {
+                    return { exported: path, time: at, method: i };
+                }
+            } catch (e) {
+                errors[errors.length] = String(e.message || e);
+            }
+        }
+
+        throw U.unsupported(
+            'This Premiere build exposes no scriptable frame export',
+            'read the frame straight from the source media file instead '
+                + '(timeline.snapshot gives each clip its source_path, start '
+                + 'and in_point, which is enough to seek to the same frame)',
+            { attempts: errors }
+        );
+    }
+
     return {
         place: place,
+        exportFrame: exportFrame,
         importMGT: importMGT,
         listMGTParams: listMGTParams,
         importCaptions: importCaptions,
