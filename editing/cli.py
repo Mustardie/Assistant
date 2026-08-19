@@ -31,10 +31,14 @@ from pathlib import Path
 from typing import Optional
 
 from editing import align
-from editing.config import SamplingConfig, load_config
+from editing.config import AudioConfig, SamplingConfig, load_config
 from editing.errors import EditingError
 from editing.pipeline import Pipeline, build_pipeline
 from editing.schema import StructureTimeline
+from editing.recommend import report as report_module
+from editing.recommend.planner import PlannerOptions
+from editing.roughcut import review as review_module
+from editing.roughcut.build import RoughCutOptions
 from editing.transcripts import premiere_source
 from editing.visual import qwen
 
@@ -86,9 +90,27 @@ def _sampling_from(args) -> SamplingConfig:
     return base.validated()
 
 
+def _audio_from(args) -> AudioConfig:
+    """Audio config from the environment, overridden by any CLI flags."""
+    base = AudioConfig.from_env()
+    overrides = {
+        "silence_threshold_db": getattr(args, "silence_db", None),
+        "min_silence_seconds": getattr(args, "min_silence", None),
+        "long_pause_seconds": getattr(args, "long_pause", None),
+        "spike_delta_db": getattr(args, "spike_db", None),
+        "sample_interval": getattr(args, "audio_interval", None),
+    }
+    clean = {key: value for key, value in overrides.items() if value is not None}
+    if clean:
+        from dataclasses import replace
+        base = replace(base, **clean)
+    return base.validated()
+
+
 def _pipeline(args) -> Pipeline:
-    config, sampling = load_config(
+    config, sampling, audio = load_config(
         sampling=_sampling_from(args),
+        audio=_audio_from(args),
         output_dir=Path(args.output_dir) if getattr(args, "output_dir", None) else None,
         vision_backend=getattr(args, "backend", None),
         vision_model=getattr(args, "model", None),
@@ -96,7 +118,7 @@ def _pipeline(args) -> Pipeline:
         use_premiere=(False if getattr(args, "no_premiere", False) else None),
     )
     return build_pipeline(
-        config, sampling,
+        config, sampling, audio,
         say=_reporter(args),
         use_cache=not getattr(args, "no_cache", False),
     )
@@ -291,6 +313,437 @@ def cmd_analyze(args) -> int:
     return EXIT_OK
 
 
+def cmd_audio(args) -> int:
+    pipeline = _pipeline(args)
+    assets = _assets_for(pipeline, args)
+    results = pipeline.analyze_audio(assets, refresh=args.refresh)
+
+    if args.json:
+        _emit({
+            "success": True,
+            "assets": {
+                asset.filename: results[asset.asset_id].to_dict()
+                for asset in assets
+            },
+        })
+        return EXIT_OK
+
+    total = sum(len(result.events) for result in results.values())
+    print(f"{total} audio event(s) across {len(assets)} file(s).")
+    for asset in assets:
+        result = results[asset.asset_id]
+        summary = result.summary()
+        if summary["by_type"]:
+            print(f"  {asset.filename}: " + ", ".join(
+                f"{name}={count}"
+                for name, count in sorted(summary["by_type"].items())
+            ))
+    print(f"Written to {pipeline.config.audio_dir}")
+    return EXIT_OK
+
+
+def cmd_attach(args) -> int:
+    """Fold audio events into the timeline without re-analysing anything.
+
+    ``timeline`` already attaches whatever audio is on disk, so this is the
+    same operation named for the step it performs -- useful after running
+    ``audio`` on a timeline that was built before the audio existed.
+    """
+    pipeline = _pipeline(args)
+    assets = _assets_for(pipeline, args)
+
+    missing = [
+        asset.filename for asset in assets if not pipeline.load_audio_events(asset)
+    ]
+    timeline = pipeline.timeline(assets, use_premiere=False)
+    target = pipeline.write_timeline(timeline, name=args.name)
+
+    attached = sum(len(segment.audio_events) for segment in timeline.segments)
+    covered = sum(1 for segment in timeline.segments if segment.audio_events)
+
+    if args.json:
+        _emit({
+            "success": True,
+            "written": str(target),
+            "segments": len(timeline.segments),
+            "segments_with_audio": covered,
+            "audio_event_links": attached,
+            "files_without_audio_analysis": missing,
+        })
+        return EXIT_OK
+
+    print(
+        f"{attached} audio event link(s) across {covered}/{len(timeline.segments)} "
+        f"segment(s)."
+    )
+    for name in missing:
+        print(f"  ! {name} has no audio analysis yet -- run `audio` for it.")
+    print(f"Written to {target}")
+    return EXIT_OK
+
+
+def cmd_recommend(args) -> int:
+    pipeline = _pipeline(args)
+    timeline = pipeline.load_timeline(name=args.name)
+    recommendations = pipeline.recommend(
+        timeline,
+        options=PlannerOptions(
+            budget_seconds=args.budget_seconds,
+            min_repeat_gap=args.repeat_gap,
+            skip_safety=args.no_safety,
+        ),
+        name=args.name,
+    )
+    draft = None
+    if args.with_plan:
+        draft = pipeline.draft_plan(recommendations, name=args.name)
+    report_path = pipeline.write_report(
+        recommendations, timeline=timeline, draft=draft, name=args.name
+    )
+
+    if args.json:
+        _emit({"success": True, "report": str(report_path),
+               **recommendations.to_dict()})
+        return EXIT_OK
+
+    print(report_module.render(
+        recommendations, timeline=timeline, draft=draft, limit=args.limit
+    ))
+    print(f"\nWritten to {pipeline.config.recommendations_dir}")
+    return EXIT_OK
+
+
+def cmd_top(args) -> int:
+    pipeline = _pipeline(args)
+    timeline = pipeline.load_timeline(name=args.name)
+    if args.json:
+        _emit({
+            "success": True,
+            "moments": [
+                segment.to_dict()
+                for segment in timeline.highlights(args.limit)
+            ],
+        })
+        return EXIT_OK
+    print(report_module.render_top_moments(timeline, limit=args.limit))
+    return EXIT_OK
+
+
+def cmd_reactions(args) -> int:
+    """Moments the audio layer made interesting on its own."""
+    pipeline = _pipeline(args)
+    timeline = pipeline.load_timeline(name=args.name)
+    reacting = [
+        segment for segment in timeline.segments
+        if segment.audio_reaction is not None
+    ]
+    reacting.sort(key=lambda s: s.audio_reaction.confidence, reverse=True)
+
+    if args.json:
+        _emit({
+            "success": True,
+            "count": len(reacting),
+            "moments": [
+                {
+                    "start": round(segment.start, 3),
+                    "end": round(segment.end, 3),
+                    "reaction": segment.audio_reaction.to_dict(),
+                    "importance": segment.importance,
+                    "said": segment.said,
+                    "usefulness": round(segment.usefulness, 3),
+                }
+                for segment in reacting[: args.limit]
+            ],
+        })
+        return EXIT_OK
+
+    if not reacting:
+        print("No audio reaction moments. Run `audio` if you have not yet.")
+        return EXIT_OK
+    print(f"{len(reacting)} audio reaction moment(s):")
+    for segment in reacting[: args.limit]:
+        reaction = segment.audio_reaction
+        print(
+            f"  [{segment.start:8.2f}-{segment.end:8.2f}] {reaction.type:<18}"
+            f" {reaction.detection:<18} conf={reaction.confidence:.2f}"
+        )
+        print(f"      picture: {segment.importance}; "
+              + (f'said "{segment.said[:50]}"' if segment.has_speech else "silent"))
+    return EXIT_OK
+
+
+def cmd_removed(args) -> int:
+    """What the safety pass took out, and why."""
+    pipeline = _pipeline(args)
+    recommendations = pipeline.load_recommendations(name=args.name)
+    removed = recommendations.removed()
+
+    if args.json:
+        _emit({
+            "success": True,
+            "count": len(removed),
+            "removed": [entry.to_dict() for entry in removed],
+        })
+        return EXIT_OK
+
+    if not removed:
+        print("The safety pass removed nothing.")
+        return EXIT_OK
+    print(f"{len(removed)} recommendation(s) removed or softened:")
+    for entry in removed[: args.limit]:
+        print(f"  [{entry.status:<10}] {entry.start:8.2f}s {entry.category:<16} "
+              f"{entry.reason[:44]}")
+        print(f"      why: {entry.status_reason}")
+    return EXIT_OK
+
+
+def cmd_draft(args) -> int:
+    """Build the draft Premiere plan and dry-run it. Executes nothing."""
+    pipeline = _pipeline(args)
+    recommendations = pipeline.load_recommendations(name=args.name)
+    draft = pipeline.draft_plan(recommendations, name=args.name)
+
+    if args.json:
+        _emit({"success": True, **draft.to_dict()})
+        return EXIT_OK
+
+    print(f"Draft Premiere plan ({args.name})")
+    print(f"  operations     : {draft.operation_count}")
+    print(f"  dry run        : {'valid' if draft.valid else 'INVALID'}")
+    print(f"  executed       : {draft.executed}  <- nothing has been applied")
+    print(f"  kept as recs   : {len(draft.not_convertible)}")
+    if draft.validation_error:
+        print(f"  error          : {draft.validation_error.get('error')}")
+        if draft.validation_error.get("hint"):
+            print(f"  hint           : {draft.validation_error['hint']}")
+    for line in draft.explanation[: args.limit]:
+        print(f"    {line}")
+    if draft.not_convertible:
+        print("\n  Kept as recommendations (no operation yet):")
+        seen: dict = {}
+        for entry in draft.not_convertible:
+            seen.setdefault(entry["category"], entry["reason"])
+        for category, reason in sorted(seen.items()):
+            print(f"    {category:<18} {reason}")
+    print(f"\nWritten to {pipeline.config.plans_dir / (args.name + '.json')}")
+    return EXIT_OK
+
+
+def _roughcut_options(args) -> RoughCutOptions:
+    return RoughCutOptions(
+        sequence_name=args.sequence,
+        keep_threshold=args.keep_threshold,
+        filler_speed=args.filler_speed,
+        handle=args.handle,
+        drop_filler=args.drop_filler,
+        allow_zooms=not args.no_zooms,
+        preset=args.preset or "",
+    )
+
+
+def cmd_roughcut(args) -> int:
+    pipeline = _pipeline(args)
+    command = args.roughcut_command
+
+    # -- build ----------------------------------------------------------
+    if command == "build":
+        plan = pipeline.rough_cut(
+            options=_roughcut_options(args),
+            name=args.name,
+            validate=not args.plan_only,
+        )
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        _print_roughcut(plan, limit=args.limit)
+        if args.plan_only:
+            print("\nplan-only: NOT validated. Run `roughcut dry-run` next.")
+        return EXIT_OK
+
+    # -- dry-run --------------------------------------------------------
+    if command == "dry-run":
+        plan = pipeline.load_rough_cut(name=args.name)
+        report = pipeline.run_rough_cut(plan, mode="dry_run", name=args.name)
+        if args.json:
+            _emit({"success": True, "report": report.to_dict(),
+                   "dry_run_passed": plan.dry_run_passed,
+                   "explanation": plan.explanation})
+            return EXIT_OK
+        print(f"Dry run: {'PASSED' if plan.dry_run_passed else 'FAILED'}")
+        print(f"  operations : {plan.operation_count}")
+        print(f"  executed   : {report.executed}  <- nothing has been applied")
+        if plan.dry_run_error:
+            print(f"  error      : {plan.dry_run_error.get('error')}")
+            if plan.dry_run_error.get("hint"):
+                print(f"  hint       : {plan.dry_run_error['hint']}")
+        for line in plan.explanation[: args.limit]:
+            print(f"    {line}")
+        return EXIT_OK
+
+    # -- execute --------------------------------------------------------
+    if command == "execute":
+        plan = pipeline.load_rough_cut(name=args.name)
+        if not args.yes:
+            raise EditingError(
+                "Execution needs an explicit confirmation",
+                hint="This writes to Premiere. Re-run with --yes once you have "
+                     "read the dry run.",
+            )
+        report = pipeline.run_rough_cut(
+            plan,
+            mode="execute_on_scratch",
+            allow_active_sequence=args.allow_active_sequence,
+            name=args.name,
+        )
+        if args.json:
+            _emit({"success": report.ok, **report.to_dict()})
+            return EXIT_OK if report.ok or report.refused_reason else EXIT_ERROR
+
+        print(f"Rough cut execution ({plan.sequence_name})")
+        print(f"  dry run    : {'passed' if report.dry_run_passed else 'FAILED'}")
+        print(f"  on scratch : {report.on_scratch}")
+        print(f"  executed   : {report.executed}")
+        print(f"  operations : {report.operations_succeeded}/"
+              f"{report.operations_attempted}")
+        if report.refused_reason:
+            print(f"  refused    : {report.refused_reason}")
+        if report.error:
+            print(f"  error      : {report.error.get('error')}")
+        return EXIT_OK if report.executed or report.refused_reason else EXIT_ERROR
+
+    # -- placements -----------------------------------------------------
+    if command == "placements":
+        plan = pipeline.load_rough_cut(name=args.name)
+        if args.json:
+            _emit({"success": True, "sequence": plan.sequence_name,
+                   "placements": [p.to_dict() for p in plan.placements]})
+            return EXIT_OK
+        print(f"{len(plan.placements)} clip(s) in '{plan.sequence_name}':")
+        for placement in plan.placements:
+            flags = []
+            if placement.protected:
+                flags.append("protected")
+            if placement.speed != 1.0:
+                flags.append(f"{placement.speed:g}x")
+            print(
+                f"  [{placement.sequence_start:8.2f}-{placement.sequence_end:8.2f}] "
+                f"<- {placement.source_in:8.2f}-{placement.source_out:8.2f}  "
+                f"{placement.keep_reason:<14} {' '.join(flags)}"
+            )
+            print(f"      {placement.placement_id}  "
+                  f"recs={len(placement.recommendation_ids)} "
+                  f"segments={len(placement.segment_ids)}")
+        return EXIT_OK
+
+    # -- unconverted ----------------------------------------------------
+    if command == "unconverted":
+        plan = pipeline.load_rough_cut(name=args.name)
+        if args.json:
+            _emit({"success": True, "count": len(plan.unconverted),
+                   "unconverted": [u.to_dict() for u in plan.unconverted]})
+            return EXIT_OK
+        if not plan.unconverted:
+            print("Everything accepted was converted into the cut.")
+            return EXIT_OK
+        print(f"{len(plan.unconverted)} recommendation(s) not in the cut:")
+        for entry in plan.unconverted[: args.limit]:
+            print(f"  {entry.start:8.2f}s {entry.category:<16} "
+                  f"{entry.recommendation_id}")
+            print(f"      {entry.reason}")
+        return EXIT_OK
+
+    # -- report ---------------------------------------------------------
+    if command == "report":
+        report = pipeline.load_execution_report(name=args.name)
+        if args.json:
+            _emit({"success": True, **report.to_dict()})
+            return EXIT_OK
+        print(f"Execution report ({args.name})")
+        for label, value in (
+            ("mode", report.mode), ("executed", report.executed),
+            ("on scratch", report.on_scratch),
+            ("dry run passed", report.dry_run_passed),
+            ("sequence", report.sequence_name),
+            ("operations", f"{report.operations_succeeded}/"
+                           f"{report.operations_attempted}"),
+            ("elapsed", f"{report.elapsed:.2f}s"),
+        ):
+            print(f"  {label:<15}: {value}")
+        if report.refused_reason:
+            print(f"  refused        : {report.refused_reason}")
+        if report.error:
+            print(f"  error          : {report.error.get('error')}")
+        return EXIT_OK
+
+    raise EditingError("Unknown roughcut command")
+
+
+def cmd_review(args) -> int:
+    """Export review frames from the rough cut."""
+    pipeline = _pipeline(args)
+    plan = pipeline.load_rough_cut(name=args.name)
+
+    if args.list:
+        frames = review_module.plan_frames(plan, position=args.position)
+        if args.json:
+            _emit({"success": True, "exported": False,
+                   "frames": [f.to_dict() for f in frames]})
+            return EXIT_OK
+        print(f"{len(frames)} frame(s) would be exported:")
+        for frame in frames[: args.limit]:
+            print(f"  seq {frame.sequence_time:8.2f}s <- src "
+                  f"{frame.source_time:8.2f}s  {frame.keep_reason:<14} "
+                  f"{frame.placement_id}")
+        return EXIT_OK
+
+    review = pipeline.review_frames(
+        plan, name=args.name, position=args.position, width=args.width
+    )
+    if args.json:
+        _emit({"success": True, **review.to_dict()})
+        return EXIT_OK
+
+    print(f"{len(review)} review frame(s) for '{plan.sequence_name}'.")
+    for frame in review.frames[: args.limit]:
+        print(f"  seq {frame.sequence_time:8.2f}s  {frame.keep_reason:<14} "
+              f"{Path(frame.path).name}")
+        if frame.marker_names:
+            print(f"      markers: {', '.join(frame.marker_names)}")
+    for warning in review.warnings:
+        print(f"  ! {warning}")
+    print(f"\nWritten to {pipeline.config.review_dir}")
+    return EXIT_OK
+
+
+def _print_roughcut(plan, *, limit: int = 30) -> None:
+    stats = plan.stats()
+    print(f"Rough cut: {plan.sequence_name}")
+    print(f"  {stats['placements']} clip(s), {stats['cut_duration']}s from "
+          f"{stats['source_duration']}s of footage")
+    print(f"  {stats['protected']} protected, {stats['sped_up']} sped up, "
+          f"{stats['markers']} marker(s)")
+    print(f"  {stats['operations']} operation(s), "
+          f"{stats['unconverted']} recommendation(s) unconverted")
+    print(f"  dry run    : {'passed' if plan.dry_run_passed else 'not run'}")
+    print(f"  on scratch : {plan.on_scratch}  (nothing has been applied)")
+
+    if plan.placements:
+        print("\n  Assembly:")
+        for placement in plan.placements[:limit]:
+            flags = " ".join(filter(None, [
+                "protected" if placement.protected else "",
+                f"{placement.speed:g}x" if placement.speed != 1.0 else "",
+            ]))
+            print(f"    [{placement.sequence_start:7.2f}-"
+                  f"{placement.sequence_end:7.2f}] "
+                  f"{placement.keep_reason:<14} {flags}")
+
+    if plan.warnings:
+        print("\n  Warnings:")
+        for warning in plan.warnings:
+            print(f"    ! {warning}")
+
+
 def cmd_timeline(args) -> int:
     pipeline = _pipeline(args)
     assets = _assets_for(pipeline, args)
@@ -324,18 +777,79 @@ def cmd_show(args) -> int:
 
 
 def cmd_export(args) -> int:
+    """Write a built artefact to a path of your choosing."""
     pipeline = _pipeline(args)
-    timeline = pipeline.load_timeline(name=args.name)
     target = Path(args.out).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(timeline.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+
+    if args.what == "timeline":
+        timeline = pipeline.load_timeline(name=args.name)
+        target.write_text(
+            json.dumps(timeline.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary = {"segments": len(timeline.segments), "stats": timeline.stats()}
+        human = f"Wrote {len(timeline.segments)} segment(s) to {target}"
+
+    elif args.what == "recommendations":
+        recommendations = pipeline.load_recommendations(name=args.name)
+        target.write_text(
+            json.dumps(recommendations.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary = {"recommendations": len(recommendations),
+                   "stats": recommendations.stats()}
+        human = f"Wrote {len(recommendations)} recommendation(s) to {target}"
+
+    elif args.what == "report":
+        recommendations = pipeline.load_recommendations(name=args.name)
+        # The report is richer with the timeline and plan alongside it, but
+        # both are optional -- exporting a report must not fail because the
+        # draft plan has not been built.
+        timeline = None
+        draft = None
+        try:
+            timeline = pipeline.load_timeline(name=args.name)
+        except EditingError:
+            pass
+        plan_path = pipeline.config.plans_dir / f"{args.name}.json"
+        if plan_path.exists():
+            from editing.recommend.premiere_plan import DraftPlan
+
+            stored = json.loads(plan_path.read_text(encoding="utf-8"))
+            draft = DraftPlan(
+                ops=list(stored.get("plan", {}).get("ops") or []),
+                not_convertible=list(stored.get("not_convertible") or []),
+                no_op=list(stored.get("no_op") or []),
+                valid=bool(stored.get("valid")),
+                validation_error=stored.get("validation_error"),
+                explanation=list(stored.get("explanation") or []),
+                generated_at=str(stored.get("generated_at") or ""),
+            )
+        text = report_module.render(recommendations, timeline=timeline, draft=draft)
+        target.write_text(text, encoding="utf-8")
+        summary = {"recommendations": len(recommendations), "characters": len(text)}
+        human = f"Wrote the report to {target}"
+
+    else:   # plan
+        plan_path = pipeline.config.plans_dir / f"{args.name}.json"
+        if not plan_path.exists():
+            raise EditingError(
+                f"No draft plan named '{args.name}' has been built yet",
+                hint="Run `python -m editing.cli draft` first.",
+            )
+        stored = json.loads(plan_path.read_text(encoding="utf-8"))
+        target.write_text(
+            json.dumps(stored, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        summary = {"operations": stored.get("operation_count", 0),
+                   "valid": stored.get("valid"), "executed": stored.get("executed")}
+        human = f"Wrote the draft plan to {target}"
+
     if args.json:
-        _emit({"success": True, "written": str(target), "stats": timeline.stats()})
+        _emit({"success": True, "what": args.what, "written": str(target), **summary})
     else:
-        print(f"Wrote {len(timeline.segments)} segment(s) to {target}")
+        print(human)
     return EXIT_OK
 
 
@@ -451,6 +965,37 @@ def cmd_doctor(args) -> int:
 
 def cmd_run(args) -> int:
     pipeline = _pipeline(args)
+    if args.recommend:
+        timeline, recommendations, draft = pipeline.run_full(
+            planner_options=PlannerOptions(
+                budget_seconds=args.budget_seconds,
+                min_repeat_gap=args.repeat_gap,
+                skip_safety=args.no_safety,
+            ),
+            folder=args.folder,
+            files=args.file or None,
+            recursive=not args.no_recursive,
+            keep_frames=args.keep_frames,
+            use_motion=not args.no_motion,
+            max_windows=args.max_windows,
+            use_premiere=(False if args.no_premiere else None),
+            merge_similar=not args.no_merge,
+            max_segment_seconds=args.max_segment_seconds,
+            usable_threshold=args.threshold,
+        )
+        if args.json:
+            _emit({
+                "success": True,
+                "timeline": timeline.to_dict(),
+                "recommendations": recommendations.to_dict(),
+                "draft_plan": draft.to_dict(),
+            })
+            return EXIT_OK
+        print(report_module.render(
+            recommendations, timeline=timeline, draft=draft, limit=args.limit
+        ))
+        return EXIT_OK
+
     timeline = pipeline.run(
         folder=args.folder,
         files=args.file or None,
@@ -571,16 +1116,28 @@ def _add_model(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m editing.cli",
-        description="Editing Brain V1 -- footage structure layer. Produces a "
-                    "machine-readable timeline of what happens in Minecraft "
-                    "footage and what is said over it. Makes no edits.",
+        description="Editing Brain V1 -- footage structure and edit "
+                    "recommendations. Produces a machine-readable timeline of "
+                    "what happens in Minecraft footage, what is said and heard "
+                    "over it, and which edits would be worth making. Proposes "
+                    "only: it never applies an edit.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Typical first run:\n"
                "  python -m editing.cli doctor\n"
                "  python -m editing.cli discover --folder D:/Footage/ep12\n"
                "  python -m editing.cli transcript status\n"
+               "  python -m editing.cli audio\n"
                "  python -m editing.cli analyze\n"
-               "  python -m editing.cli timeline\n",
+               "  python -m editing.cli timeline\n"
+               "  python -m editing.cli recommend --with-plan\n"
+               "  python -m editing.cli roughcut build\n"
+               "  python -m editing.cli roughcut dry-run\n"
+               "  python -m editing.cli roughcut execute --yes\n"
+               "  python -m editing.cli review\n"
+               "\nOr all of it at once:\n"
+               "  python -m editing.cli run --folder D:/Footage/ep12 --recommend\n"
+               "\nNothing here applies an edit. `draft` validates a Premiere\n"
+               "plan offline; running it stays a separate, human decision.\n",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -660,6 +1217,172 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(timeline)
     timeline.set_defaults(func=cmd_timeline)
 
+    # -- audio ----------------------------------------------------------
+    audio = subparsers.add_parser(
+        "audio", help="detect audio events (silence, spikes, reactions)")
+    audio.add_argument("--refresh", action="store_true",
+                       help="re-analyse even if a cached result exists")
+    audio.add_argument("--silence-db", type=float,
+                       help="dBFS floor for silence (default -45)")
+    audio.add_argument("--min-silence", type=float,
+                       help="shortest silence worth reporting (default 0.8s)")
+    audio.add_argument("--long-pause", type=float,
+                       help="transcript gap that counts as dead air (default 2.5s)")
+    audio.add_argument("--spike-db", type=float,
+                       help="dB above baseline that counts as a spike (default 8)")
+    audio.add_argument("--audio-interval", type=float,
+                       help="loudness sample spacing in seconds (default 0.25)")
+    _add_selection(audio)
+    _add_common(audio)
+    audio.set_defaults(func=cmd_audio)
+
+    # -- attach ---------------------------------------------------------
+    attach = subparsers.add_parser(
+        "attach",
+        help="fold analysed audio events into the timeline (rebuilds it)")
+    attach.add_argument("--name", default="structure")
+    _add_selection(attach)
+    _add_common(attach)
+    attach.set_defaults(func=cmd_attach)
+
+    # -- recommend ------------------------------------------------------
+    recommend = subparsers.add_parser(
+        "recommend", help="generate layered edit recommendations")
+    recommend.add_argument("--name", default="structure")
+    recommend.add_argument("--limit", type=int, default=25)
+    recommend.add_argument(
+        "--budget-seconds", type=float, default=20.0,
+        help="seconds of footage per permitted active edit; higher is calmer "
+             "(default 20)")
+    recommend.add_argument(
+        "--repeat-gap", type=float, default=12.0,
+        help="minimum seconds between two edits of the same kind (default 12)")
+    recommend.add_argument(
+        "--no-safety", action="store_true",
+        help="skip the anti-trash pass -- for inspecting raw proposals only; "
+             "the result must not be used to build a plan")
+    recommend.add_argument("--with-plan", action="store_true",
+                           help="also build and dry-run the draft Premiere plan")
+    _add_common(recommend)
+    recommend.set_defaults(func=cmd_recommend)
+
+    # -- top / reactions / removed --------------------------------------
+    top = subparsers.add_parser("top", help="the moments most worth using")
+    top.add_argument("--name", default="structure")
+    top.add_argument("--limit", type=int, default=20)
+    _add_common(top)
+    top.set_defaults(func=cmd_top)
+
+    reactions = subparsers.add_parser(
+        "reactions", help="moments the audio made interesting")
+    reactions.add_argument("--name", default="structure")
+    reactions.add_argument("--limit", type=int, default=20)
+    _add_common(reactions)
+    reactions.set_defaults(func=cmd_reactions)
+
+    removed = subparsers.add_parser(
+        "removed", help="what the safety pass took out, and why")
+    removed.add_argument("--name", default="structure")
+    removed.add_argument("--limit", type=int, default=40)
+    _add_common(removed)
+    removed.set_defaults(func=cmd_removed)
+
+    # -- draft ----------------------------------------------------------
+    draft = subparsers.add_parser(
+        "draft",
+        help="build the draft Premiere plan and dry-run it (executes nothing)")
+    draft.add_argument("--name", default="structure")
+    draft.add_argument("--limit", type=int, default=30)
+    _add_common(draft)
+    draft.set_defaults(func=cmd_draft)
+
+    # -- roughcut -------------------------------------------------------
+    roughcut = subparsers.add_parser(
+        "roughcut",
+        help="build, validate and (explicitly) execute a rough cut sequence")
+    roughcut_subs = roughcut.add_subparsers(
+        dest="roughcut_command", required=True)
+
+    rc_build = roughcut_subs.add_parser(
+        "build", help="select ranges and build the operation plan")
+    rc_build.add_argument("--name", default="structure")
+    rc_build.add_argument("--sequence", default="Nova Rough Cut",
+                          help="scratch sequence name")
+    rc_build.add_argument("--keep-threshold", type=float, default=0.40,
+                          help="usefulness below which a segment is dropped "
+                               "(default 0.40)")
+    rc_build.add_argument("--filler-speed", type=float, default=2.0,
+                          help="playback rate for dull silent footage "
+                               "(default 2.0)")
+    rc_build.add_argument("--handle", type=float, default=0.25,
+                          help="seconds of handle either side of a kept range")
+    rc_build.add_argument("--drop-filler", action="store_true",
+                          help="drop low-value footage instead of speeding it up")
+    rc_build.add_argument("--no-zooms", action="store_true",
+                          help="markers only; do not animate Motion > Scale")
+    rc_build.add_argument("--preset", help="a .sqpreset path for the sequence")
+    rc_build.add_argument("--plan-only", action="store_true",
+                          help="build the operations without validating them")
+    rc_build.add_argument("--limit", type=int, default=30)
+    _add_common(rc_build)
+    rc_build.set_defaults(func=cmd_roughcut)
+
+    rc_dry = roughcut_subs.add_parser(
+        "dry-run", help="validate the plan offline (executes nothing)")
+    rc_dry.add_argument("--name", default="structure")
+    rc_dry.add_argument("--limit", type=int, default=40)
+    _add_common(rc_dry)
+    rc_dry.set_defaults(func=cmd_roughcut)
+
+    rc_exec = roughcut_subs.add_parser(
+        "execute",
+        help="run the plan on a scratch sequence -- needs --yes")
+    rc_exec.add_argument("--name", default="structure")
+    rc_exec.add_argument("--yes", action="store_true",
+                         help="required: confirms you have read the dry run")
+    rc_exec.add_argument(
+        "--allow-active-sequence", action="store_true",
+        help="permit editing the sequence currently open instead of a scratch "
+             "one. Off by default, and rarely what you want.")
+    rc_exec.add_argument("--limit", type=int, default=40)
+    _add_common(rc_exec)
+    rc_exec.set_defaults(func=cmd_roughcut)
+
+    rc_place = roughcut_subs.add_parser(
+        "placements", help="what lands where on the sequence")
+    rc_place.add_argument("--name", default="structure")
+    rc_place.add_argument("--limit", type=int, default=60)
+    _add_common(rc_place)
+    rc_place.set_defaults(func=cmd_roughcut)
+
+    rc_unconv = roughcut_subs.add_parser(
+        "unconverted", help="recommendations that did not make the cut, and why")
+    rc_unconv.add_argument("--name", default="structure")
+    rc_unconv.add_argument("--limit", type=int, default=40)
+    _add_common(rc_unconv)
+    rc_unconv.set_defaults(func=cmd_roughcut)
+
+    rc_report = roughcut_subs.add_parser(
+        "report", help="the last execution report")
+    rc_report.add_argument("--name", default="structure")
+    rc_report.add_argument("--limit", type=int, default=40)
+    _add_common(rc_report)
+    rc_report.set_defaults(func=cmd_roughcut)
+
+    # -- review ---------------------------------------------------------
+    review = subparsers.add_parser(
+        "review", help="export representative frames from the rough cut")
+    review.add_argument("--name", default="structure")
+    review.add_argument("--position", type=float, default=0.34,
+                        help="where in each clip to sample, 0-1 (default 0.34)")
+    review.add_argument("--width", type=int, default=960,
+                        help="exported frame width (default 960)")
+    review.add_argument("--list", action="store_true",
+                        help="list what would be exported without extracting")
+    review.add_argument("--limit", type=int, default=40)
+    _add_common(review)
+    review.set_defaults(func=cmd_review)
+
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")
     show.add_argument("--name", default="structure")
@@ -669,9 +1392,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(show)
     show.set_defaults(func=cmd_show)
 
-    export = subparsers.add_parser("export", help="write a timeline to a path")
+    export = subparsers.add_parser(
+        "export", help="write a built artefact to a path of your choosing")
+    export.add_argument(
+        "what", nargs="?", default="timeline",
+        choices=["timeline", "recommendations", "report", "plan"],
+        help="what to export (default: timeline)")
     export.add_argument("--name", default="structure")
-    export.add_argument("--out", required=True, help="destination .json path")
+    export.add_argument("--out", required=True,
+                        help="destination path (.json, or .txt for the report)")
     _add_common(export)
     export.set_defaults(func=cmd_export)
 
@@ -715,6 +1444,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--threshold", type=float,
                      default=align.DEFAULT_USABLE_THRESHOLD)
     run.add_argument("--limit", type=int, default=60)
+    run.add_argument("--recommend", action="store_true",
+                     help="also plan recommendations and dry-run a draft plan")
+    run.add_argument("--budget-seconds", type=float, default=20.0)
+    run.add_argument("--repeat-gap", type=float, default=12.0)
+    run.add_argument("--no-safety", action="store_true", help=argparse.SUPPRESS)
     _add_selection(run)
     _add_sampling(run)
     _add_model(run)

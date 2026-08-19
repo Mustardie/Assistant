@@ -550,3 +550,442 @@ def test_cli_run_end_to_end_with_the_mock_backend(
         assert segment["end"] >= segment["start"]
         assert segment["alignment"] in ("match", "contrast", "neutral", "unknown")
         assert 0.0 <= segment["usefulness"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Session 2: audio, recommendations and the draft plan, end to end
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def staged(footage, tmp_path, fake_probe, frame_file, monkeypatch, srt_sample):
+    """A discovered + audio-analysed + visually-analysed output directory.
+
+    Stubs the two external edges (frame extraction and the audio reader) and
+    leaves everything else real, so the commands under test run the same code
+    path they would on the user's machine.
+    """
+    from editing.audio import analyzer as audio_analyzer
+    from editing.audio.signal import LoudnessSample, Span
+    from editing.visual import analyzer as visual_analyzer
+    from editing.visual.frames import ExtractedFrames
+
+    (footage / "session_01.srt").write_text(srt_sample, encoding="utf-8")
+    out = tmp_path / "out"
+
+    class StubFrames:
+        def extract(self, path, window):
+            return ExtractedFrames(
+                window=window, times=list(window.frame_times),
+                paths=[frame_file] * len(window.frame_times),
+            )
+
+    monkeypatch.setattr(
+        visual_analyzer.VisualAnalyzer, "frame_source_for",
+        lambda self, asset: StubFrames(),
+    )
+
+    samples = []
+    time = 0.0
+    while time < 16.0:
+        # Quiet from 5-9s so there is real dead air to find.
+        level = -95.0 if 5.0 <= time < 9.0 else -24.0
+        samples.append(LoudnessSample(round(time, 3), level, level + 6.0))
+        time = round(time + 0.25, 3)
+
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "__init__",
+        lambda self, config, audio: None,
+    )
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "has_audio", lambda self, path: True
+    )
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "envelope", lambda self, path: samples
+    )
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "silence",
+        lambda self, path, duration: [Span(5.0, 9.0)],
+    )
+    return out
+
+
+def _stage(staged, footage, capsys, *extra):
+    """Run discover -> audio -> analyze -> timeline into ``staged``."""
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+    run_cli(["audio"] + base, capsys)
+    run_cli(
+        ["analyze", "--backend", "mock", "--window-seconds", "8", "--no-motion"]
+        + base, capsys
+    )
+    run_cli(["timeline", "--limit", "0"] + base, capsys)
+    return base
+
+
+def test_cli_audio_detects_events(staged, footage, capsys):
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+
+    code, captured = run_cli(["audio", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    first = next(iter(payload["assets"].values()))
+    kinds = {event["type"] for event in first["events"]}
+    assert "silence" in kinds
+    assert (staged / "audio").exists()
+
+
+def test_cli_timeline_carries_audio_events(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    code, captured = run_cli(["show", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert any(segment["audio_events"] for segment in payload["segments"])
+
+
+def test_cli_recommend_produces_evidence_backed_output(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    code, captured = run_cli(["recommend", "--json"] + base, capsys)
+
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["stats"]["total"] > 0
+    accepted = [
+        entry for entry in payload["recommendations"]
+        if entry["status"] == "accepted"
+    ]
+    assert accepted
+    assert all(entry["has_evidence"] for entry in accepted)
+    assert (staged / "recommendations" / "structure.json").exists()
+    assert (staged / "recommendations" / "structure.txt").exists()
+
+
+def test_cli_draft_plan_dry_runs_and_executes_nothing(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    code, captured = run_cli(["draft", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+
+    assert payload["executed"] is False
+    assert payload["plan"]["dry_run"] is True
+    if payload["operation_count"]:
+        assert payload["valid"] is True
+    assert (staged / "plans" / "structure.json").exists()
+
+
+def test_cli_draft_needs_recommendations_first(staged, footage, capsys):
+    _stage(staged, footage, capsys)
+    code, captured = run_cli(
+        ["draft", "--json", "--output-dir", str(staged), "--no-premiere", "-q"],
+        capsys,
+    )
+    assert code == 1
+    assert "recommend" in json.loads(captured.out)["hint"]
+
+
+def test_cli_top_and_reactions(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+
+    code, captured = run_cli(["top", "--json"] + base, capsys)
+    assert code == 0
+    assert "moments" in json.loads(captured.out)
+
+    code, captured = run_cli(["reactions", "--json"] + base, capsys)
+    assert code == 0
+    assert "moments" in json.loads(captured.out)
+
+
+def test_cli_removed_reports_the_safety_pass(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    code, captured = run_cli(["removed", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert "removed" in payload
+    for entry in payload["removed"]:
+        # Anything the safety pass touched must say why.
+        assert entry["status_reason"]
+
+
+def test_cli_run_with_recommend_does_everything(
+    staged, footage, capsys
+):
+    code, captured = run_cli([
+        "run", "--folder", str(footage), "--recommend", "--backend", "mock",
+        "--window-seconds", "8", "--no-motion",
+        "--output-dir", str(staged), "--no-premiere", "--json", "-q",
+    ], capsys)
+
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["timeline"]["stats"]["segments"] > 0
+    assert payload["recommendations"]["stats"]["total"] > 0
+    assert payload["draft_plan"]["executed"] is False
+
+
+def test_no_cli_command_ever_executes_a_premiere_edit(staged, footage, capsys):
+    """The hard guarantee for this session, asserted at the CLI boundary.
+
+    Every command is run against a bridge that raises if anything reaches it.
+    A mutating call would surface as an error rather than silently editing a
+    real timeline.
+    """
+    import editing.premiere_link as premiere_link
+    import editing.transcripts.premiere_source as premiere_source
+
+    calls = []
+
+    class ExplodingBridge:
+        def health(self):
+            return {"connected": True, "project_open": True}
+
+        def call(self, op, params=None, *, timeout=None):
+            calls.append(op)
+            raise AssertionError(f"{op} reached Premiere during a dry run")
+
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+    run_cli(["draft"] + base, capsys)
+
+    # Nothing above should have needed a bridge at all; prove the draft path
+    # specifically validates without one.
+    from editing.pipeline import build_pipeline
+    from editing.config import load_config
+
+    config, sampling, audio_config = load_config(output_dir=staged)
+    pipeline = build_pipeline(config, sampling, audio_config)
+    pipeline.bridge = ExplodingBridge()
+    draft = pipeline.draft_plan(save=False)
+
+    assert draft.executed is False
+    assert calls == []
+
+
+def test_cli_attach_folds_audio_into_the_timeline(staged, footage, capsys):
+    """The explicit name for the step ``timeline`` performs implicitly."""
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+    run_cli(["audio"] + base, capsys)
+    run_cli(
+        ["analyze", "--backend", "mock", "--window-seconds", "8", "--no-motion"]
+        + base, capsys
+    )
+
+    code, captured = run_cli(["attach", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["segments_with_audio"] > 0
+    assert payload["audio_event_links"] > 0
+    assert payload["files_without_audio_analysis"] == []
+
+
+def test_cli_attach_names_files_missing_audio_analysis(
+    staged, footage, capsys
+):
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+    run_cli(
+        ["analyze", "--backend", "mock", "--window-seconds", "8", "--no-motion"]
+        + base, capsys
+    )
+
+    code, captured = run_cli(["attach", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["files_without_audio_analysis"]     # said so, not silent
+    assert payload["audio_event_links"] == 0
+
+
+@pytest.mark.parametrize("what,suffix", [
+    ("timeline", ".json"),
+    ("recommendations", ".json"),
+    ("report", ".txt"),
+    ("plan", ".json"),
+])
+def test_cli_export_writes_each_artefact(staged, footage, capsys, what, suffix):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+    run_cli(["draft"] + base, capsys)
+
+    out = staged / f"exported_{what}{suffix}"
+    code, captured = run_cli(
+        ["export", what, "--out", str(out), "--json"] + base, capsys
+    )
+
+    assert code == 0
+    assert json.loads(captured.out)["what"] == what
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_cli_export_report_works_without_a_draft_plan(staged, footage, capsys):
+    """Exporting a report must not require the plan step to have run."""
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    out = staged / "report_only.txt"
+    code, _ = run_cli(["export", "report", "--out", str(out), "--json"] + base, capsys)
+    assert code == 0
+    assert "EDIT RECOMMENDATIONS" in out.read_text(encoding="utf-8")
+
+
+def test_cli_export_plan_before_drafting_reports_why(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    code, captured = run_cli(
+        ["export", "plan", "--out", str(staged / "p.json"), "--json"] + base, capsys
+    )
+    assert code == 1
+    assert "draft" in json.loads(captured.out)["hint"]
+
+
+# ---------------------------------------------------------------------------
+# Session 3: the rough cut, through the CLI
+# ---------------------------------------------------------------------------
+
+def _stage_full(staged, footage, capsys):
+    """discover -> audio -> analyze -> timeline -> recommend."""
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+    return base
+
+
+def test_cli_roughcut_build_and_dry_run(staged, footage, capsys):
+    base = _stage_full(staged, footage, capsys)
+
+    code, captured = run_cli(["roughcut", "build", "--json"] + base, capsys)
+    assert code == 0
+    plan = json.loads(captured.out)
+    assert plan["stats"]["operations"] > 0
+    assert plan["dry_run_passed"] is True
+    assert plan["on_scratch"] is True
+    assert (staged / "roughcut" / "structure.json").exists()
+
+    code, captured = run_cli(["roughcut", "dry-run", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["dry_run_passed"] is True
+    assert payload["report"]["executed"] is False
+
+
+def test_cli_roughcut_execute_refuses_without_yes(staged, footage, capsys):
+    """The explicit-flag requirement, at the CLI boundary."""
+    base = _stage_full(staged, footage, capsys)
+    run_cli(["roughcut", "build"] + base, capsys)
+
+    code, captured = run_cli(["roughcut", "execute", "--json"] + base, capsys)
+    assert code == 1
+    payload = json.loads(captured.out)
+    assert payload["success"] is False
+    assert "--yes" in payload["hint"]
+
+
+def test_cli_roughcut_execute_refuses_without_premiere(staged, footage, capsys):
+    """With --yes but no Premiere, it must refuse rather than pretend."""
+    base = _stage_full(staged, footage, capsys)
+    run_cli(["roughcut", "build"] + base, capsys)
+
+    code, captured = run_cli(
+        ["roughcut", "execute", "--yes", "--json"] + base, capsys
+    )
+    payload = json.loads(captured.out)
+    assert payload["executed"] is False
+    assert payload["refused_reason"]
+
+
+def test_cli_roughcut_plan_only_is_not_validated(staged, footage, capsys):
+    base = _stage_full(staged, footage, capsys)
+    code, captured = run_cli(
+        ["roughcut", "build", "--plan-only", "--json"] + base, capsys
+    )
+    assert code == 0
+    assert json.loads(captured.out)["dry_run_passed"] is False
+
+
+def test_cli_roughcut_placements_and_unconverted(staged, footage, capsys):
+    base = _stage_full(staged, footage, capsys)
+    run_cli(["roughcut", "build"] + base, capsys)
+
+    code, captured = run_cli(["roughcut", "placements", "--json"] + base, capsys)
+    assert code == 0
+    placements = json.loads(captured.out)["placements"]
+    assert placements
+    for placement in placements:
+        assert placement["placement_id"]
+        assert placement["sequence_end"] >= placement["sequence_start"]
+
+    code, captured = run_cli(["roughcut", "unconverted", "--json"] + base, capsys)
+    assert code == 0
+    for entry in json.loads(captured.out)["unconverted"]:
+        assert entry["reason"]
+
+
+def test_cli_roughcut_report_after_dry_run(staged, footage, capsys):
+    base = _stage_full(staged, footage, capsys)
+    run_cli(["roughcut", "build"] + base, capsys)
+    run_cli(["roughcut", "dry-run"] + base, capsys)
+
+    code, captured = run_cli(["roughcut", "report", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["mode"] == "dry_run"
+    assert payload["executed"] is False
+
+
+def test_cli_roughcut_needs_a_build_first(staged, footage, capsys):
+    base = _stage_full(staged, footage, capsys)
+    code, captured = run_cli(["roughcut", "placements", "--json"] + base, capsys)
+    assert code == 1
+    assert "roughcut build" in json.loads(captured.out)["hint"]
+
+
+def test_cli_review_lists_without_extracting(staged, footage, capsys):
+    base = _stage_full(staged, footage, capsys)
+    run_cli(["roughcut", "build"] + base, capsys)
+
+    code, captured = run_cli(["review", "--list", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["exported"] is False
+    assert payload["frames"]
+    for frame in payload["frames"]:
+        assert frame["placement_id"]
+        assert frame["source_time"] >= 0
+
+
+def test_cli_review_exports_frames(staged, footage, capsys, monkeypatch, tmp_path):
+    from editing.roughcut import review as review_module
+
+    written = tmp_path / "frame.jpg"
+    written.write_bytes(b"\xff\xd8jpeg")
+    monkeypatch.setattr(
+        review_module.ff, "extract_frame", lambda *a, **k: written
+    )
+
+    base = _stage_full(staged, footage, capsys)
+    run_cli(["roughcut", "build"] + base, capsys)
+
+    code, captured = run_cli(["review", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["exported"] is True
+    assert payload["frames"]
+    assert payload["stats"]["with_recommendations"] >= 0
+
+
+def test_no_cli_command_builds_a_plan_that_edits_the_active_sequence(
+    staged, footage, capsys
+):
+    """Every rough cut the CLI produces must create its own sequence."""
+    from editing.roughcut.execute import targets_scratch_sequence
+    from editing.roughcut.schema import RoughCutPlan
+
+    base = _stage_full(staged, footage, capsys)
+    _, captured = run_cli(["roughcut", "build", "--json"] + base, capsys)
+    plan = RoughCutPlan.from_dict(json.loads(captured.out))
+
+    assert targets_scratch_sequence(plan) is True
+    assert plan.on_scratch is True

@@ -25,12 +25,22 @@ from typing import Callable, Optional, Sequence
 
 from editing import align
 from editing.cache import Cache, build_cache
-from editing.config import EditingConfig, SamplingConfig
+from editing.audio.analyzer import AudioAnalyzer, AudioResult
+from editing.config import AudioConfig, EditingConfig, SamplingConfig
 from editing.discovery import discover
 from editing.errors import EditingError, FootageError
 from editing.fingerprint import fingerprint
 from editing.premiere_link import ProjectSnapshot
-from editing.schema import MediaAsset, StructureTimeline, VisualEvent
+from editing.recommend import report as report_module
+from editing.recommend.planner import PlannerOptions, plan_recommendations
+from editing.recommend.premiere_plan import DraftPlan, build_and_dry_run
+from editing.recommend.schema import RecommendationSet
+from editing.roughcut import execute as roughcut_execute, review as review_module
+from editing.roughcut.build import RoughCutOptions, build_rough_cut
+from editing.roughcut.schema import ExecutionReport, RoughCutPlan
+from editing.schema import (
+    AudioEvent, MediaAsset, StructureTimeline, VisualEvent,
+)
 from editing.transcripts import store as transcript_store
 from editing.visual.analyzer import AnalysisResult, VisualAnalyzer
 from editing.visual.qwen import build_model
@@ -51,16 +61,20 @@ class Pipeline:
 
     config: EditingConfig
     sampling: SamplingConfig
+    audio: AudioConfig = field(default_factory=AudioConfig)
     cache: Optional[Cache] = None
     say: Reporter = _quiet
     bridge: object = None
     model: object = None
+    #: Injected in tests to avoid FFmpeg; None means the real reader.
+    audio_source: object = None
 
     assets: list[MediaAsset] = field(default_factory=list)
     project: Optional[ProjectSnapshot] = None
 
     def __post_init__(self) -> None:
         self.sampling = self.sampling.validated()
+        self.audio = self.audio.validated()
         if self.cache is None:
             self.cache = build_cache(self.config)
         self.config.ensure_dirs()
@@ -285,6 +299,73 @@ class Pipeline:
         ]
 
     # ------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------
+
+    def audio_analyzer(self) -> AudioAnalyzer:
+        return AudioAnalyzer(
+            self.config, self.audio, cache=self.cache, source=self.audio_source
+        )
+
+    def analyze_audio(
+        self,
+        assets: Optional[Sequence[MediaAsset]] = None,
+        *,
+        transcripts: Optional[dict] = None,
+        refresh: bool = False,
+    ) -> dict:
+        """Analyse audio into events. Returns ``{asset_id: AudioResult}``."""
+        assets = list(assets if assets is not None else self.assets)
+        if transcripts is None:
+            resolved = self.transcripts(assets)
+            transcripts = {
+                asset_id: resolution.transcript
+                for asset_id, resolution in resolved.items()
+                if resolution.found
+            }
+
+        analyzer = self.audio_analyzer()
+        results: dict = {}
+        for asset in assets:
+            result = analyzer.analyze_asset(
+                asset,
+                transcript=transcripts.get(asset.asset_id),
+                refresh=refresh,
+            )
+            results[asset.asset_id] = result
+            self.write_audio(asset, result)
+            self.say(
+                f"  {asset.filename}: {len(result.events)} audio event(s)"
+                + (" (cached)" if result.cached else "")
+            )
+            for warning in result.warnings:
+                self.say(f"    ! {warning}")
+        return results
+
+    def write_audio(self, asset: MediaAsset, result: AudioResult):
+        target = self.config.audio_dir / f"{asset.asset_id}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_audio_events(self, asset: MediaAsset) -> list:
+        """Read an asset's saved audio events. Empty when never analysed."""
+        target = self.config.audio_dir / f"{asset.asset_id}.json"
+        if not target.exists():
+            return []
+        try:
+            document = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring unreadable audio file %s: %s", target, exc)
+            return []
+        return [
+            AudioEvent.from_dict(event) for event in (document.get("events") or [])
+        ]
+
+    # ------------------------------------------------------------------
     # Timeline
     # ------------------------------------------------------------------
 
@@ -307,6 +388,7 @@ class Pipeline:
         """
         assets = list(assets if assets is not None else self.assets)
         events_by_asset: dict = {}
+        audio_by_asset: dict = {}
         transcripts: dict = {}
         sources: dict = {}
         warnings: list[str] = []
@@ -323,6 +405,8 @@ class Pipeline:
                     f"{asset.filename}: no visual analysis on disk. Run "
                     "`analyze` for it."
                 )
+            audio_by_asset[asset.asset_id] = self.load_audio_events(asset)
+
             resolution = resolutions.get(asset.asset_id)
             if resolution is not None:
                 sources[asset.asset_id] = resolution.to_dict()
@@ -333,6 +417,7 @@ class Pipeline:
             assets,
             events_by_asset,
             transcripts,
+            audio_by_asset=audio_by_asset,
             sampling=self.sampling,
             model=self.config.vision_model,
             transcript_sources=sources,
@@ -365,6 +450,286 @@ class Pipeline:
         )
 
     # ------------------------------------------------------------------
+    # Recommendations
+    # ------------------------------------------------------------------
+
+    def recommend(
+        self,
+        timeline: Optional[StructureTimeline] = None,
+        *,
+        options: Optional[PlannerOptions] = None,
+        name: str = "structure",
+        save: bool = True,
+    ) -> RecommendationSet:
+        """Run the layered planner over a timeline."""
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        recommendations = plan_recommendations(timeline, options=options)
+
+        stats = recommendations.stats()
+        self.say(
+            f"{stats['total']} recommendation(s): {stats['accepted']} accepted, "
+            f"{len(recommendations.removed())} removed or softened by the "
+            "safety pass."
+        )
+        for warning in recommendations.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_recommendations(recommendations, name=name)
+        return recommendations
+
+    def write_recommendations(
+        self, recommendations: RecommendationSet, *, name: str = "structure"
+    ) -> Path:
+        self.config.recommendations_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.recommendations_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(recommendations.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_recommendations(self, *, name: str = "structure") -> RecommendationSet:
+        target = self.config.recommendations_dir / f"{name}.json"
+        if not target.exists():
+            raise EditingError(
+                f"No recommendations named '{name}' have been generated yet",
+                hint="Run `python -m editing.cli recommend` first.",
+            )
+        return RecommendationSet.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    # ------------------------------------------------------------------
+    # Draft Premiere plan (never executed)
+    # ------------------------------------------------------------------
+
+    def draft_plan(
+        self,
+        recommendations: Optional[RecommendationSet] = None,
+        *,
+        name: str = "structure",
+        save: bool = True,
+    ) -> DraftPlan:
+        """Convert accepted recommendations and validate them offline.
+
+        Executes nothing. The validation runs against ``premiere.validator``
+        at a fixed frame rate, so it needs neither Premiere nor the bridge.
+        """
+        if recommendations is None:
+            recommendations = self.load_recommendations(name=name)
+
+        paths = {asset.asset_id: asset.path for asset in self.assets}
+        if not paths:
+            try:
+                paths = {
+                    asset.asset_id: asset.path for asset in self.load_assets()
+                }
+            except FootageError:
+                paths = {}
+
+        draft = build_and_dry_run(recommendations, asset_paths=paths)
+        self.say(
+            f"Draft plan: {draft.operation_count} operation(s), dry run "
+            + ("valid" if draft.valid else "INVALID")
+            + f", {len(draft.not_convertible)} recommendation(s) kept without ops."
+        )
+        if draft.validation_error:
+            self.say(f"  ! {draft.validation_error.get('error')}")
+        for warning in draft.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_plan(draft, name=name)
+        return draft
+
+    def write_plan(self, draft: DraftPlan, *, name: str = "structure") -> Path:
+        self.config.plans_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.plans_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(draft.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def write_report(
+        self,
+        recommendations: RecommendationSet,
+        *,
+        timeline: Optional[StructureTimeline] = None,
+        draft: Optional[DraftPlan] = None,
+        name: str = "structure",
+        limit: int = 25,
+    ) -> Path:
+        text = report_module.render(
+            recommendations, timeline=timeline, draft=draft, limit=limit
+        )
+        self.config.recommendations_dir.mkdir(parents=True, exist_ok=True)
+        return report_module.write(
+            self.config.recommendations_dir / f"{name}.txt", text
+        )
+
+    # ------------------------------------------------------------------
+    # Rough cut
+    # ------------------------------------------------------------------
+
+    def rough_cut(
+        self,
+        *,
+        timeline: Optional[StructureTimeline] = None,
+        recommendations: Optional[RecommendationSet] = None,
+        options: Optional[RoughCutOptions] = None,
+        name: str = "structure",
+        validate: bool = True,
+        save: bool = True,
+    ) -> RoughCutPlan:
+        """Build a rough cut plan from the timeline and recommendations."""
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if recommendations is None:
+            recommendations = self.load_recommendations(name=name)
+        assets = self.assets or self._assets_or_empty()
+
+        plan = build_rough_cut(
+            timeline, recommendations,
+            assets=assets, options=options, validate=validate,
+        )
+
+        self.say(
+            f"Rough cut '{plan.sequence_name}': {len(plan.placements)} clip(s), "
+            f"{plan.total_duration:.1f}s from {plan.source_duration:.1f}s of "
+            f"footage, {plan.operation_count} operation(s)."
+        )
+        if validate:
+            self.say(
+                "  dry run: " + ("passed" if plan.dry_run_passed else "FAILED")
+            )
+            if plan.dry_run_error:
+                self.say(f"  ! {plan.dry_run_error.get('error')}")
+        for warning in plan.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_rough_cut(plan, name=name)
+        return plan
+
+    def _assets_or_empty(self) -> list:
+        try:
+            return self.load_assets()
+        except FootageError:
+            return []
+
+    def write_rough_cut(self, plan: RoughCutPlan, *, name: str = "structure") -> Path:
+        self.config.roughcut_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.roughcut_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_rough_cut(self, *, name: str = "structure") -> RoughCutPlan:
+        target = self.config.roughcut_dir / f"{name}.json"
+        if not target.exists():
+            raise EditingError(
+                f"No rough cut named '{name}' has been built yet",
+                hint="Run `python -m editing.cli roughcut build` first.",
+            )
+        return RoughCutPlan.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def run_rough_cut(
+        self,
+        plan: Optional[RoughCutPlan] = None,
+        *,
+        mode: str = "dry_run",
+        allow_active_sequence: bool = False,
+        name: str = "structure",
+        engine=None,
+        save: bool = True,
+    ) -> ExecutionReport:
+        """Carry a rough cut plan out to the depth ``mode`` allows."""
+        if plan is None:
+            plan = self.load_rough_cut(name=name)
+
+        report = roughcut_execute.run(
+            plan,
+            mode=mode,
+            bridge=self.bridge,
+            engine=engine,
+            allow_active_sequence=allow_active_sequence,
+        )
+
+        if report.refused_reason:
+            self.say(f"Refused: {report.refused_reason}")
+        elif report.executed:
+            self.say(
+                f"Executed {report.operations_succeeded}/"
+                f"{report.operations_attempted} operation(s) on "
+                f"'{plan.sequence_name}'."
+            )
+        elif mode == "dry_run":
+            self.say(
+                "Dry run " + ("passed" if report.dry_run_passed else "FAILED")
+                + f" ({plan.operation_count} operation(s)); nothing was executed."
+            )
+        if report.error:
+            self.say(f"  ! {report.error.get('error')}")
+
+        if save:
+            self.write_execution_report(report, name=name)
+            self.write_rough_cut(plan, name=name)
+        return report
+
+    def write_execution_report(
+        self, report: ExecutionReport, *, name: str = "structure"
+    ) -> Path:
+        self.config.roughcut_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.roughcut_dir / f"{name}.execution.json"
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_execution_report(self, *, name: str = "structure") -> ExecutionReport:
+        target = self.config.roughcut_dir / f"{name}.execution.json"
+        if not target.exists():
+            raise EditingError(
+                f"No execution report named '{name}' exists yet",
+                hint="Run `python -m editing.cli roughcut dry-run` or "
+                     "`roughcut execute` first.",
+            )
+        return ExecutionReport.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def review_frames(
+        self,
+        plan: Optional[RoughCutPlan] = None,
+        *,
+        name: str = "structure",
+        position: float = review_module.DEFAULT_POSITION,
+        width: int = review_module.DEFAULT_WIDTH,
+    ):
+        """Export one representative frame per clip in the cut."""
+        if plan is None:
+            plan = self.load_rough_cut(name=name)
+
+        review = review_module.export_frames(
+            plan, self.config, position=position, width=width
+        )
+        self.say(
+            f"{len(review)} review frame(s) exported for "
+            f"'{plan.sequence_name}'."
+        )
+        for warning in review.warnings:
+            self.say(f"  ! {warning}")
+        return review
+
+    # ------------------------------------------------------------------
     # Whole run
     # ------------------------------------------------------------------
 
@@ -393,7 +758,13 @@ class Pipeline:
         self.say(f"Found {len(assets)} file(s).")
 
         self.say("Resolving transcripts...")
-        self.transcripts(assets, use_premiere=use_premiere)
+        resolved = self.transcripts(assets, use_premiere=use_premiere)
+
+        self.say("Analysing audio...")
+        self.analyze_audio(assets, transcripts={
+            asset_id: resolution.transcript
+            for asset_id, resolution in resolved.items() if resolution.found
+        })
 
         self.analyze(
             assets,
@@ -406,21 +777,45 @@ class Pipeline:
         timeline = self.timeline(assets, use_premiere=use_premiere, **timeline_kwargs)
         return timeline
 
+    def run_full(
+        self,
+        *,
+        planner_options: Optional[PlannerOptions] = None,
+        **run_kwargs,
+    ) -> tuple[StructureTimeline, RecommendationSet, DraftPlan]:
+        """Everything: structure, recommendations, and a validated draft plan.
+
+        Still executes nothing -- the draft is validated and written, and
+        applying it stays a separate, human decision.
+        """
+        timeline = self.run(**run_kwargs)
+        self.write_timeline(timeline)
+        self.say("Planning recommendations...")
+        recommendations = self.recommend(timeline, options=planner_options)
+        self.say("Building draft Premiere plan...")
+        draft = self.draft_plan(recommendations)
+        self.write_report(recommendations, timeline=timeline, draft=draft)
+        return timeline, recommendations, draft
+
 
 def build_pipeline(
     config: EditingConfig,
     sampling: SamplingConfig,
+    audio: Optional[AudioConfig] = None,
     *,
     say: Reporter = _quiet,
     use_cache: bool = True,
     bridge=None,
     model=None,
+    audio_source=None,
 ) -> Pipeline:
     return Pipeline(
         config=config,
         sampling=sampling,
+        audio=(audio or AudioConfig()).validated(),
         cache=build_cache(config, enabled=use_cache),
         say=say,
         bridge=bridge,
         model=model,
+        audio_source=audio_source,
     )

@@ -184,6 +184,119 @@ class SamplingConfig:
 
 
 @dataclass(frozen=True)
+class AudioConfig:
+    """Thresholds for the audio event layer.
+
+    Like ``SamplingConfig``, this is serialised into every audio cache key, so
+    changing a threshold correctly re-analyses rather than mixing two different
+    analyses in one timeline.
+
+    The defaults are tuned for game-capture with live commentary, where the
+    voice sits well above the game bed. They are all *relative* to the file's
+    own median loudness wherever that is meaningful -- an absolute dBFS
+    threshold would behave completely differently on a quiet recording and a
+    hot one.
+
+    ``sample_interval``
+        Spacing of the loudness envelope. 0.25s is fine enough to catch a
+        shout and coarse enough to scan a 40-minute file quickly.
+    ``silence_threshold_db``
+        Absolute dBFS floor for "nothing is happening". Absolute rather than
+        relative on purpose: digital silence is digital silence.
+    ``min_silence_seconds``
+        Shorter quiet stretches are just gaps between words.
+    ``long_pause_seconds``
+        A transcript gap this long reads as dead air to a viewer.
+    ``spike_delta_db``
+        How far above the local baseline counts as a spike.
+    ``reaction_delta_db``
+        A larger jump, out of a quiet run-up: the "oh god" moment.
+    ``low_energy_delta_db``
+        How far *below* baseline counts as a boring-audio stretch.
+    ``clipping_db``
+        Peak level at which the signal is distorting.
+    ``laughter_min_bursts``
+        Loudness bursts within ``laughter_window`` needed to guess laughter.
+        Laughter is rhythmic; a single shout is not.
+    ``music_min_seconds``
+        Sustained energy with little speech, for this long, reads as music.
+    ``speech_dense_wps`` / ``speech_sparse_wps``
+        Words per second above/below which narration is notably fast or slow.
+    """
+
+    sample_interval: float = 0.25
+    silence_threshold_db: float = -45.0
+    min_silence_seconds: float = 0.8
+    long_pause_seconds: float = 2.5
+    spike_delta_db: float = 8.0
+    reaction_delta_db: float = 14.0
+    low_energy_delta_db: float = 10.0
+    clipping_db: float = -0.2
+    laughter_min_bursts: int = 3
+    laughter_window: float = 3.0
+    music_min_seconds: float = 6.0
+    speech_dense_wps: float = 3.4
+    speech_sparse_wps: float = 0.8
+    #: Minimum confidence an event needs to be kept at all.
+    min_confidence: float = 0.25
+    #: Ceiling on the confidence any purely-heuristic inference may claim.
+    #: The layer must not be able to assert laughter as strongly as silence.
+    max_inferred_confidence: float = 0.45
+
+    @classmethod
+    def from_env(cls) -> "AudioConfig":
+        return cls(
+            sample_interval=_env_float("EDITING_AUDIO_INTERVAL", 0.25),
+            silence_threshold_db=_env_float("EDITING_SILENCE_DB", -45.0),
+            min_silence_seconds=_env_float("EDITING_MIN_SILENCE", 0.8),
+            long_pause_seconds=_env_float("EDITING_LONG_PAUSE", 2.5),
+            spike_delta_db=_env_float("EDITING_SPIKE_DELTA_DB", 8.0),
+            reaction_delta_db=_env_float("EDITING_REACTION_DELTA_DB", 14.0),
+            low_energy_delta_db=_env_float("EDITING_LOW_ENERGY_DELTA_DB", 10.0),
+            clipping_db=_env_float("EDITING_CLIPPING_DB", -0.2),
+            music_min_seconds=_env_float("EDITING_MUSIC_MIN_SECONDS", 6.0),
+        )
+
+    def validated(self) -> "AudioConfig":
+        """Clamp to values the detectors can honour. Never raises."""
+        return replace(
+            self,
+            sample_interval=max(0.05, float(self.sample_interval)),
+            min_silence_seconds=max(0.1, float(self.min_silence_seconds)),
+            long_pause_seconds=max(0.5, float(self.long_pause_seconds)),
+            spike_delta_db=max(1.0, float(self.spike_delta_db)),
+            # A "reaction" must always be a bigger jump than a plain spike, or
+            # every spike would also register as a reaction.
+            reaction_delta_db=max(
+                max(1.0, float(self.spike_delta_db)) + 1.0,
+                float(self.reaction_delta_db),
+            ),
+            low_energy_delta_db=max(1.0, float(self.low_energy_delta_db)),
+            laughter_min_bursts=max(2, int(self.laughter_min_bursts)),
+            laughter_window=max(0.5, float(self.laughter_window)),
+            music_min_seconds=max(1.0, float(self.music_min_seconds)),
+            speech_dense_wps=max(0.1, float(self.speech_dense_wps)),
+            speech_sparse_wps=max(0.0, float(self.speech_sparse_wps)),
+            min_confidence=max(0.0, min(1.0, float(self.min_confidence))),
+            max_inferred_confidence=max(
+                0.05, min(1.0, float(self.max_inferred_confidence))
+            ),
+        )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "AudioConfig":
+        data = data or {}
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+    def cache_key_part(self) -> dict:
+        return self.validated().to_dict()
+
+
+@dataclass(frozen=True)
 class EditingConfig:
     """Paths, backend selection and limits for one editing session."""
 
@@ -250,6 +363,26 @@ class EditingConfig:
         return self.output_dir / "timelines"
 
     @property
+    def audio_dir(self) -> Path:
+        return self.output_dir / "audio"
+
+    @property
+    def recommendations_dir(self) -> Path:
+        return self.output_dir / "recommendations"
+
+    @property
+    def plans_dir(self) -> Path:
+        return self.output_dir / "plans"
+
+    @property
+    def roughcut_dir(self) -> Path:
+        return self.output_dir / "roughcut"
+
+    @property
+    def review_dir(self) -> Path:
+        return self.output_dir / "review"
+
+    @property
     def frames_dir(self) -> Path:
         return self.output_dir / "frames"
 
@@ -261,6 +394,8 @@ class EditingConfig:
         for directory in (
             self.output_dir, self.cache_dir, self.transcripts_dir,
             self.visual_dir, self.timelines_dir, self.frames_dir,
+            self.audio_dir, self.recommendations_dir, self.plans_dir,
+            self.roughcut_dir, self.review_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -274,8 +409,9 @@ class EditingConfig:
 def load_config(
     *,
     sampling: Optional[SamplingConfig] = None,
+    audio: Optional[AudioConfig] = None,
     **overrides,
-) -> tuple[EditingConfig, SamplingConfig]:
+) -> tuple[EditingConfig, SamplingConfig, AudioConfig]:
     """Build the (config, sampling) pair the whole layer is threaded with.
 
     Environment first, explicit keyword overrides second, so the CLI can beat
@@ -285,4 +421,8 @@ def load_config(
     clean = {k: v for k, v in overrides.items() if v is not None}
     if clean:
         config = replace(config, **clean)
-    return config, (sampling or SamplingConfig.from_env()).validated()
+    return (
+        config,
+        (sampling or SamplingConfig.from_env()).validated(),
+        (audio or AudioConfig.from_env()).validated(),
+    )
