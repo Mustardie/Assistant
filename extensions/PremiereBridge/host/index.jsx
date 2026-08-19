@@ -21,6 +21,7 @@
 #include "modules/effects.jsx"
 #include "modules/media.jsx"
 #include "modules/markers.jsx"
+#include "modules/transcript.jsx"
 #include "modules/caps.jsx"
 
 var NovaBridge = (function () {
@@ -112,6 +113,10 @@ var NovaBridge = (function () {
         'marker.remove':     function (p) { return NovaMarkers.remove(p); },
         'clip.copy_attributes':
                              function (p) { return NovaMarkers.copyAttributes(p); },
+
+        // -- transcript (read-only; Speech to Text / Transcript panel) ----
+        'transcript.caps':   function (p) { return NovaTranscript.caps(p); },
+        'transcript.read':   function (p) { return NovaTranscript.read(p); },
 
         // -- capability discovery ----------------------------------------
         'caps.probe':        function (p) { return NovaCaps.probe(p); },

@@ -1100,6 +1100,31 @@ _op(OpSpec(
 ))
 
 # --------------------------------------------------------------------------
+# Transcript (read-only): Premiere's Speech to Text / Transcript panel
+# --------------------------------------------------------------------------
+
+_op(OpSpec(
+    "transcript.caps", category="transcript", mutating=False, needs_sequence=False,
+    summary="Report which transcript access routes this Premiere build actually "
+            "exposes to scripting. Adobe documents none, so this is measured, "
+            "not assumed -- call it before transcript.read to know whether a "
+            "manual export from the Text panel will be needed.",
+    fields={},
+))
+
+_op(OpSpec(
+    "transcript.read", category="transcript", mutating=False, needs_sequence=False,
+    summary="Read Speech to Text / Transcript data for one project item. Returns "
+            "raw word markers plus their tick scale when Premiere has analysed "
+            "the item, and found=false (never invented timings) when it has "
+            "not. Grouping markers into lines happens on the Python side.",
+    fields={
+        "asset": F("string", required=True,
+                   doc="media path or project item name to read the transcript of"),
+    },
+))
+
+# --------------------------------------------------------------------------
 # Consistency: make other clips match one you already got right
 # --------------------------------------------------------------------------
 
