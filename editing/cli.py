@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Optional
 
 from editing import align
-from editing.config import SamplingConfig, load_config
+from editing.config import AudioConfig, SamplingConfig, load_config
 from editing.errors import EditingError
 from editing.pipeline import Pipeline, build_pipeline
 from editing.schema import StructureTimeline
@@ -86,9 +86,27 @@ def _sampling_from(args) -> SamplingConfig:
     return base.validated()
 
 
+def _audio_from(args) -> AudioConfig:
+    """Audio config from the environment, overridden by any CLI flags."""
+    base = AudioConfig.from_env()
+    overrides = {
+        "silence_threshold_db": getattr(args, "silence_db", None),
+        "min_silence_seconds": getattr(args, "min_silence", None),
+        "long_pause_seconds": getattr(args, "long_pause", None),
+        "spike_delta_db": getattr(args, "spike_db", None),
+        "sample_interval": getattr(args, "audio_interval", None),
+    }
+    clean = {key: value for key, value in overrides.items() if value is not None}
+    if clean:
+        from dataclasses import replace
+        base = replace(base, **clean)
+    return base.validated()
+
+
 def _pipeline(args) -> Pipeline:
-    config, sampling = load_config(
+    config, sampling, audio = load_config(
         sampling=_sampling_from(args),
+        audio=_audio_from(args),
         output_dir=Path(args.output_dir) if getattr(args, "output_dir", None) else None,
         vision_backend=getattr(args, "backend", None),
         vision_model=getattr(args, "model", None),
@@ -96,7 +114,7 @@ def _pipeline(args) -> Pipeline:
         use_premiere=(False if getattr(args, "no_premiere", False) else None),
     )
     return build_pipeline(
-        config, sampling,
+        config, sampling, audio,
         say=_reporter(args),
         use_cache=not getattr(args, "no_cache", False),
     )

@@ -30,8 +30,8 @@ from typing import Iterable, Optional, Sequence
 
 from editing.config import SCHEMA_VERSION, SamplingConfig
 from editing.schema import (
-    IMPORTANCE_WEIGHT, MediaAsset, StructureTimeline, TimelineSegment,
-    Transcript, TranscriptEntry, VisualEvent, short_hash,
+    IMPORTANCE_WEIGHT, AudioEvent, MediaAsset, StructureTimeline,
+    TimelineSegment, Transcript, TranscriptEntry, VisualEvent, short_hash,
 )
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,10 @@ class AlignmentVerdict:
 
 
 def classify_alignment(
-    events: Sequence[VisualEvent], said: str
+    events: Sequence[VisualEvent],
+    said: str,
+    *,
+    audio_events: Optional[Sequence[AudioEvent]] = None,
 ) -> AlignmentVerdict:
     """Decide whether narration and visuals agree, clash, or are unrelated.
 
@@ -170,9 +173,14 @@ def classify_alignment(
     where the player says "diamonds!" while mining diamonds is a match even
     though the narration is also excited. Only then are the contrast patterns
     tested, and anything left over with speech in it is neutral.
+
+    ``audio_events`` widens what counts as evidence. A wordless scream over a
+    creeper is a match even with an empty transcript -- the audio agrees with
+    the picture -- and that case is invisible to a purely text-based check.
     """
+    audio = list(audio_events or [])
     if not said.strip():
-        return AlignmentVerdict("unknown", "No speech in this segment.", [])
+        return _speechless_verdict(events, audio)
     if not events:
         return AlignmentVerdict("unknown", "No visual analysis for this segment.", [])
     if all(event.error for event in events):
@@ -192,6 +200,20 @@ def classify_alignment(
         for event in events
     )
     boring = all(event.importance == "boring" for event in events)
+
+    # An audible reaction is agreement in its own right: the player's voice
+    # spiking over a threat means narration and picture point the same way,
+    # whatever the words happened to be.
+    reaction = next(
+        (event for event in audio
+         if event.type in ("sudden_reaction", "possible_scream")), None
+    )
+    if reaction is not None and dangerous:
+        return AlignmentVerdict(
+            "match",
+            f"Audible reaction ({reaction.type}) over a dangerous moment.",
+            [f"audio:{reaction.type}"],
+        )
 
     # -- agreement -----------------------------------------------------
     hits: list[str] = []
@@ -251,9 +273,52 @@ def classify_alignment(
                 [f"elsewhere:{name}" for name in sorted(elsewhere)][:5],
             )
 
+    laughter = next(
+        (event for event in audio if event.type == "possible_laughter"), None
+    )
+    if laughter is not None and boring:
+        # Laughing at nothing on screen is the classic reaction-shot setup.
+        return AlignmentVerdict(
+            "contrast",
+            "Laughter over an uneventful shot "
+            f"({laughter.detection}, confidence {laughter.confidence:.2f}).",
+            [f"audio:{laughter.type}"],
+        )
+
     return AlignmentVerdict(
         "neutral", "Speech present but unrelated to what is on screen.", []
     )
+
+
+def _speechless_verdict(
+    events: Sequence[VisualEvent], audio: Sequence[AudioEvent]
+) -> AlignmentVerdict:
+    """Classify a segment with no words in it.
+
+    Silence is not an absence of information. A scream with no words is still
+    the audio agreeing with the picture; dead air over a dangerous moment is
+    still worth noting.
+    """
+    if not events:
+        return AlignmentVerdict("unknown", "No visual analysis for this segment.", [])
+
+    reaction = next(
+        (event for event in audio
+         if event.type in ("sudden_reaction", "possible_scream",
+                           "possible_laughter", "loudness_spike")), None
+    )
+    if reaction is not None:
+        return AlignmentVerdict(
+            "match",
+            f"No narration, but an audible {reaction.type.replace('possible_', '')} "
+            f"({reaction.detection}, confidence {reaction.confidence:.2f}).",
+            [f"audio:{reaction.type}"],
+        )
+    if any(event.type in ("silence", "long_pause", "low_energy") for event in audio):
+        return AlignmentVerdict(
+            "unknown", "Silent segment with no narration.", ["audio:silence"]
+        )
+    return AlignmentVerdict("unknown", "No speech in this segment.", [])
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +381,30 @@ def score_segment(
         score += 0.10
         reasons.append("threats: " + ", ".join(sorted(threats)[:4]))
 
+    # -- audio evidence -------------------------------------------------
+    # This is the whole point of the audio layer: a reaction can make a
+    # visually ordinary moment worth keeping, and dead air can sink a
+    # visually interesting one.
+    reaction = segment.audio_reaction
+    if reaction is not None:
+        bonus = 0.15 * reaction.confidence
+        score += bonus
+        reasons.append(
+            f"audio: {reaction.type} ({reaction.detection}, "
+            f"confidence {reaction.confidence:.2f})"
+        )
+
+    if segment.is_dead_air:
+        score -= 0.30
+        reasons.append("dead air: silent with no narration")
+
+    if any(event.type == "music_region" for event in segment.audio_events):
+        reasons.append("audio: steady music-like bed")
+
+    if any(event.type == "clipping" for event in segment.audio_events):
+        score -= 0.05
+        reasons.append("audio: clipping -- needs a level fix")
+
     if any(event.ui.death_screen for event in segment.events):
         score += 0.10
         reasons.append("death screen visible")
@@ -337,6 +426,8 @@ def score_segment(
         score >= threshold
         and segment.duration >= 1.0
         and not all(event.error for event in segment.events)
+        # Dead air is never usable footage, however interesting the picture is.
+        and not segment.is_dead_air
     )
     return score, usable, reasons
 
@@ -395,16 +486,20 @@ def build_segments(
     events: Sequence[VisualEvent],
     transcript: Optional[Transcript] = None,
     *,
+    audio_events: Optional[Sequence[AudioEvent]] = None,
     merge_similar: bool = True,
     max_segment_seconds: float = 30.0,
     usable_threshold: float = DEFAULT_USABLE_THRESHOLD,
 ) -> list[TimelineSegment]:
     """Build one asset's segments from its events and transcript."""
+    audio = list(audio_events or [])
     groups = group_events(
         events, merge_similar=merge_similar, max_segment_seconds=max_segment_seconds
     )
     if not groups and transcript is not None and len(transcript):
-        return _segments_from_transcript(asset, transcript, usable_threshold)
+        return _segments_from_transcript(
+            asset, transcript, usable_threshold, audio_events=audio
+        )
 
     segments: list[TimelineSegment] = []
     for group in groups:
@@ -414,6 +509,11 @@ def build_segments(
             transcript.entries_between(start, end) if transcript is not None else []
         )
         said = " ".join(entry.text for entry in entries if entry.text).strip()
+        # Audio events are attached by overlap, exactly like speech: an event
+        # straddling a boundary is audible over both segments.
+        heard = [
+            event for event in audio if event.overlaps(start, end) > 0.0
+        ]
 
         segment = TimelineSegment(
             segment_id="s_" + short_hash(asset.asset_id, round(start, 3), round(end, 3)),
@@ -424,8 +524,9 @@ def build_segments(
             said=said,
             speech_entries=list(entries),
             events=list(group),
+            audio_events=heard,
         )
-        verdict = classify_alignment(group, said)
+        verdict = classify_alignment(group, said, audio_events=heard)
         segment.alignment = verdict.kind
         segment.alignment_reason = verdict.reason
         segment.usefulness, segment.usable, segment.reasons = score_segment(
@@ -437,7 +538,11 @@ def build_segments(
 
 
 def _segments_from_transcript(
-    asset: MediaAsset, transcript: Transcript, usable_threshold: float
+    asset: MediaAsset,
+    transcript: Transcript,
+    usable_threshold: float,
+    *,
+    audio_events: Optional[Sequence[AudioEvent]] = None,
 ) -> list[TimelineSegment]:
     """Fall back to a speech-only timeline when there is no visual analysis.
 
@@ -446,6 +551,7 @@ def _segments_from_transcript(
     alignment and left un-usable, so it can never be mistaken for an analysed
     one.
     """
+    audio = list(audio_events or [])
     segments: list[TimelineSegment] = []
     for entry in transcript.entries:
         segment = TimelineSegment(
@@ -459,6 +565,10 @@ def _segments_from_transcript(
             said=entry.text,
             speech_entries=[entry],
             events=[],
+            audio_events=[
+                event for event in audio
+                if event.overlaps(entry.start, entry.end) > 0.0
+            ],
             alignment="unknown",
             alignment_reason="Speech only: this file has no visual analysis yet.",
             usefulness=0.0,
@@ -478,6 +588,7 @@ def build_timeline(
     events_by_asset: dict,
     transcripts_by_asset: Optional[dict] = None,
     *,
+    audio_by_asset: Optional[dict] = None,
     sampling: Optional[SamplingConfig] = None,
     model: str = "",
     transcript_sources: Optional[dict] = None,
@@ -493,6 +604,7 @@ def build_timeline(
     -- which is what makes two timelines diffable.
     """
     transcripts_by_asset = transcripts_by_asset or {}
+    audio_by_asset = audio_by_asset or {}
     collected: list[TimelineSegment] = []
     notes = list(warnings or [])
 
@@ -501,6 +613,7 @@ def build_timeline(
         transcript = transcripts_by_asset.get(asset.asset_id)
         segments = build_segments(
             asset, events, transcript,
+            audio_events=audio_by_asset.get(asset.asset_id),
             merge_similar=merge_similar,
             max_segment_seconds=max_segment_seconds,
             usable_threshold=usable_threshold,

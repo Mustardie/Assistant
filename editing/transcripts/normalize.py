@@ -44,8 +44,18 @@ _INLINE_SPEAKER = re.compile(r"^\s*(?:>>\s*)?(?P<speaker>[A-Z][\w .'-]{0,30}):\s
 _VTT_VOICE = re.compile(r"<v(?:\.[^ >]+)*\s+(?P<speaker>[^>]+)>(?P<text>.*?)(?:</v>)?$", re.S)
 _TAG = re.compile(r"</?[a-zA-Z][^>]*>")
 
-#: Cue-level noise that carries no speech.
-_NON_SPEECH = re.compile(r"^\s*[\[(](?:inaudible|music|silence|applause|laughter|noise)[\])]\s*$", re.I)
+#: Cue-level noise that carries no information at all, and is dropped.
+#:
+#: Deliberately narrow. ``[laughs]``, ``[music]`` and ``[applause]`` are NOT
+#: here: they are exactly the non-speech events the audio layer wants, and a
+#: transcriber writing one is far stronger evidence than any loudness
+#: heuristic. They survive normalisation so ``editing.audio.markers`` can find
+#: them. Only genuinely contentless cues are discarded.
+_NON_SPEECH = re.compile(
+    r"^\s*[\[(](?:inaudible|unintelligible|indistinct|silence|noise|"
+    r"background noise|no audio)[\])]\s*$",
+    re.I,
+)
 
 
 def _seconds(text: str) -> float:

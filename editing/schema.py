@@ -60,6 +60,58 @@ CAMERA_MOTIONS = (
 
 ALIGNMENT_KINDS = ("match", "contrast", "neutral", "unknown")
 
+# ---------------------------------------------------------------------------
+# Audio vocabularies
+# ---------------------------------------------------------------------------
+
+#: What an audio event is. Every name that involves interpreting a *sound* --
+#: rather than measuring one -- is prefixed ``possible_``, because that is the
+#: honest label for what a loudness heuristic can actually tell you. Silence
+#: and clipping are measured; laughter and screaming are guessed at.
+AUDIO_EVENT_TYPES = (
+    "silence",              # measured: below the floor for long enough
+    "long_pause",           # measured: a gap between transcript lines
+    "loudness_spike",       # measured: a jump above the local baseline
+    "sudden_reaction",      # measured: a spike out of near-silence
+    "speech_dense",         # measured: words-per-second well above normal
+    "speech_sparse",        # measured: words-per-second well below normal
+    "low_energy",           # measured: sustained quiet, but not silence
+    "clipping",             # measured: peak at or above 0 dBFS
+    "possible_laughter",    # guessed
+    "possible_scream",      # guessed
+    "music_region",         # guessed: sustained energy with little speech
+    "unknown",
+)
+
+#: What an audio event is worth to an editor.
+AUDIO_EDIT_VALUES = (
+    "boring", "tension", "comedy", "impact", "pause", "transition",
+    "emphasis", "unknown",
+)
+
+#: How the event was found. This is not decoration -- the safety pass weighs a
+#: transcript marker (a human or ASR literally wrote "[laughs]") far more
+#: heavily than a loudness heuristic, so the provenance has to survive.
+AUDIO_DETECTION_METHODS = (
+    "heuristic", "transcript_marker", "model", "manual", "unknown",
+)
+
+#: Default editing value per event type, before any context is applied.
+AUDIO_VALUE_FOR_TYPE = {
+    "silence": "pause",
+    "long_pause": "pause",
+    "loudness_spike": "impact",
+    "sudden_reaction": "impact",
+    "speech_dense": "emphasis",
+    "speech_sparse": "boring",
+    "low_energy": "boring",
+    "clipping": "unknown",
+    "possible_laughter": "comedy",
+    "possible_scream": "tension",
+    "music_region": "transition",
+    "unknown": "unknown",
+}
+
 TRANSCRIPT_SOURCES = (
     "premiere", "srt", "vtt", "txt", "json", "csv", "manual", "unknown",
 )
@@ -770,6 +822,125 @@ class VisualEvent:
 # Combined timeline
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Audio events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AudioEvent:
+    """Something audible worth an editor's attention.
+
+    Deliberately modest about what it claims. ``silence``, ``clipping`` and
+    ``loudness_spike`` are *measurements* and carry high confidence.
+    ``possible_laughter`` and ``possible_scream`` are *guesses* from a loudness
+    envelope, and are named and scored to say so -- a heuristic that has not
+    seen a transcript marker will not exceed ~0.45 confidence, and downstream
+    layers are built to treat that as weak evidence rather than fact.
+
+    ``loudness_db`` is dBFS (negative; 0.0 is full scale) and ``baseline_db``
+    is the file's own median level, because "loud" only means anything
+    relative to the rest of the recording.
+    """
+
+    event_id: str
+    source_file: str
+    asset_id: str = ""
+    start: float = 0.0
+    end: float = 0.0
+    type: str = "unknown"
+    confidence: float = 0.5
+    loudness_db: float = 0.0
+    peak_db: float = 0.0
+    baseline_db: float = 0.0
+    #: Words per second across this event, when a transcript was available.
+    speech_density: Optional[float] = None
+    edit_value: str = "unknown"
+    detection: str = "heuristic"
+    notes: str = ""
+    #: Free-form measurements behind the verdict, for debugging a bad call.
+    evidence: dict = field(default_factory=dict)
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+    @property
+    def is_measured(self) -> bool:
+        """True when the verdict is a measurement rather than an inference."""
+        return not self.type.startswith("possible_") and self.type != "music_region"
+
+    @property
+    def relative_db(self) -> float:
+        """How far above (or below) the file's own baseline this event sits."""
+        return self.loudness_db - self.baseline_db
+
+    def overlaps(self, start: float, end: float) -> float:
+        return max(0.0, min(self.end, end) - max(self.start, start))
+
+    def to_dict(self) -> dict:
+        return {
+            "event_id": self.event_id,
+            "source_file": self.source_file,
+            "asset_id": self.asset_id,
+            "start": round(self.start, 3),
+            "end": round(self.end, 3),
+            "duration": round(self.duration, 3),
+            "type": self.type,
+            "confidence": round(self.confidence, 3),
+            "loudness_db": round(self.loudness_db, 2),
+            "peak_db": round(self.peak_db, 2),
+            "baseline_db": round(self.baseline_db, 2),
+            "relative_db": round(self.relative_db, 2),
+            "speech_density": (
+                round(self.speech_density, 3)
+                if self.speech_density is not None else None
+            ),
+            "edit_value": self.edit_value,
+            "detection": self.detection,
+            "is_measured": self.is_measured,
+            "notes": self.notes,
+            "evidence": dict(self.evidence),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AudioEvent":
+        start = max(0.0, as_float(data.get("start")))
+        end = max(start, as_float(data.get("end"), start))
+        kind = _slug(data.get("type"))
+        if kind not in AUDIO_EVENT_TYPES:
+            kind = _coerce(kind, AUDIO_EVENT_TYPES)
+
+        value = _slug(data.get("edit_value"))
+        if value not in AUDIO_EDIT_VALUES:
+            value = AUDIO_VALUE_FOR_TYPE.get(kind, "unknown")
+
+        detection = _slug(data.get("detection") or data.get("method"))
+        if detection not in AUDIO_DETECTION_METHODS:
+            detection = "unknown"
+
+        density = data.get("speech_density")
+        return cls(
+            event_id=str(data.get("event_id") or short_hash(
+                data.get("source_file"), start, end, kind)),
+            source_file=str(data.get("source_file") or ""),
+            asset_id=str(data.get("asset_id") or ""),
+            start=start,
+            end=end,
+            type=kind,
+            confidence=clamp01(data.get("confidence", 0.5), 0.5),
+            loudness_db=as_float(data.get("loudness_db")),
+            peak_db=as_float(data.get("peak_db")),
+            baseline_db=as_float(data.get("baseline_db")),
+            speech_density=(
+                as_float(density) if density is not None else None
+            ),
+            edit_value=value,
+            detection=detection,
+            notes=str(data.get("notes") or "")[:1000],
+            evidence=dict(data.get("evidence") or {}),
+        )
+
+
 @dataclass
 class TimelineSegment:
     """One stretch of one file with both channels of information attached."""
@@ -782,6 +953,7 @@ class TimelineSegment:
     said: str = ""
     speech_entries: list[TranscriptEntry] = field(default_factory=list)
     events: list[VisualEvent] = field(default_factory=list)
+    audio_events: list[AudioEvent] = field(default_factory=list)
     #: "match" / "contrast" / "neutral" / "unknown" -- see ``editing.align``.
     alignment: str = "unknown"
     alignment_reason: str = ""
@@ -796,6 +968,44 @@ class TimelineSegment:
     @property
     def has_speech(self) -> bool:
         return bool(self.said.strip())
+
+    @property
+    def has_audio_events(self) -> bool:
+        return bool(self.audio_events)
+
+    def audio_types(self) -> set:
+        return {event.type for event in self.audio_events}
+
+    @property
+    def is_dead_air(self) -> bool:
+        """Silence or a long pause covering most of the segment, with no speech.
+
+        "Most" rather than "all" because a 0.4s cough inside eight seconds of
+        nothing does not make the stretch worth keeping.
+        """
+        if self.has_speech or not self.audio_events:
+            return False
+        quiet = sum(
+            event.duration for event in self.audio_events
+            if event.type in ("silence", "long_pause", "low_energy")
+        )
+        return self.duration > 0 and quiet >= self.duration * 0.6
+
+    @property
+    def audio_reaction(self) -> Optional["AudioEvent"]:
+        """The strongest reaction-style audio event here, if any.
+
+        This is what makes a visually ordinary moment interesting: a scream or
+        a burst of laughter over footage the vision model called "setup".
+        """
+        reactions = [
+            event for event in self.audio_events
+            if event.type in ("sudden_reaction", "possible_laughter",
+                              "possible_scream", "loudness_spike")
+        ]
+        if not reactions:
+            return None
+        return max(reactions, key=lambda event: event.confidence)
 
     @property
     def importance(self) -> str:
@@ -830,6 +1040,9 @@ class TimelineSegment:
             "said": self.said,
             "speech_entries": [entry.to_dict() for entry in self.speech_entries],
             "events": [event.to_dict() for event in self.events],
+            "audio_events": [event.to_dict() for event in self.audio_events],
+            "audio_types": sorted(self.audio_types()),
+            "is_dead_air": self.is_dead_air,
             "importance": self.importance,
             "alignment": self.alignment,
             "alignment_reason": self.alignment_reason,
@@ -856,6 +1069,10 @@ class TimelineSegment:
             ],
             events=[
                 VisualEvent.from_dict(event) for event in (data.get("events") or [])
+            ],
+            audio_events=[
+                AudioEvent.from_dict(event)
+                for event in (data.get("audio_events") or [])
             ],
             alignment=alignment if alignment in ALIGNMENT_KINDS else "unknown",
             alignment_reason=str(data.get("alignment_reason") or ""),

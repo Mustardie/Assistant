@@ -49,12 +49,26 @@ def test_srt_multiline_cue_is_joined():
     assert entries[0].text == "first line second line"
 
 
-def test_srt_skips_non_speech_cues():
+def test_srt_skips_contentless_cues():
     entries = normalize.parse_srt(
-        "1\n00:00:01,000 --> 00:00:02,000\n[music]\n\n"
+        "1\n00:00:01,000 --> 00:00:02,000\n[inaudible]\n\n"
         "2\n00:00:03,000 --> 00:00:04,000\nreal words\n"
     )
     assert [entry.text for entry in entries] == ["real words"]
+
+
+def test_srt_keeps_sound_markers_for_the_audio_layer():
+    """``[laughs]``/``[music]`` are evidence, not noise -- they must survive.
+
+    A transcriber naming a sound is stronger evidence than any loudness
+    heuristic, so ``editing.audio.markers`` needs these cues to still be here.
+    """
+    entries = normalize.parse_srt(
+        "1\n00:00:01,000 --> 00:00:02,000\n[laughs]\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n[music]\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nreal words\n"
+    )
+    assert [entry.text for entry in entries] == ["[laughs]", "[music]", "real words"]
 
 
 def test_inline_speaker_only_split_when_it_looks_like_a_name():

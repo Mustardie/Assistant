@@ -25,12 +25,15 @@ from typing import Callable, Optional, Sequence
 
 from editing import align
 from editing.cache import Cache, build_cache
-from editing.config import EditingConfig, SamplingConfig
+from editing.audio.analyzer import AudioAnalyzer, AudioResult
+from editing.config import AudioConfig, EditingConfig, SamplingConfig
 from editing.discovery import discover
 from editing.errors import EditingError, FootageError
 from editing.fingerprint import fingerprint
 from editing.premiere_link import ProjectSnapshot
-from editing.schema import MediaAsset, StructureTimeline, VisualEvent
+from editing.schema import (
+    AudioEvent, MediaAsset, StructureTimeline, VisualEvent,
+)
 from editing.transcripts import store as transcript_store
 from editing.visual.analyzer import AnalysisResult, VisualAnalyzer
 from editing.visual.qwen import build_model
@@ -51,16 +54,20 @@ class Pipeline:
 
     config: EditingConfig
     sampling: SamplingConfig
+    audio: AudioConfig = field(default_factory=AudioConfig)
     cache: Optional[Cache] = None
     say: Reporter = _quiet
     bridge: object = None
     model: object = None
+    #: Injected in tests to avoid FFmpeg; None means the real reader.
+    audio_source: object = None
 
     assets: list[MediaAsset] = field(default_factory=list)
     project: Optional[ProjectSnapshot] = None
 
     def __post_init__(self) -> None:
         self.sampling = self.sampling.validated()
+        self.audio = self.audio.validated()
         if self.cache is None:
             self.cache = build_cache(self.config)
         self.config.ensure_dirs()
@@ -285,6 +292,73 @@ class Pipeline:
         ]
 
     # ------------------------------------------------------------------
+    # Audio
+    # ------------------------------------------------------------------
+
+    def audio_analyzer(self) -> AudioAnalyzer:
+        return AudioAnalyzer(
+            self.config, self.audio, cache=self.cache, source=self.audio_source
+        )
+
+    def analyze_audio(
+        self,
+        assets: Optional[Sequence[MediaAsset]] = None,
+        *,
+        transcripts: Optional[dict] = None,
+        refresh: bool = False,
+    ) -> dict:
+        """Analyse audio into events. Returns ``{asset_id: AudioResult}``."""
+        assets = list(assets if assets is not None else self.assets)
+        if transcripts is None:
+            resolved = self.transcripts(assets)
+            transcripts = {
+                asset_id: resolution.transcript
+                for asset_id, resolution in resolved.items()
+                if resolution.found
+            }
+
+        analyzer = self.audio_analyzer()
+        results: dict = {}
+        for asset in assets:
+            result = analyzer.analyze_asset(
+                asset,
+                transcript=transcripts.get(asset.asset_id),
+                refresh=refresh,
+            )
+            results[asset.asset_id] = result
+            self.write_audio(asset, result)
+            self.say(
+                f"  {asset.filename}: {len(result.events)} audio event(s)"
+                + (" (cached)" if result.cached else "")
+            )
+            for warning in result.warnings:
+                self.say(f"    ! {warning}")
+        return results
+
+    def write_audio(self, asset: MediaAsset, result: AudioResult):
+        target = self.config.audio_dir / f"{asset.asset_id}.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_audio_events(self, asset: MediaAsset) -> list:
+        """Read an asset's saved audio events. Empty when never analysed."""
+        target = self.config.audio_dir / f"{asset.asset_id}.json"
+        if not target.exists():
+            return []
+        try:
+            document = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring unreadable audio file %s: %s", target, exc)
+            return []
+        return [
+            AudioEvent.from_dict(event) for event in (document.get("events") or [])
+        ]
+
+    # ------------------------------------------------------------------
     # Timeline
     # ------------------------------------------------------------------
 
@@ -307,6 +381,7 @@ class Pipeline:
         """
         assets = list(assets if assets is not None else self.assets)
         events_by_asset: dict = {}
+        audio_by_asset: dict = {}
         transcripts: dict = {}
         sources: dict = {}
         warnings: list[str] = []
@@ -323,6 +398,8 @@ class Pipeline:
                     f"{asset.filename}: no visual analysis on disk. Run "
                     "`analyze` for it."
                 )
+            audio_by_asset[asset.asset_id] = self.load_audio_events(asset)
+
             resolution = resolutions.get(asset.asset_id)
             if resolution is not None:
                 sources[asset.asset_id] = resolution.to_dict()
@@ -333,6 +410,7 @@ class Pipeline:
             assets,
             events_by_asset,
             transcripts,
+            audio_by_asset=audio_by_asset,
             sampling=self.sampling,
             model=self.config.vision_model,
             transcript_sources=sources,
@@ -393,7 +471,13 @@ class Pipeline:
         self.say(f"Found {len(assets)} file(s).")
 
         self.say("Resolving transcripts...")
-        self.transcripts(assets, use_premiere=use_premiere)
+        resolved = self.transcripts(assets, use_premiere=use_premiere)
+
+        self.say("Analysing audio...")
+        self.analyze_audio(assets, transcripts={
+            asset_id: resolution.transcript
+            for asset_id, resolution in resolved.items() if resolution.found
+        })
 
         self.analyze(
             assets,
@@ -410,17 +494,21 @@ class Pipeline:
 def build_pipeline(
     config: EditingConfig,
     sampling: SamplingConfig,
+    audio: Optional[AudioConfig] = None,
     *,
     say: Reporter = _quiet,
     use_cache: bool = True,
     bridge=None,
     model=None,
+    audio_source=None,
 ) -> Pipeline:
     return Pipeline(
         config=config,
         sampling=sampling,
+        audio=(audio or AudioConfig()).validated(),
         cache=build_cache(config, enabled=use_cache),
         say=say,
         bridge=bridge,
         model=model,
+        audio_source=audio_source,
     )
