@@ -31,6 +31,10 @@ from editing.discovery import discover
 from editing.errors import EditingError, FootageError
 from editing.fingerprint import fingerprint
 from editing.premiere_link import ProjectSnapshot
+from editing.recommend import report as report_module
+from editing.recommend.planner import PlannerOptions, plan_recommendations
+from editing.recommend.premiere_plan import DraftPlan, build_and_dry_run
+from editing.recommend.schema import RecommendationSet
 from editing.schema import (
     AudioEvent, MediaAsset, StructureTimeline, VisualEvent,
 )
@@ -443,6 +447,127 @@ class Pipeline:
         )
 
     # ------------------------------------------------------------------
+    # Recommendations
+    # ------------------------------------------------------------------
+
+    def recommend(
+        self,
+        timeline: Optional[StructureTimeline] = None,
+        *,
+        options: Optional[PlannerOptions] = None,
+        name: str = "structure",
+        save: bool = True,
+    ) -> RecommendationSet:
+        """Run the layered planner over a timeline."""
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        recommendations = plan_recommendations(timeline, options=options)
+
+        stats = recommendations.stats()
+        self.say(
+            f"{stats['total']} recommendation(s): {stats['accepted']} accepted, "
+            f"{len(recommendations.removed())} removed or softened by the "
+            "safety pass."
+        )
+        for warning in recommendations.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_recommendations(recommendations, name=name)
+        return recommendations
+
+    def write_recommendations(
+        self, recommendations: RecommendationSet, *, name: str = "structure"
+    ) -> Path:
+        self.config.recommendations_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.recommendations_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(recommendations.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_recommendations(self, *, name: str = "structure") -> RecommendationSet:
+        target = self.config.recommendations_dir / f"{name}.json"
+        if not target.exists():
+            raise EditingError(
+                f"No recommendations named '{name}' have been generated yet",
+                hint="Run `python -m editing.cli recommend` first.",
+            )
+        return RecommendationSet.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    # ------------------------------------------------------------------
+    # Draft Premiere plan (never executed)
+    # ------------------------------------------------------------------
+
+    def draft_plan(
+        self,
+        recommendations: Optional[RecommendationSet] = None,
+        *,
+        name: str = "structure",
+        save: bool = True,
+    ) -> DraftPlan:
+        """Convert accepted recommendations and validate them offline.
+
+        Executes nothing. The validation runs against ``premiere.validator``
+        at a fixed frame rate, so it needs neither Premiere nor the bridge.
+        """
+        if recommendations is None:
+            recommendations = self.load_recommendations(name=name)
+
+        paths = {asset.asset_id: asset.path for asset in self.assets}
+        if not paths:
+            try:
+                paths = {
+                    asset.asset_id: asset.path for asset in self.load_assets()
+                }
+            except FootageError:
+                paths = {}
+
+        draft = build_and_dry_run(recommendations, asset_paths=paths)
+        self.say(
+            f"Draft plan: {draft.operation_count} operation(s), dry run "
+            + ("valid" if draft.valid else "INVALID")
+            + f", {len(draft.not_convertible)} recommendation(s) kept without ops."
+        )
+        if draft.validation_error:
+            self.say(f"  ! {draft.validation_error.get('error')}")
+        for warning in draft.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_plan(draft, name=name)
+        return draft
+
+    def write_plan(self, draft: DraftPlan, *, name: str = "structure") -> Path:
+        self.config.plans_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.plans_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(draft.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def write_report(
+        self,
+        recommendations: RecommendationSet,
+        *,
+        timeline: Optional[StructureTimeline] = None,
+        draft: Optional[DraftPlan] = None,
+        name: str = "structure",
+        limit: int = 25,
+    ) -> Path:
+        text = report_module.render(
+            recommendations, timeline=timeline, draft=draft, limit=limit
+        )
+        self.config.recommendations_dir.mkdir(parents=True, exist_ok=True)
+        return report_module.write(
+            self.config.recommendations_dir / f"{name}.txt", text
+        )
+
+    # ------------------------------------------------------------------
     # Whole run
     # ------------------------------------------------------------------
 
@@ -489,6 +614,26 @@ class Pipeline:
         self.say("Building structure timeline...")
         timeline = self.timeline(assets, use_premiere=use_premiere, **timeline_kwargs)
         return timeline
+
+    def run_full(
+        self,
+        *,
+        planner_options: Optional[PlannerOptions] = None,
+        **run_kwargs,
+    ) -> tuple[StructureTimeline, RecommendationSet, DraftPlan]:
+        """Everything: structure, recommendations, and a validated draft plan.
+
+        Still executes nothing -- the draft is validated and written, and
+        applying it stays a separate, human decision.
+        """
+        timeline = self.run(**run_kwargs)
+        self.write_timeline(timeline)
+        self.say("Planning recommendations...")
+        recommendations = self.recommend(timeline, options=planner_options)
+        self.say("Building draft Premiere plan...")
+        draft = self.draft_plan(recommendations)
+        self.write_report(recommendations, timeline=timeline, draft=draft)
+        return timeline, recommendations, draft
 
 
 def build_pipeline(

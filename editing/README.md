@@ -1,14 +1,22 @@
-# Editing Brain V1 — Structure Layer
+# Editing Brain V1 — Structure + Recommendations
 
 Turns a folder of Minecraft footage into a machine-readable timeline of **what
-happens on screen** and **what is being said over it**.
+happens on screen**, **what is being said**, and **what is heard** — then
+proposes the edits worth making, with the evidence for each one.
 
 ```
-footage → Premiere mapping → transcript → Qwen3-VL vision → structure timeline
+footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
+                                                            ├→ structure timeline
+                                            audio events ──┘
+                                                    ↓
+                       six recommendation layers → safety pass
+                                                    ↓
+                    draft Premiere plan → offline dry-run (never executed)
 ```
 
-This layer makes no edits and no creative decisions. It produces the structured
-input a later editing layer will plan cuts from. Everything it writes is JSON.
+**Nothing here applies an edit.** The draft plan is built, validated offline and
+written to disk; running it is a separate decision for a person. Everything the
+layer writes is JSON, plus one plain-text report.
 
 ---
 
@@ -18,15 +26,25 @@ input a later editing layer will plan cuts from. Everything it writes is JSON.
 python -m editing.cli doctor                              # check FFmpeg / model / Premiere
 python -m editing.cli discover --folder D:/Footage/ep12   # find and map the footage
 python -m editing.cli transcript status                   # what transcript data exists
+python -m editing.cli audio                               # silence, spikes, reactions
 python -m editing.cli analyze                             # run Qwen3-VL over sampled windows
-python -m editing.cli timeline                            # combine into the structure timeline
-python -m editing.cli show --highlights                   # the moments worth looking at
+python -m editing.cli timeline                            # combine all three channels
+python -m editing.cli recommend --with-plan               # propose edits + dry-run a plan
+```
+
+Then read the results:
+
+```bash
+python -m editing.cli top          # the moments most worth using
+python -m editing.cli reactions    # moments the audio made interesting
+python -m editing.cli removed      # what the safety pass threw out, and why
+python -m editing.cli draft        # the draft Premiere plan (executes nothing)
 ```
 
 Or all of it in one call:
 
 ```bash
-python -m editing.cli run --folder D:/Footage/ep12
+python -m editing.cli run --folder D:/Footage/ep12 --recommend
 ```
 
 Try the whole pipeline without a GPU — real discovery, sampling, caching and
@@ -280,7 +298,127 @@ poison the results forever.
 
 ---
 
-## 4. The combined timeline
+## 4. Audio analysis
+
+Transcript alone misses a lot: laughter, screams, dead air, the silence right
+before something goes wrong. This layer reads the audio track alongside it.
+
+```bash
+python -m editing.cli audio
+```
+
+```
+17 audio event(s) across 1 file(s).
+  ep12.mp4: clipping=1, long_pause=4, loudness_spike=4, music_region=2,
+            possible_laughter=1, silence=1, speech_sparse=2, sudden_reaction=1
+```
+
+### What it measures, and what it guesses
+
+This distinction runs through the whole layer and is enforced in code, not just
+documented.
+
+| Type | Kind | Typical confidence |
+|---|---|---|
+| `silence`, `long_pause` | **measured** | 0.80–0.90 |
+| `loudness_spike`, `sudden_reaction` | **measured** | 0.75–0.80 |
+| `clipping` | **measured** | 0.85 |
+| `low_energy`, `speech_dense`, `speech_sparse` | **measured** | 0.65–0.70 |
+| `possible_laughter`, `possible_scream`, `music_region` | **inferred** | ≤ 0.45 |
+
+Anything inferred from the *shape* of a loudness curve is named `possible_*`
+where that applies and is capped by `AudioConfig.max_inferred_confidence`
+(default 0.45). The layer is structurally incapable of asserting laughter as
+confidently as it asserts silence. Every event carries `is_measured` so
+downstream code can branch on it.
+
+**This is not emotion detection and does not pretend to be.** A laughter
+cluster is "several short loud bursts close together", which is also what a
+stuttering engine or a burst of gunfire looks like.
+
+### Transcript markers beat heuristics
+
+When a transcript contains `[laughs]`, `[music]` or `[sighs]`, that event is
+recorded with `detection: "transcript_marker"` at confidence **0.85** — someone
+(or something trained on speech) listened and named the sound. A heuristic
+guess covering the same moment is dropped, so one laugh is not counted twice as
+evidence.
+
+This is why the transcript normaliser deliberately *keeps* marker-only cues
+instead of discarding them as non-speech. Only genuinely contentless cues
+(`[inaudible]`) are dropped.
+
+### How it works
+
+Two FFmpeg passes, both read-only:
+
+1. **`astats`** over a mono 8 kHz copy, reset every `sample_interval`, giving an
+   RMS/peak reading per 0.25s.
+2. **`silencedetect`**, which finds quiet stretches more precisely than
+   re-deriving them from the envelope.
+
+Then pure detectors run over that envelope. Two are worth calling out:
+
+- **A "sudden reaction" requires a quiet run-up.** A 15 dB jump inside an
+  already-loud fight is just more fight; the same jump out of near-silence is
+  the moment a viewer's head comes up.
+- **Music regions are cut at spikes, not discarded.** A steady bed interrupted
+  by one shout is still a bed either side of it.
+
+Everything is relative to the file's own **median** level. An absolute dBFS
+threshold behaves completely differently on a quiet recording and a hot one.
+
+Audio degrades honestly: no audio track, an undecodable codec, or FFmpeg
+missing all produce a stated warning and whatever transcript markers exist,
+rather than a silent empty result.
+
+### Tuning
+
+| Flag | Env | Default | Effect |
+|---|---|---|---|
+| `--silence-db` | `EDITING_SILENCE_DB` | -45 | dBFS floor for silence |
+| `--min-silence` | `EDITING_MIN_SILENCE` | 0.8s | Shortest silence worth reporting |
+| `--long-pause` | `EDITING_LONG_PAUSE` | 2.5s | Transcript gap that counts as dead air |
+| `--spike-db` | `EDITING_SPIKE_DELTA_DB` | 8 | dB above baseline that counts as a spike |
+| `--audio-interval` | `EDITING_AUDIO_INTERVAL` | 0.25s | Loudness sample spacing |
+
+### The audio event schema
+
+```json
+{
+  "event_id": "au_4f2c9a1b3d70",
+  "source_file": "D:/Footage/ep12/session_01.mp4",
+  "start": 41.0, "end": 43.0, "duration": 2.0,
+  "type": "possible_laughter",
+  "confidence": 0.85,
+  "loudness_db": -11.2, "peak_db": -2.0,
+  "baseline_db": -24.0, "relative_db": 12.8,
+  "speech_density": 1.5,
+  "edit_value": "comedy",
+  "detection": "transcript_marker",
+  "is_measured": false,
+  "notes": "transcript marker: [laughs]",
+  "evidence": { "marker": "laughs", "line": "[laughs] oh my god" }
+}
+```
+
+`edit_value` is what the event is worth to an editor: `boring`, `tension`,
+`comedy`, `impact`, `pause`, `transition`, `emphasis`.
+
+### What audio changes on the timeline
+
+Audio events attach to timeline segments by overlap, and genuinely change the
+verdicts:
+
+- a **wordless scream over a creeper** becomes `alignment: match` — invisible to
+  a text-only check
+- **laughter over an uneventful shot** becomes `contrast`
+- **dead air** scores 0.0 and is never `usable`, however good the picture is
+- an audible reaction **lifts** a visually ordinary moment
+
+---
+
+## 5. The combined timeline
 
 ```bash
 python -m editing.cli timeline
@@ -362,22 +500,190 @@ python -m editing.cli show --highlights      # usable segments, best first
 
 ---
 
-## 5. Where outputs go
+## 6. Edit recommendations
+
+```bash
+python -m editing.cli recommend --with-plan
+```
+
+Six layers run in order over the combined timeline. The first five propose
+generously; the sixth is strict, and that is where most of the quality comes
+from.
+
+| Layer | Decides |
+|---|---|
+| 1. **story** | What kind of moment is this? Markers on payoffs, reveals, danger, deaths; cuts where the story actually turns |
+| 2. **pacing** | Cut, trim dead air, **hold**, speed up, preserve anticipation before a payoff |
+| 3. **visual** | Punch-in, slow push-in, freeze frame, text overlay, caption emphasis |
+| 4. **audio** | Music cue, impact sound, comedic sting, ducking, audio fade (placeholders) |
+| 5. **polish** | Shadow lifts in caves, clipping fixes, "don't crop the HUD here" warnings |
+| 6. **safety** | Which of the above is actually a bad idea |
+
+House style is cinematic Minecraft: clean pacing, tension and payoff respected,
+punch-ins that mean something, readable text, no spam.
+
+### `hold` is a real answer
+
+A planner that can only say "cut here" will edit everything. `hold` is a
+first-class category: a payoff the viewer is already invested in gets an
+explicit *leave this alone*, and later layers respect it. Cutting into a moment
+to look busy is the most common way an edit gets worse.
+
+### The safety pass
+
+Six checks, cheapest and most certain first. **Nothing is deleted** — items are
+marked `rejected` or `downgraded` with a reason, so the output always shows what
+was considered.
+
+1. **No evidence** → rejected.
+2. **Transcript-only and contradicted** → rejected. If the words say
+   "terrifying" while the picture and audio are calm, the words are the weakest
+   of the three channels.
+3. **Covers gameplay** → rejected. A zoom or overlay over an open inventory, or
+   a punch-in that would crop visible low health out of frame.
+4. **Weak single-channel** → downgraded. One channel at low priority is a hunch.
+5. **Repetition** → downgraded. Same edit type within `--repeat-gap` (12s).
+6. **Density budget** → downgraded, weakest first, until active edits fit one
+   per `--budget-seconds` (20s) of footage.
+
+Markers and holds are exempt from 4–6: they change nothing, and an editor is
+well served by plenty of both.
+
+An edit pushed all the way down becomes a `hold` — the report keeps those
+separate from deliberate holds, so it never claims restraint the planner was
+actually forced into.
+
+```bash
+python -m editing.cli removed
+```
+
+```
+1 recommendation(s) removed or softened:
+  [rejected  ]  37.50s punch_in    Threat on screen (zombie)
+      why: Low health is visible and is the reason this moment is tense; a
+           zoom risks cropping the HUD out of frame.
+```
+
+### The recommendation schema
+
+```json
+{
+  "recommendation_id": "r_8c31f0a92e4d",
+  "asset_id": "a_3f8c21d0e4b7a915",
+  "source_file": "D:/Footage/ep12/session_01.mp4",
+  "start": 40.0, "end": 50.0, "duration": 10.0,
+  "category": "punch_in",
+  "priority": 0.7,
+  "reason": "Threat on screen (creeper)",
+  "evidence": {
+    "visual_event_ids": ["e_9f2c1a8b4d10"],
+    "transcript_quotes": ["this is completely safe nothing to worry about"],
+    "audio_event_ids": ["au_4f2c9a1b3d70"],
+    "audio_types": ["sudden_reaction"],
+    "channels": ["visual", "transcript", "audio"],
+    "summary": "Threat on screen (creeper)"
+  },
+  "intensity": "medium",
+  "effects": ["tension", "impact"],
+  "risks": ["hides_gameplay"],
+  "status": "accepted",
+  "status_reason": "",
+  "layer": "visual",
+  "premiere_ops": [],
+  "has_evidence": true,
+  "is_actionable": true
+}
+```
+
+Categories: `structure_cut`, `trim_dead_air`, `hold`, `punch_in`,
+`slow_push_in`, `speed_ramp`, `freeze_frame`, `text_overlay`,
+`caption_emphasis`, `marker`, `music_cue`, `sound_effect`, `ducking`,
+`audio_fade`, `color_adjust`, `transition`.
+
+Effects: `clarity`, `tension`, `comedy`, `impact`, `pacing`, `explanation`,
+`anticipation`, `payoff`. Risks: `over_editing`, `hides_gameplay`,
+`text_unreadable`, `bad_timing`, `unnecessary`, `low_confidence`,
+`audio_masking`, `repetitive`.
+
+### Tuning
+
+```bash
+python -m editing.cli recommend --budget-seconds 40   # calmer edit
+python -m editing.cli recommend --repeat-gap 20       # more spacing
+python -m editing.cli recommend --no-safety           # raw proposals, inspection only
+```
+
+`--no-safety` prints a loud warning and must not be used to build a plan.
+
+---
+
+## 7. The draft Premiere plan
+
+```bash
+python -m editing.cli draft
+```
+
+```
+Draft Premiere plan (structure)
+  operations     : 8
+  dry run        : valid
+  executed       : False  <- nothing has been applied
+  kept as recs   : 16
+```
+
+**Nothing is executed.** The plan is built in the existing `premiere.catalog`
+vocabulary, validated through `premiere.validator` at 30 fps **offline** — no
+Premiere, no bridge, no open project — and written to disk. The plan itself
+carries `dry_run: true`, so even a careless caller passing it to the engine
+would validate rather than edit.
+
+### What converts today, and what does not
+
+Recommendations are in **source file time**. Most Premiere operations act on
+**clips already on a sequence** — until the footage is assembled, a punch-in has
+no clip to apply itself to. Rather than emit operations that would fail or hit
+the wrong clip:
+
+- **`marker` and `structure_cut`** → `marker.add` on the **project item**, which
+  works in source time with no sequence at all. The marker comment carries the
+  reason, the evidence channels and the priority, so a human editor can judge it
+  in Premiere without opening any JSON.
+- **`hold`** → zero operations, deliberately. A hold means "do nothing here", so
+  no operations is the correct output, not a failure.
+- **Everything else** → kept as a recommendation, listed with the specific
+  reason it cannot convert yet.
+
+```
+  Kept as recommendations (no operation yet):
+    color_adjust       needs a clip on a sequence to apply Lumetri to
+    ducking            needs the music and speech clips on a sequence
+    music_cue          placeholder only -- no track has been chosen
+    punch_in           needs a clip on a sequence to animate Motion > Scale on
+```
+
+---
+
+## 8. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
 ```
 data/editing/
-├── assets.json                 discovered footage + Premiere mapping
-├── transcripts/<asset_id>.json normalised transcripts (durable)
-├── visual/<asset_id>.json      visual events + sampling plan + warnings
-├── timelines/structure.json    ← the deliverable
-├── frames/                     extracted JPEGs (deleted unless --keep-frames)
+├── assets.json                     discovered footage + Premiere mapping
+├── transcripts/<asset_id>.json     normalised transcripts (durable)
+├── visual/<asset_id>.json          visual events + sampling plan + warnings
+├── audio/<asset_id>.json           audio events + baseline + warnings
+├── timelines/structure.json        the combined timeline
+├── recommendations/structure.json  ← every recommendation, with evidence
+├── recommendations/structure.txt   ← the human-readable report
+├── plans/structure.json            ← draft Premiere plan + dry-run result
+├── frames/                         extracted JPEGs (deleted unless --keep-frames)
 └── cache/
-    ├── probe/    ffprobe results
-    ├── motion/   motion scans
+    ├── probe/       ffprobe results
+    ├── motion/      motion scans
+    ├── audio/       loudness analyses
     ├── transcript/
-    └── visual/   one JSON per analysed window
+    └── visual/      one JSON per analysed window
 ```
 
 Each stage writes as it goes, so an interrupted four-hour analysis loses
@@ -393,7 +699,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 6. Caching
+## 9. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -423,10 +729,10 @@ that window.
 
 ---
 
-## 7. Tests
+## 10. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 298 tests, ~1s
+python -m pytest tests/editing -q        # 450 tests, ~1.5s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -443,7 +749,22 @@ asserting on the same call shape the real component receives.
 | `test_editing_cache.py` | key construction, hit/miss, invalidation, corruption |
 | `test_editing_analyzer.py` | messy model output, failures, cache behaviour |
 | `test_editing_align.py` | match/contrast/neutral, scoring, merging |
+| `test_editing_audio.py` | detectors, confidence ceiling, markers, caching |
+| `test_editing_recommend.py` | layers, safety pass, dry-run, no execution |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
+
+Tests worth knowing about, because they pin the promises this layer makes:
+
+- `test_inferred_confidence_is_capped` — a guess can never claim as much
+  confidence as a measurement
+- `test_a_marker_supersedes_the_heuristic_guess` — one laugh is not counted twice
+- `test_safety_never_deletes` — rejected recommendations stay visible
+- `test_the_budget_removes_the_weakest_first` — the anti-trash pass drops the
+  least defensible ideas, not the last ones
+- `test_nothing_is_executed` / `test_no_cli_command_ever_executes_a_premiere_edit`
+  — asserted at both the plan and the CLI boundary
+- `test_premiere_mapping_is_read_only` — every op this layer issues is
+  non-mutating in the catalog
 
 ---
 
@@ -481,7 +802,38 @@ by design; a second model pass would be more accurate and much slower.
 **Audio is only used via the transcript.** No analysis of music, sound effects,
 laughter or volume — a scream over silence is invisible to this layer.
 
-**No editing.** By design. This layer describes footage; it does not cut it.
+**Audio inference is shallow.** Silence, clipping and spikes are solid.
+`possible_laughter` fires on any rhythmic burst pattern — a stuttering engine or
+gunfire will trigger it. `possible_scream` is "sustained and very loud".
+`music_region` is "steady, speech-free energy", which also describes rain, a
+generator or a long ambient stretch. All three are capped at 0.45 confidence and
+named to say so. If accuracy matters more than cost, feed the audio to a real
+classifier and write the results in with `detection: "model"` — the schema is
+already shaped for it.
+
+**Music/beat detection does not find beats.** It finds *regions*. There is no
+tempo estimation and no beat grid, so `music_cue` recommendations are placed at
+story boundaries, not on downbeats.
+
+**Recommendations are rules, not a model.** The planner is deterministic and
+free, which makes every suggestion traceable and tunable. It will miss things a
+model would catch — subtle comedic timing, running jokes, anything needing
+memory across an episode. A model pass can sit on top of these recommendations
+later without changing the schema.
+
+**The safety thresholds are opinions.** One active edit per 20 seconds, 12
+seconds between repeats — these are defaults for a cinematic style, not
+measured optima. Change them with `--budget-seconds` and `--repeat-gap`.
+
+**Most recommendations cannot become Premiere operations yet.** Only markers
+convert, because everything else needs the footage on a sequence. That is a real
+gap, reported per category rather than hidden.
+
+**Sound and music libraries are not wired up.** `music_cue`, `sound_effect` and
+`ducking` are placeholders with real timing and no chosen asset.
+
+**No editing.** By design. This layer describes footage and proposes edits; it
+does not cut anything, and it never executes the plan it writes.
 
 ---
 
@@ -501,4 +853,16 @@ laughter or volume — a scream over silence is invisible to this layer.
 | `EDITING_FFMPEG` / `EDITING_FFPROBE` | `ffmpeg` / `ffprobe` | Full paths if not on PATH |
 | `EDITING_USE_PREMIERE` | `true` | Talk to Premiere at all |
 
-Sampling variables are in the tuning table in section 3.
+Sampling variables are in the tuning table in section 3; audio variables in
+section 4.
+
+### Where `AI_Models/editingllm` fits
+
+`E:\Assistant\AI_Models\editingllm` holds model weights, model config, prompts
+and any future training data. **No importable Python lives there** — all code is
+in `E:\Assistant\editing`. To keep generated outputs and caches alongside the
+model data instead of in `data/editing`:
+
+```bash
+set EDITING_OUTPUT_DIR=E:\Assistant\AI_Models\editingllm\runs
+```

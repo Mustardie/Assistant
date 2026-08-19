@@ -35,6 +35,8 @@ from editing.config import AudioConfig, SamplingConfig, load_config
 from editing.errors import EditingError
 from editing.pipeline import Pipeline, build_pipeline
 from editing.schema import StructureTimeline
+from editing.recommend import report as report_module
+from editing.recommend.planner import PlannerOptions
 from editing.transcripts import premiere_source
 from editing.visual import qwen
 
@@ -309,6 +311,182 @@ def cmd_analyze(args) -> int:
     return EXIT_OK
 
 
+def cmd_audio(args) -> int:
+    pipeline = _pipeline(args)
+    assets = _assets_for(pipeline, args)
+    results = pipeline.analyze_audio(assets, refresh=args.refresh)
+
+    if args.json:
+        _emit({
+            "success": True,
+            "assets": {
+                asset.filename: results[asset.asset_id].to_dict()
+                for asset in assets
+            },
+        })
+        return EXIT_OK
+
+    total = sum(len(result.events) for result in results.values())
+    print(f"{total} audio event(s) across {len(assets)} file(s).")
+    for asset in assets:
+        result = results[asset.asset_id]
+        summary = result.summary()
+        if summary["by_type"]:
+            print(f"  {asset.filename}: " + ", ".join(
+                f"{name}={count}"
+                for name, count in sorted(summary["by_type"].items())
+            ))
+    print(f"Written to {pipeline.config.audio_dir}")
+    return EXIT_OK
+
+
+def cmd_recommend(args) -> int:
+    pipeline = _pipeline(args)
+    timeline = pipeline.load_timeline(name=args.name)
+    recommendations = pipeline.recommend(
+        timeline,
+        options=PlannerOptions(
+            budget_seconds=args.budget_seconds,
+            min_repeat_gap=args.repeat_gap,
+            skip_safety=args.no_safety,
+        ),
+        name=args.name,
+    )
+    draft = None
+    if args.with_plan:
+        draft = pipeline.draft_plan(recommendations, name=args.name)
+    report_path = pipeline.write_report(
+        recommendations, timeline=timeline, draft=draft, name=args.name
+    )
+
+    if args.json:
+        _emit({"success": True, "report": str(report_path),
+               **recommendations.to_dict()})
+        return EXIT_OK
+
+    print(report_module.render(
+        recommendations, timeline=timeline, draft=draft, limit=args.limit
+    ))
+    print(f"\nWritten to {pipeline.config.recommendations_dir}")
+    return EXIT_OK
+
+
+def cmd_top(args) -> int:
+    pipeline = _pipeline(args)
+    timeline = pipeline.load_timeline(name=args.name)
+    if args.json:
+        _emit({
+            "success": True,
+            "moments": [
+                segment.to_dict()
+                for segment in timeline.highlights(args.limit)
+            ],
+        })
+        return EXIT_OK
+    print(report_module.render_top_moments(timeline, limit=args.limit))
+    return EXIT_OK
+
+
+def cmd_reactions(args) -> int:
+    """Moments the audio layer made interesting on its own."""
+    pipeline = _pipeline(args)
+    timeline = pipeline.load_timeline(name=args.name)
+    reacting = [
+        segment for segment in timeline.segments
+        if segment.audio_reaction is not None
+    ]
+    reacting.sort(key=lambda s: s.audio_reaction.confidence, reverse=True)
+
+    if args.json:
+        _emit({
+            "success": True,
+            "count": len(reacting),
+            "moments": [
+                {
+                    "start": round(segment.start, 3),
+                    "end": round(segment.end, 3),
+                    "reaction": segment.audio_reaction.to_dict(),
+                    "importance": segment.importance,
+                    "said": segment.said,
+                    "usefulness": round(segment.usefulness, 3),
+                }
+                for segment in reacting[: args.limit]
+            ],
+        })
+        return EXIT_OK
+
+    if not reacting:
+        print("No audio reaction moments. Run `audio` if you have not yet.")
+        return EXIT_OK
+    print(f"{len(reacting)} audio reaction moment(s):")
+    for segment in reacting[: args.limit]:
+        reaction = segment.audio_reaction
+        print(
+            f"  [{segment.start:8.2f}-{segment.end:8.2f}] {reaction.type:<18}"
+            f" {reaction.detection:<18} conf={reaction.confidence:.2f}"
+        )
+        print(f"      picture: {segment.importance}; "
+              + (f'said "{segment.said[:50]}"' if segment.has_speech else "silent"))
+    return EXIT_OK
+
+
+def cmd_removed(args) -> int:
+    """What the safety pass took out, and why."""
+    pipeline = _pipeline(args)
+    recommendations = pipeline.load_recommendations(name=args.name)
+    removed = recommendations.removed()
+
+    if args.json:
+        _emit({
+            "success": True,
+            "count": len(removed),
+            "removed": [entry.to_dict() for entry in removed],
+        })
+        return EXIT_OK
+
+    if not removed:
+        print("The safety pass removed nothing.")
+        return EXIT_OK
+    print(f"{len(removed)} recommendation(s) removed or softened:")
+    for entry in removed[: args.limit]:
+        print(f"  [{entry.status:<10}] {entry.start:8.2f}s {entry.category:<16} "
+              f"{entry.reason[:44]}")
+        print(f"      why: {entry.status_reason}")
+    return EXIT_OK
+
+
+def cmd_draft(args) -> int:
+    """Build the draft Premiere plan and dry-run it. Executes nothing."""
+    pipeline = _pipeline(args)
+    recommendations = pipeline.load_recommendations(name=args.name)
+    draft = pipeline.draft_plan(recommendations, name=args.name)
+
+    if args.json:
+        _emit({"success": True, **draft.to_dict()})
+        return EXIT_OK
+
+    print(f"Draft Premiere plan ({args.name})")
+    print(f"  operations     : {draft.operation_count}")
+    print(f"  dry run        : {'valid' if draft.valid else 'INVALID'}")
+    print(f"  executed       : {draft.executed}  <- nothing has been applied")
+    print(f"  kept as recs   : {len(draft.not_convertible)}")
+    if draft.validation_error:
+        print(f"  error          : {draft.validation_error.get('error')}")
+        if draft.validation_error.get("hint"):
+            print(f"  hint           : {draft.validation_error['hint']}")
+    for line in draft.explanation[: args.limit]:
+        print(f"    {line}")
+    if draft.not_convertible:
+        print("\n  Kept as recommendations (no operation yet):")
+        seen: dict = {}
+        for entry in draft.not_convertible:
+            seen.setdefault(entry["category"], entry["reason"])
+        for category, reason in sorted(seen.items()):
+            print(f"    {category:<18} {reason}")
+    print(f"\nWritten to {pipeline.config.plans_dir / (args.name + '.json')}")
+    return EXIT_OK
+
+
 def cmd_timeline(args) -> int:
     pipeline = _pipeline(args)
     assets = _assets_for(pipeline, args)
@@ -469,6 +647,37 @@ def cmd_doctor(args) -> int:
 
 def cmd_run(args) -> int:
     pipeline = _pipeline(args)
+    if args.recommend:
+        timeline, recommendations, draft = pipeline.run_full(
+            planner_options=PlannerOptions(
+                budget_seconds=args.budget_seconds,
+                min_repeat_gap=args.repeat_gap,
+                skip_safety=args.no_safety,
+            ),
+            folder=args.folder,
+            files=args.file or None,
+            recursive=not args.no_recursive,
+            keep_frames=args.keep_frames,
+            use_motion=not args.no_motion,
+            max_windows=args.max_windows,
+            use_premiere=(False if args.no_premiere else None),
+            merge_similar=not args.no_merge,
+            max_segment_seconds=args.max_segment_seconds,
+            usable_threshold=args.threshold,
+        )
+        if args.json:
+            _emit({
+                "success": True,
+                "timeline": timeline.to_dict(),
+                "recommendations": recommendations.to_dict(),
+                "draft_plan": draft.to_dict(),
+            })
+            return EXIT_OK
+        print(report_module.render(
+            recommendations, timeline=timeline, draft=draft, limit=args.limit
+        ))
+        return EXIT_OK
+
     timeline = pipeline.run(
         folder=args.folder,
         files=args.file or None,
@@ -589,16 +798,24 @@ def _add_model(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m editing.cli",
-        description="Editing Brain V1 -- footage structure layer. Produces a "
-                    "machine-readable timeline of what happens in Minecraft "
-                    "footage and what is said over it. Makes no edits.",
+        description="Editing Brain V1 -- footage structure and edit "
+                    "recommendations. Produces a machine-readable timeline of "
+                    "what happens in Minecraft footage, what is said and heard "
+                    "over it, and which edits would be worth making. Proposes "
+                    "only: it never applies an edit.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Typical first run:\n"
                "  python -m editing.cli doctor\n"
                "  python -m editing.cli discover --folder D:/Footage/ep12\n"
                "  python -m editing.cli transcript status\n"
+               "  python -m editing.cli audio\n"
                "  python -m editing.cli analyze\n"
-               "  python -m editing.cli timeline\n",
+               "  python -m editing.cli timeline\n"
+               "  python -m editing.cli recommend --with-plan\n"
+               "\nOr all of it at once:\n"
+               "  python -m editing.cli run --folder D:/Footage/ep12 --recommend\n"
+               "\nNothing here applies an edit. `draft` validates a Premiere\n"
+               "plan offline; running it stays a separate, human decision.\n",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -678,6 +895,76 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(timeline)
     timeline.set_defaults(func=cmd_timeline)
 
+    # -- audio ----------------------------------------------------------
+    audio = subparsers.add_parser(
+        "audio", help="detect audio events (silence, spikes, reactions)")
+    audio.add_argument("--refresh", action="store_true",
+                       help="re-analyse even if a cached result exists")
+    audio.add_argument("--silence-db", type=float,
+                       help="dBFS floor for silence (default -45)")
+    audio.add_argument("--min-silence", type=float,
+                       help="shortest silence worth reporting (default 0.8s)")
+    audio.add_argument("--long-pause", type=float,
+                       help="transcript gap that counts as dead air (default 2.5s)")
+    audio.add_argument("--spike-db", type=float,
+                       help="dB above baseline that counts as a spike (default 8)")
+    audio.add_argument("--audio-interval", type=float,
+                       help="loudness sample spacing in seconds (default 0.25)")
+    _add_selection(audio)
+    _add_common(audio)
+    audio.set_defaults(func=cmd_audio)
+
+    # -- recommend ------------------------------------------------------
+    recommend = subparsers.add_parser(
+        "recommend", help="generate layered edit recommendations")
+    recommend.add_argument("--name", default="structure")
+    recommend.add_argument("--limit", type=int, default=25)
+    recommend.add_argument(
+        "--budget-seconds", type=float, default=20.0,
+        help="seconds of footage per permitted active edit; higher is calmer "
+             "(default 20)")
+    recommend.add_argument(
+        "--repeat-gap", type=float, default=12.0,
+        help="minimum seconds between two edits of the same kind (default 12)")
+    recommend.add_argument(
+        "--no-safety", action="store_true",
+        help="skip the anti-trash pass -- for inspecting raw proposals only; "
+             "the result must not be used to build a plan")
+    recommend.add_argument("--with-plan", action="store_true",
+                           help="also build and dry-run the draft Premiere plan")
+    _add_common(recommend)
+    recommend.set_defaults(func=cmd_recommend)
+
+    # -- top / reactions / removed --------------------------------------
+    top = subparsers.add_parser("top", help="the moments most worth using")
+    top.add_argument("--name", default="structure")
+    top.add_argument("--limit", type=int, default=20)
+    _add_common(top)
+    top.set_defaults(func=cmd_top)
+
+    reactions = subparsers.add_parser(
+        "reactions", help="moments the audio made interesting")
+    reactions.add_argument("--name", default="structure")
+    reactions.add_argument("--limit", type=int, default=20)
+    _add_common(reactions)
+    reactions.set_defaults(func=cmd_reactions)
+
+    removed = subparsers.add_parser(
+        "removed", help="what the safety pass took out, and why")
+    removed.add_argument("--name", default="structure")
+    removed.add_argument("--limit", type=int, default=40)
+    _add_common(removed)
+    removed.set_defaults(func=cmd_removed)
+
+    # -- draft ----------------------------------------------------------
+    draft = subparsers.add_parser(
+        "draft",
+        help="build the draft Premiere plan and dry-run it (executes nothing)")
+    draft.add_argument("--name", default="structure")
+    draft.add_argument("--limit", type=int, default=30)
+    _add_common(draft)
+    draft.set_defaults(func=cmd_draft)
+
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")
     show.add_argument("--name", default="structure")
@@ -733,6 +1020,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--threshold", type=float,
                      default=align.DEFAULT_USABLE_THRESHOLD)
     run.add_argument("--limit", type=int, default=60)
+    run.add_argument("--recommend", action="store_true",
+                     help="also plan recommendations and dry-run a draft plan")
+    run.add_argument("--budget-seconds", type=float, default=20.0)
+    run.add_argument("--repeat-gap", type=float, default=12.0)
+    run.add_argument("--no-safety", action="store_true", help=argparse.SUPPRESS)
     _add_selection(run)
     _add_sampling(run)
     _add_model(run)

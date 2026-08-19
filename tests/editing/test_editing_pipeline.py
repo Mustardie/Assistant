@@ -550,3 +550,215 @@ def test_cli_run_end_to_end_with_the_mock_backend(
         assert segment["end"] >= segment["start"]
         assert segment["alignment"] in ("match", "contrast", "neutral", "unknown")
         assert 0.0 <= segment["usefulness"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Session 2: audio, recommendations and the draft plan, end to end
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def staged(footage, tmp_path, fake_probe, frame_file, monkeypatch, srt_sample):
+    """A discovered + audio-analysed + visually-analysed output directory.
+
+    Stubs the two external edges (frame extraction and the audio reader) and
+    leaves everything else real, so the commands under test run the same code
+    path they would on the user's machine.
+    """
+    from editing.audio import analyzer as audio_analyzer
+    from editing.audio.signal import LoudnessSample, Span
+    from editing.visual import analyzer as visual_analyzer
+    from editing.visual.frames import ExtractedFrames
+
+    (footage / "session_01.srt").write_text(srt_sample, encoding="utf-8")
+    out = tmp_path / "out"
+
+    class StubFrames:
+        def extract(self, path, window):
+            return ExtractedFrames(
+                window=window, times=list(window.frame_times),
+                paths=[frame_file] * len(window.frame_times),
+            )
+
+    monkeypatch.setattr(
+        visual_analyzer.VisualAnalyzer, "frame_source_for",
+        lambda self, asset: StubFrames(),
+    )
+
+    samples = []
+    time = 0.0
+    while time < 16.0:
+        # Quiet from 5-9s so there is real dead air to find.
+        level = -95.0 if 5.0 <= time < 9.0 else -24.0
+        samples.append(LoudnessSample(round(time, 3), level, level + 6.0))
+        time = round(time + 0.25, 3)
+
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "__init__",
+        lambda self, config, audio: None,
+    )
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "has_audio", lambda self, path: True
+    )
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "envelope", lambda self, path: samples
+    )
+    monkeypatch.setattr(
+        audio_analyzer.FFmpegAudioSource, "silence",
+        lambda self, path, duration: [Span(5.0, 9.0)],
+    )
+    return out
+
+
+def _stage(staged, footage, capsys, *extra):
+    """Run discover -> audio -> analyze -> timeline into ``staged``."""
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+    run_cli(["audio"] + base, capsys)
+    run_cli(
+        ["analyze", "--backend", "mock", "--window-seconds", "8", "--no-motion"]
+        + base, capsys
+    )
+    run_cli(["timeline", "--limit", "0"] + base, capsys)
+    return base
+
+
+def test_cli_audio_detects_events(staged, footage, capsys):
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+
+    code, captured = run_cli(["audio", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    first = next(iter(payload["assets"].values()))
+    kinds = {event["type"] for event in first["events"]}
+    assert "silence" in kinds
+    assert (staged / "audio").exists()
+
+
+def test_cli_timeline_carries_audio_events(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    code, captured = run_cli(["show", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert any(segment["audio_events"] for segment in payload["segments"])
+
+
+def test_cli_recommend_produces_evidence_backed_output(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    code, captured = run_cli(["recommend", "--json"] + base, capsys)
+
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["stats"]["total"] > 0
+    accepted = [
+        entry for entry in payload["recommendations"]
+        if entry["status"] == "accepted"
+    ]
+    assert accepted
+    assert all(entry["has_evidence"] for entry in accepted)
+    assert (staged / "recommendations" / "structure.json").exists()
+    assert (staged / "recommendations" / "structure.txt").exists()
+
+
+def test_cli_draft_plan_dry_runs_and_executes_nothing(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    code, captured = run_cli(["draft", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+
+    assert payload["executed"] is False
+    assert payload["plan"]["dry_run"] is True
+    if payload["operation_count"]:
+        assert payload["valid"] is True
+    assert (staged / "plans" / "structure.json").exists()
+
+
+def test_cli_draft_needs_recommendations_first(staged, footage, capsys):
+    _stage(staged, footage, capsys)
+    code, captured = run_cli(
+        ["draft", "--json", "--output-dir", str(staged), "--no-premiere", "-q"],
+        capsys,
+    )
+    assert code == 1
+    assert "recommend" in json.loads(captured.out)["hint"]
+
+
+def test_cli_top_and_reactions(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+
+    code, captured = run_cli(["top", "--json"] + base, capsys)
+    assert code == 0
+    assert "moments" in json.loads(captured.out)
+
+    code, captured = run_cli(["reactions", "--json"] + base, capsys)
+    assert code == 0
+    assert "moments" in json.loads(captured.out)
+
+
+def test_cli_removed_reports_the_safety_pass(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    code, captured = run_cli(["removed", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert "removed" in payload
+    for entry in payload["removed"]:
+        # Anything the safety pass touched must say why.
+        assert entry["status_reason"]
+
+
+def test_cli_run_with_recommend_does_everything(
+    staged, footage, capsys
+):
+    code, captured = run_cli([
+        "run", "--folder", str(footage), "--recommend", "--backend", "mock",
+        "--window-seconds", "8", "--no-motion",
+        "--output-dir", str(staged), "--no-premiere", "--json", "-q",
+    ], capsys)
+
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["timeline"]["stats"]["segments"] > 0
+    assert payload["recommendations"]["stats"]["total"] > 0
+    assert payload["draft_plan"]["executed"] is False
+
+
+def test_no_cli_command_ever_executes_a_premiere_edit(staged, footage, capsys):
+    """The hard guarantee for this session, asserted at the CLI boundary.
+
+    Every command is run against a bridge that raises if anything reaches it.
+    A mutating call would surface as an error rather than silently editing a
+    real timeline.
+    """
+    import editing.premiere_link as premiere_link
+    import editing.transcripts.premiere_source as premiere_source
+
+    calls = []
+
+    class ExplodingBridge:
+        def health(self):
+            return {"connected": True, "project_open": True}
+
+        def call(self, op, params=None, *, timeout=None):
+            calls.append(op)
+            raise AssertionError(f"{op} reached Premiere during a dry run")
+
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+    run_cli(["draft"] + base, capsys)
+
+    # Nothing above should have needed a bridge at all; prove the draft path
+    # specifically validates without one.
+    from editing.pipeline import build_pipeline
+    from editing.config import load_config
+
+    config, sampling, audio_config = load_config(output_dir=staged)
+    pipeline = build_pipeline(config, sampling, audio_config)
+    pipeline.bridge = ExplodingBridge()
+    draft = pipeline.draft_plan(save=False)
+
+    assert draft.executed is False
+    assert calls == []

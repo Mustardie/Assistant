@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import pytest
 
-from editing.config import EditingConfig, SamplingConfig
+from editing.config import AudioConfig, EditingConfig, SamplingConfig
 from editing.cache import Cache
-from editing.schema import MediaAsset, TimeRange, VisualEvent
+from editing.audio.signal import LoudnessSample, Span
+from editing.schema import AudioEvent, MediaAsset, TimeRange, VisualEvent
 from editing.visual.frames import ExtractedFrames
 
 
@@ -55,6 +56,103 @@ def sampling() -> SamplingConfig:
 @pytest.fixture
 def cache(tmp_path) -> Cache:
     return Cache(root=tmp_path / "cache")
+
+
+@pytest.fixture
+def audio_config() -> AudioConfig:
+    """Exact, round numbers so detected spans are easy to assert on."""
+    return AudioConfig(
+        sample_interval=0.25,
+        silence_threshold_db=-45.0,
+        min_silence_seconds=0.5,
+        long_pause_seconds=2.0,
+        spike_delta_db=8.0,
+        reaction_delta_db=14.0,
+        low_energy_delta_db=10.0,
+        music_min_seconds=4.0,
+    ).validated()
+
+
+def envelope(*blocks, interval: float = 0.25):
+    """Build a loudness envelope from ``(start, end, rms_db[, peak_db])`` blocks.
+
+    Writing test audio as level-over-time blocks keeps the detector tests
+    readable: the shape being asserted on is visible in the call.
+    """
+    samples: list[LoudnessSample] = []
+    for block in blocks:
+        start, end, rms = block[0], block[1], block[2]
+        peak = block[3] if len(block) > 3 else rms + 6.0
+        time = start
+        while time < end - 1e-9:
+            samples.append(LoudnessSample(round(time, 3), rms, peak))
+            time = round(time + interval, 3)
+    return samples
+
+
+@pytest.fixture
+def make_envelope():
+    return envelope
+
+
+def make_audio_event(
+    start: float,
+    end: float,
+    kind: str,
+    *,
+    confidence: float = 0.8,
+    detection: str = "heuristic",
+    asset_id: str = "a_test",
+    source_file: str = "/footage/clip.mp4",
+    edit_value: str = "",
+) -> AudioEvent:
+    from editing.schema import AUDIO_VALUE_FOR_TYPE
+
+    return AudioEvent(
+        event_id=f"au_{start}_{kind}",
+        source_file=source_file,
+        asset_id=asset_id,
+        start=start,
+        end=end,
+        type=kind,
+        confidence=confidence,
+        detection=detection,
+        loudness_db=-10.0,
+        baseline_db=-24.0,
+        edit_value=edit_value or AUDIO_VALUE_FOR_TYPE.get(kind, "unknown"),
+    )
+
+
+@pytest.fixture
+def audio_event_factory():
+    return make_audio_event
+
+
+class StubAudioSource:
+    """Stands in for the two FFmpeg audio passes."""
+
+    def __init__(self, samples=(), silence=(), has_audio=True):
+        self.samples = list(samples)
+        self.silence_spans = list(silence)
+        self._has_audio = has_audio
+        self.calls = 0
+
+    def has_audio(self, path):
+        return self._has_audio
+
+    def envelope(self, path):
+        self.calls += 1
+        return list(self.samples)
+
+    def silence(self, path, duration):
+        return list(self.silence_spans)
+
+
+@pytest.fixture
+def audio_source_factory():
+    def make(samples=(), silence=(), has_audio=True):
+        return StubAudioSource(samples, silence, has_audio)
+    return make
 
 
 # ---------------------------------------------------------------------------
