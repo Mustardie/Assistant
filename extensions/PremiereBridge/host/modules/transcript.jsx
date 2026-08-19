@@ -157,7 +157,9 @@ var NovaTranscript = (function () {
 
         // Only a Speech/transcript track is of interest -- a Comment or Chapter
         // marker track would otherwise be mistaken for dialogue.
-        if (!/trackType\s*[=>]\s*"?\s*(Speech|Transcript)/i.test(block)) {
+        // Matches both the attribute form (trackType="Speech") and the element
+        // form (<xmpDM:trackType>Speech<) -- Premiere writes either.
+        if (!/trackType\s*[>=]\s*"?\s*(Speech|Transcript)/i.test(block)) {
             return null;
         }
 

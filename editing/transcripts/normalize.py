@@ -65,15 +65,36 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+#: Words that open a sentence and are followed by a colon often enough to be
+#: mistaken for a speaker label ("Okay: let's go"). Checked case-insensitively.
+_NOT_SPEAKERS = frozenset({
+    "okay", "ok", "so", "and", "but", "well", "now", "yeah", "yes", "no",
+    "right", "alright", "anyway", "actually", "first", "second", "then",
+    "wait", "oh", "look", "listen", "honestly", "basically", "obviously",
+    "remember", "note", "warning", "tip", "step", "update", "edit",
+})
+
+
 def _split_speaker(text: str) -> tuple[str, str]:
-    """Pull a leading ``Speaker:`` off a cue. Returns (speaker, text)."""
+    """Pull a leading ``Speaker:`` off a cue. Returns (speaker, text).
+
+    Deliberately conservative. A false positive here invents a speaker that
+    never existed and eats the first word of the line, so anything that could
+    plausibly be ordinary prose is left alone: the label must be short, must
+    look like a name (title case, all caps, or "Speaker 2"), and must not be
+    one of the discourse words that habitually precede a colon.
+    """
     match = _INLINE_SPEAKER.match(text)
     if not match:
         return "", text
     speaker = match.group("speaker").strip()
-    # A sentence like "Okay: let's go" must not become a speaker named "Okay".
-    # Real speaker labels are short and either titled or all-caps.
-    if len(speaker.split()) > 3 or not (speaker.istitle() or speaker.isupper()):
+    if len(speaker.split()) > 3:
+        return "", text
+    if not (speaker.istitle() or speaker.isupper()):
+        return "", text
+    # "Speaker 1"/"SPEAKER 2" are always labels; a bare word might not be.
+    words = [word.lower() for word in speaker.split()]
+    if words[0] != "speaker" and any(word in _NOT_SPEAKERS for word in words):
         return "", text
     return speaker, match.group("text").strip()
 
