@@ -18,3 +18,8 @@ __pycache__/
 data/premiere_assets/
 data/premiere_history.json
 data/premiere_styles.json
+
+# Generated build artifacts
+build/
+dist/
+installer/
