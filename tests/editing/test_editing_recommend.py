@@ -335,6 +335,90 @@ def test_audio_layer_places_a_sound_on_a_reaction():
     assert effects[0].start == 4.0 and effects[0].end == 5.0
 
 
+def test_visual_layer_offers_a_callout_on_a_named_subject():
+    timeline = timeline_of([
+        visual(0, 10, importance="reveal", entities=("ancient debris",)),
+    ])
+    produced = layer_module.layer_visual(timeline.segments)
+    callouts = [
+        entry for entry in produced if entry.category == "visual_callout"
+    ]
+    assert callouts
+    assert "ancient debris" in callouts[0].reason
+    assert "no callout graphic" in callouts[0].notes
+
+
+def test_no_callout_without_a_subject_to_point_at():
+    timeline = timeline_of([visual(0, 10, importance="reveal")])
+    assert not [
+        entry for entry in layer_module.layer_visual(timeline.segments)
+        if entry.category == "visual_callout"
+    ]
+
+
+def test_audio_layer_marks_where_a_music_bed_starts():
+    timeline = timeline_of(
+        [visual(0, 20)],
+        audio_events=[audio(6, 18, "music_region", confidence=0.4)],
+    )
+    beats = [
+        entry for entry in layer_module.layer_audio(timeline.segments)
+        if entry.category == "beat_marker"
+    ]
+    assert beats
+    # A point at the start of the bed, not a range across it.
+    assert beats[0].start == 6.0 and beats[0].end == 6.0
+    assert "No tempo estimation" in beats[0].notes
+
+
+def test_beat_markers_convert_to_premiere_operations():
+    """They are markers, so unlike the other placeholders they do convert."""
+    entry = EditRecommendation(
+        recommendation_id="r", asset_id="a1", source_file="/f/c.mp4",
+        start=6.0, end=6.0, category="beat_marker",
+        evidence=Evidence(audio_event_ids=["au1"]),
+    )
+    draft = build_plan([entry])
+    assert len(draft.ops) == 1
+    assert draft.ops[0]["op"] == "marker.add"
+    assert draft.ops[0]["name"] == "BEAT"
+    assert "duration" not in draft.ops[0]      # a point, not a range
+
+
+def test_a_visual_callout_is_reported_as_unconvertible():
+    entry = EditRecommendation(
+        recommendation_id="r", asset_id="a1", source_file="/f/c.mp4",
+        start=0.0, end=10.0, category="visual_callout",
+        evidence=Evidence(visual_event_ids=["e1"]),
+    )
+    draft = build_plan([entry])
+    assert draft.ops == []
+    assert draft.not_convertible[0]["category"] == "visual_callout"
+    assert "graphic" in draft.not_convertible[0]["reason"]
+
+
+def test_audio_layer_holds_for_silence_before_a_payoff():
+    """The opposite of a music cue, and equally a real technique."""
+    timeline = timeline_of([
+        visual(0, 10, importance="tension"),
+        visual(10, 20, importance="payoff", actions=("looting",)),
+    ])
+    holds = [
+        entry for entry in layer_module.layer_audio(timeline.segments)
+        if entry.category == "hold"
+    ]
+    assert holds
+    assert "Silence before a payoff" in holds[0].reason
+
+
+def test_report_distinguishes_a_zero_limit_from_nothing_accepted(rich_timeline):
+    result = plan_recommendations(rich_timeline)
+    assert result.accepted()
+    text = render(result, limit=0)
+    assert "none shown at limit 0" in text
+    assert "nothing was accepted" not in text
+
+
 def test_audio_layer_ducks_music_under_speech():
     timeline = timeline_of(
         [visual(0, 10)],

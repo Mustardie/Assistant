@@ -762,3 +762,81 @@ def test_no_cli_command_ever_executes_a_premiere_edit(staged, footage, capsys):
 
     assert draft.executed is False
     assert calls == []
+
+
+def test_cli_attach_folds_audio_into_the_timeline(staged, footage, capsys):
+    """The explicit name for the step ``timeline`` performs implicitly."""
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+    run_cli(["audio"] + base, capsys)
+    run_cli(
+        ["analyze", "--backend", "mock", "--window-seconds", "8", "--no-motion"]
+        + base, capsys
+    )
+
+    code, captured = run_cli(["attach", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["segments_with_audio"] > 0
+    assert payload["audio_event_links"] > 0
+    assert payload["files_without_audio_analysis"] == []
+
+
+def test_cli_attach_names_files_missing_audio_analysis(
+    staged, footage, capsys
+):
+    base = ["--output-dir", str(staged), "--no-premiere", "-q"]
+    run_cli(["discover", "--folder", str(footage)] + base, capsys)
+    run_cli(
+        ["analyze", "--backend", "mock", "--window-seconds", "8", "--no-motion"]
+        + base, capsys
+    )
+
+    code, captured = run_cli(["attach", "--json"] + base, capsys)
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["files_without_audio_analysis"]     # said so, not silent
+    assert payload["audio_event_links"] == 0
+
+
+@pytest.mark.parametrize("what,suffix", [
+    ("timeline", ".json"),
+    ("recommendations", ".json"),
+    ("report", ".txt"),
+    ("plan", ".json"),
+])
+def test_cli_export_writes_each_artefact(staged, footage, capsys, what, suffix):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+    run_cli(["draft"] + base, capsys)
+
+    out = staged / f"exported_{what}{suffix}"
+    code, captured = run_cli(
+        ["export", what, "--out", str(out), "--json"] + base, capsys
+    )
+
+    assert code == 0
+    assert json.loads(captured.out)["what"] == what
+    assert out.exists() and out.stat().st_size > 0
+
+
+def test_cli_export_report_works_without_a_draft_plan(staged, footage, capsys):
+    """Exporting a report must not require the plan step to have run."""
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    out = staged / "report_only.txt"
+    code, _ = run_cli(["export", "report", "--out", str(out), "--json"] + base, capsys)
+    assert code == 0
+    assert "EDIT RECOMMENDATIONS" in out.read_text(encoding="utf-8")
+
+
+def test_cli_export_plan_before_drafting_reports_why(staged, footage, capsys):
+    base = _stage(staged, footage, capsys)
+    run_cli(["recommend"] + base, capsys)
+
+    code, captured = run_cli(
+        ["export", "plan", "--out", str(staged / "p.json"), "--json"] + base, capsys
+    )
+    assert code == 1
+    assert "draft" in json.loads(captured.out)["hint"]

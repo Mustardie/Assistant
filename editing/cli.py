@@ -340,6 +340,46 @@ def cmd_audio(args) -> int:
     return EXIT_OK
 
 
+def cmd_attach(args) -> int:
+    """Fold audio events into the timeline without re-analysing anything.
+
+    ``timeline`` already attaches whatever audio is on disk, so this is the
+    same operation named for the step it performs -- useful after running
+    ``audio`` on a timeline that was built before the audio existed.
+    """
+    pipeline = _pipeline(args)
+    assets = _assets_for(pipeline, args)
+
+    missing = [
+        asset.filename for asset in assets if not pipeline.load_audio_events(asset)
+    ]
+    timeline = pipeline.timeline(assets, use_premiere=False)
+    target = pipeline.write_timeline(timeline, name=args.name)
+
+    attached = sum(len(segment.audio_events) for segment in timeline.segments)
+    covered = sum(1 for segment in timeline.segments if segment.audio_events)
+
+    if args.json:
+        _emit({
+            "success": True,
+            "written": str(target),
+            "segments": len(timeline.segments),
+            "segments_with_audio": covered,
+            "audio_event_links": attached,
+            "files_without_audio_analysis": missing,
+        })
+        return EXIT_OK
+
+    print(
+        f"{attached} audio event link(s) across {covered}/{len(timeline.segments)} "
+        f"segment(s)."
+    )
+    for name in missing:
+        print(f"  ! {name} has no audio analysis yet -- run `audio` for it.")
+    print(f"Written to {target}")
+    return EXIT_OK
+
+
 def cmd_recommend(args) -> int:
     pipeline = _pipeline(args)
     timeline = pipeline.load_timeline(name=args.name)
@@ -520,18 +560,79 @@ def cmd_show(args) -> int:
 
 
 def cmd_export(args) -> int:
+    """Write a built artefact to a path of your choosing."""
     pipeline = _pipeline(args)
-    timeline = pipeline.load_timeline(name=args.name)
     target = Path(args.out).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps(timeline.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+
+    if args.what == "timeline":
+        timeline = pipeline.load_timeline(name=args.name)
+        target.write_text(
+            json.dumps(timeline.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary = {"segments": len(timeline.segments), "stats": timeline.stats()}
+        human = f"Wrote {len(timeline.segments)} segment(s) to {target}"
+
+    elif args.what == "recommendations":
+        recommendations = pipeline.load_recommendations(name=args.name)
+        target.write_text(
+            json.dumps(recommendations.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        summary = {"recommendations": len(recommendations),
+                   "stats": recommendations.stats()}
+        human = f"Wrote {len(recommendations)} recommendation(s) to {target}"
+
+    elif args.what == "report":
+        recommendations = pipeline.load_recommendations(name=args.name)
+        # The report is richer with the timeline and plan alongside it, but
+        # both are optional -- exporting a report must not fail because the
+        # draft plan has not been built.
+        timeline = None
+        draft = None
+        try:
+            timeline = pipeline.load_timeline(name=args.name)
+        except EditingError:
+            pass
+        plan_path = pipeline.config.plans_dir / f"{args.name}.json"
+        if plan_path.exists():
+            from editing.recommend.premiere_plan import DraftPlan
+
+            stored = json.loads(plan_path.read_text(encoding="utf-8"))
+            draft = DraftPlan(
+                ops=list(stored.get("plan", {}).get("ops") or []),
+                not_convertible=list(stored.get("not_convertible") or []),
+                no_op=list(stored.get("no_op") or []),
+                valid=bool(stored.get("valid")),
+                validation_error=stored.get("validation_error"),
+                explanation=list(stored.get("explanation") or []),
+                generated_at=str(stored.get("generated_at") or ""),
+            )
+        text = report_module.render(recommendations, timeline=timeline, draft=draft)
+        target.write_text(text, encoding="utf-8")
+        summary = {"recommendations": len(recommendations), "characters": len(text)}
+        human = f"Wrote the report to {target}"
+
+    else:   # plan
+        plan_path = pipeline.config.plans_dir / f"{args.name}.json"
+        if not plan_path.exists():
+            raise EditingError(
+                f"No draft plan named '{args.name}' has been built yet",
+                hint="Run `python -m editing.cli draft` first.",
+            )
+        stored = json.loads(plan_path.read_text(encoding="utf-8"))
+        target.write_text(
+            json.dumps(stored, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        summary = {"operations": stored.get("operation_count", 0),
+                   "valid": stored.get("valid"), "executed": stored.get("executed")}
+        human = f"Wrote the draft plan to {target}"
+
     if args.json:
-        _emit({"success": True, "written": str(target), "stats": timeline.stats()})
+        _emit({"success": True, "what": args.what, "written": str(target), **summary})
     else:
-        print(f"Wrote {len(timeline.segments)} segment(s) to {target}")
+        print(human)
     return EXIT_OK
 
 
@@ -914,6 +1015,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(audio)
     audio.set_defaults(func=cmd_audio)
 
+    # -- attach ---------------------------------------------------------
+    attach = subparsers.add_parser(
+        "attach",
+        help="fold analysed audio events into the timeline (rebuilds it)")
+    attach.add_argument("--name", default="structure")
+    _add_selection(attach)
+    _add_common(attach)
+    attach.set_defaults(func=cmd_attach)
+
     # -- recommend ------------------------------------------------------
     recommend = subparsers.add_parser(
         "recommend", help="generate layered edit recommendations")
@@ -974,9 +1084,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(show)
     show.set_defaults(func=cmd_show)
 
-    export = subparsers.add_parser("export", help="write a timeline to a path")
+    export = subparsers.add_parser(
+        "export", help="write a built artefact to a path of your choosing")
+    export.add_argument(
+        "what", nargs="?", default="timeline",
+        choices=["timeline", "recommendations", "report", "plan"],
+        help="what to export (default: timeline)")
     export.add_argument("--name", default="structure")
-    export.add_argument("--out", required=True, help="destination .json path")
+    export.add_argument("--out", required=True,
+                        help="destination path (.json, or .txt for the report)")
     _add_common(export)
     export.set_defaults(func=cmd_export)
 

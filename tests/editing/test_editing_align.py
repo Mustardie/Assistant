@@ -8,6 +8,8 @@ coverage here.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from editing.align import (
@@ -15,7 +17,8 @@ from editing.align import (
     group_events, score_segment,
 )
 from editing.schema import (
-    MediaAsset, TimelineSegment, Transcript, TranscriptEntry, UIState, VisualEvent,
+    AudioEvent, MediaAsset, TimelineSegment, Transcript, TranscriptEntry,
+    UIState, VisualEvent,
 )
 
 
@@ -456,3 +459,240 @@ def test_usable_threshold_is_honoured(asset_a, event_factory):
 
 def test_default_threshold_is_exposed():
     assert 0.0 < DEFAULT_USABLE_THRESHOLD < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Audio alignment -- the third channel
+# ---------------------------------------------------------------------------
+
+def audio_of(*specs):
+    """``(start, end, type[, confidence[, detection]])`` -> AudioEvents."""
+    out = []
+    for spec in specs:
+        start, end, kind = spec[0], spec[1], spec[2]
+        confidence = spec[3] if len(spec) > 3 else 0.8
+        detection = spec[4] if len(spec) > 4 else "heuristic"
+        out.append(AudioEvent(
+            event_id=f"au_{start}_{kind}", source_file="/footage/clip.mp4",
+            asset_id="a_test", start=start, end=end, type=kind,
+            confidence=confidence, detection=detection,
+            loudness_db=-8.0, baseline_db=-24.0,
+        ))
+    return out
+
+
+def test_audio_events_attach_to_the_overlapping_segment(asset_a, event_factory):
+    events = [event_factory(0, 8), event_factory(8, 16, importance="danger")]
+    audio = audio_of((1.0, 3.0, "silence"), (9.0, 10.0, "sudden_reaction"))
+
+    segments = build_segments(
+        asset_a, events, None, audio_events=audio, merge_similar=False
+    )
+    assert [e.type for e in segments[0].audio_events] == ["silence"]
+    assert [e.type for e in segments[1].audio_events] == ["sudden_reaction"]
+
+
+def test_an_audio_event_spanning_two_segments_appears_in_both(
+    asset_a, event_factory
+):
+    """It is genuinely audible over both, exactly like a spoken line."""
+    events = [event_factory(0, 8), event_factory(8, 16, importance="danger")]
+    audio = audio_of((6.0, 10.0, "music_region"))
+
+    segments = build_segments(
+        asset_a, events, None, audio_events=audio, merge_similar=False
+    )
+    assert segments[0].audio_types() == {"music_region"}
+    assert segments[1].audio_types() == {"music_region"}
+
+
+def test_audio_events_outside_every_segment_are_dropped(asset_a, event_factory):
+    segments = build_segments(
+        asset_a, [event_factory(0, 8)],
+        None, audio_events=audio_of((50.0, 55.0, "silence")),
+    )
+    assert segments[0].audio_events == []
+
+
+def test_audio_events_survive_a_merge(asset_a, event_factory):
+    """Merging three similar events must not lose the audio on any of them."""
+    events = [
+        event_factory(0, 8, environment="cave", actions=("mining",)),
+        event_factory(8, 16, environment="cave", actions=("mining",)),
+        event_factory(16, 24, environment="cave", actions=("mining",)),
+    ]
+    audio = audio_of((2.0, 3.0, "loudness_spike"), (18.0, 19.0, "sudden_reaction"))
+
+    segments = build_segments(
+        asset_a, events, None, audio_events=audio, merge_similar=True
+    )
+    assert len(segments) == 1
+    assert segments[0].audio_types() == {"loudness_spike", "sudden_reaction"}
+
+
+def test_build_timeline_routes_audio_per_asset(event_factory):
+    """Two files must not receive each other's audio events."""
+    first = MediaAsset(asset_id="a1", path="/f/one.mp4", filename="one.mp4",
+                       duration=16.0)
+    second = MediaAsset(asset_id="a2", path="/f/two.mp4", filename="two.mp4",
+                        duration=16.0)
+
+    def audio_for(asset_id, kind):
+        return [AudioEvent(
+            event_id=f"au_{asset_id}", source_file="f", asset_id=asset_id,
+            start=1.0, end=2.0, type=kind, confidence=0.8,
+        )]
+
+    timeline = build_timeline(
+        [first, second],
+        {
+            "a1": [event_factory(0, 8, asset_id="a1", source_file="/f/one.mp4")],
+            "a2": [event_factory(0, 8, asset_id="a2", source_file="/f/two.mp4")],
+        },
+        {},
+        audio_by_asset={
+            "a1": audio_for("a1", "silence"),
+            "a2": audio_for("a2", "sudden_reaction"),
+        },
+    )
+    assert timeline.segments_for("a1")[0].audio_types() == {"silence"}
+    assert timeline.segments_for("a2")[0].audio_types() == {"sudden_reaction"}
+
+
+def test_a_transcript_only_timeline_still_carries_audio(asset_a):
+    """The speech-only fallback path must not drop the audio channel."""
+    transcript = transcript_of((1.0, 4.0, "talking with no visual analysis"))
+    segments = build_segments(
+        asset_a, [], transcript, audio_events=audio_of((2.0, 3.0, "possible_laughter"))
+    )
+    assert segments[0].audio_types() == {"possible_laughter"}
+
+
+# -- segment properties derived from audio ----------------------------------
+
+def test_dead_air_needs_silence_and_no_speech(asset_a, event_factory):
+    segments = build_segments(
+        asset_a, [event_factory(0, 8)], None,
+        audio_events=audio_of((0.0, 8.0, "silence", 0.9)),
+    )
+    assert segments[0].is_dead_air is True
+
+
+def test_silence_with_narration_over_it_is_not_dead_air(asset_a, event_factory):
+    transcript = transcript_of((1.0, 7.0, "still talking over the quiet"))
+    segments = build_segments(
+        asset_a, [event_factory(0, 8)], transcript,
+        audio_events=audio_of((0.0, 8.0, "silence", 0.9)),
+    )
+    assert segments[0].is_dead_air is False
+
+
+def test_a_brief_quiet_patch_is_not_dead_air(asset_a, event_factory):
+    """A one-second gap inside eight seconds is normal speech rhythm."""
+    segments = build_segments(
+        asset_a, [event_factory(0, 8)], None,
+        audio_events=audio_of((3.0, 4.0, "silence", 0.9)),
+    )
+    assert segments[0].is_dead_air is False
+
+
+def test_audio_reaction_picks_the_most_confident(asset_a, event_factory):
+    segments = build_segments(
+        asset_a, [event_factory(0, 8)], None,
+        audio_events=audio_of(
+            (1.0, 2.0, "loudness_spike", 0.6),
+            (3.0, 4.0, "possible_laughter", 0.9, "transcript_marker"),
+        ),
+    )
+    assert segments[0].audio_reaction.type == "possible_laughter"
+
+
+def test_silence_is_not_a_reaction(asset_a, event_factory):
+    segments = build_segments(
+        asset_a, [event_factory(0, 8)], None,
+        audio_events=audio_of((1.0, 5.0, "silence", 0.95)),
+    )
+    assert segments[0].audio_reaction is None
+
+
+# -- audio changing the verdict ---------------------------------------------
+
+def test_a_wordless_scream_over_danger_is_a_match(asset_a, event_factory):
+    """Invisible to a text-only check: there are no words at all."""
+    verdict = classify_alignment(
+        [event_factory(0, 8, importance="danger", threats=("creeper",))],
+        "",
+        audio_events=audio_of((2.0, 3.0, "possible_scream")),
+    )
+    assert verdict.kind == "match"
+    assert "audio:possible_scream" in verdict.evidence
+
+
+def test_laughter_over_an_uneventful_shot_is_a_contrast(asset_a, event_factory):
+    verdict = classify_alignment(
+        [event_factory(0, 8, importance="boring")],
+        "anyway so as I was saying about the thing",
+        audio_events=audio_of(
+            (2.0, 4.0, "possible_laughter", 0.85, "transcript_marker")
+        ),
+    )
+    assert verdict.kind == "contrast"
+
+
+def test_a_silent_segment_says_so_rather_than_shrugging(asset_a, event_factory):
+    verdict = classify_alignment(
+        [event_factory(0, 8)], "", audio_events=audio_of((0.0, 8.0, "silence"))
+    )
+    assert verdict.kind == "unknown"
+    assert "Silent" in verdict.reason
+
+
+def test_dead_air_is_never_usable_however_good_the_picture(
+    asset_a, event_factory
+):
+    segments = build_segments(
+        asset_a, [event_factory(0, 8, importance="payoff", confidence=1.0)],
+        None, audio_events=audio_of((0.0, 8.0, "silence", 0.9)),
+    )
+    assert segments[0].usable is False
+    assert any("dead air" in reason for reason in segments[0].reasons)
+
+
+def test_an_audio_reaction_lifts_a_segment(asset_a, event_factory):
+    quiet = build_segments(asset_a, [event_factory(0, 8, importance="setup")], None)
+    lifted = build_segments(
+        asset_a, [event_factory(0, 8, importance="setup")], None,
+        audio_events=audio_of((2.0, 3.0, "sudden_reaction", 0.9)),
+    )
+    assert lifted[0].usefulness > quiet[0].usefulness
+    assert any("audio:" in reason for reason in lifted[0].reasons)
+
+
+def test_clipping_is_penalised_and_named(asset_a, event_factory):
+    segments = build_segments(
+        asset_a, [event_factory(0, 8, importance="payoff")], None,
+        audio_events=audio_of((1.0, 2.0, "clipping", 0.85)),
+    )
+    assert any("clipping" in reason for reason in segments[0].reasons)
+
+
+# -- export ------------------------------------------------------------------
+
+def test_audio_events_survive_the_export_round_trip(asset_a, event_factory):
+    """The deliverable must carry the audio channel, not just compute with it."""
+    from editing.schema import StructureTimeline
+
+    timeline = build_timeline(
+        [asset_a], {"a_test": [event_factory(0, 8)]}, {},
+        audio_by_asset={"a_test": audio_of((1.0, 3.0, "sudden_reaction", 0.8))},
+    )
+    document = json.loads(json.dumps(timeline.to_dict()))
+
+    exported = document["segments"][0]
+    assert exported["audio_events"][0]["type"] == "sudden_reaction"
+    assert exported["audio_types"] == ["sudden_reaction"]
+    assert "is_dead_air" in exported
+
+    restored = StructureTimeline.from_dict(document)
+    assert restored.segments[0].audio_events[0].type == "sudden_reaction"
+    assert restored.segments[0].audio_reaction is not None

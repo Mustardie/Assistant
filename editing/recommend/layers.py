@@ -359,6 +359,25 @@ def layer_visual(
                 notes=f'Quote: "{segment.said[:60]}"',
             ))
 
+        # Something specific worth pointing at: a named mob or item during a
+        # moment the viewer is meant to notice. A callout is a placeholder --
+        # no graphic is designed yet -- but the *timing* and the *subject* are
+        # both derived from real evidence.
+        subjects = sorted({
+            entity for event in segment.events for entity in event.entities
+        })
+        if subjects and importance in ("reveal", "payoff") and not covered:
+            out.append(_make(
+                segment, category="visual_callout", layer="visual",
+                reason="Worth pointing at: " + ", ".join(subjects[:3]),
+                priority=0.5,
+                intensity="low",
+                effects=["clarity", "impact"],
+                risks=["hides_gameplay"],
+                notes="Placeholder: no callout graphic designed yet. Keep it "
+                      "clear of the hotbar and the health bar.",
+            ))
+
         # An achievement is a real beat and already renders its own text.
         if any(event.ui.achievement_toast for event in segment.events):
             out.append(_make(
@@ -464,6 +483,44 @@ def layer_audio(segments: Sequence[TimelineSegment]) -> list[EditRecommendation]
                 intensity="low",
                 effects=["clarity"],
                 notes="Only relevant if the trim is rejected.",
+            ))
+
+        # A beat marker anchors later cuts to the music. This does NOT estimate
+        # tempo -- there is no beat tracking here -- so the marker goes at the
+        # point the bed starts, which is the one musical position the audio
+        # layer actually knows.
+        music = next(
+            (event for event in segment.audio_events
+             if event.type == "music_region"), None
+        )
+        if music is not None:
+            out.append(_make(
+                segment, category="beat_marker", layer="audio",
+                reason="Music-like bed starts here -- anchor cuts to it",
+                priority=0.4 + 0.2 * music.confidence,
+                effects=["pacing"],
+                start=music.start, end=music.start,
+                notes="No tempo estimation is done; this marks where the bed "
+                      "begins, not a downbeat.",
+            ))
+
+        # Silence before a payoff is a real technique, and the opposite of the
+        # music cue above -- so it is proposed as a hold, not an edit.
+        following = segments[index + 1] if index + 1 < len(segments) else None
+        if (
+            following is not None
+            and following.importance in ("payoff", "reveal")
+            and not segment.has_speech
+            and segment.duration >= 1.5
+            and not segment.is_dead_air
+        ):
+            out.append(_make(
+                segment, category="hold", layer="audio",
+                reason="Silence before a payoff -- let it land rather than "
+                       "scoring it",
+                priority=0.5,
+                effects=["anticipation"],
+                notes="Deliberate audio hold: no music, no sound effect here.",
             ))
 
     return out

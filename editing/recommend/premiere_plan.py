@@ -43,7 +43,7 @@ from editing.recommend.schema import EditRecommendation, RecommendationSet
 DRY_RUN_FPS = 30.0
 
 #: Categories that become real operations today.
-CONVERTIBLE = frozenset({"marker", "structure_cut"})
+CONVERTIBLE = frozenset({"marker", "structure_cut", "beat_marker"})
 
 #: Categories that correctly produce no operations at all.
 NO_OP = frozenset({"hold"})
@@ -57,6 +57,7 @@ _NOT_YET = {
     "speed_ramp": "needs a clip on a sequence to retime",
     "freeze_frame": "needs a clip on a sequence to freeze",
     "text_overlay": "needs a sequence and a chosen style before text is placed",
+    "visual_callout": "placeholder only -- no callout graphic has been designed",
     "caption_emphasis": "needs a sequence and a caption track",
     "music_cue": "placeholder only -- no track has been chosen",
     "sound_effect": "placeholder only -- no sound library is wired up",
@@ -191,7 +192,9 @@ def _to_marker_ops(entry: EditRecommendation, asset_paths: dict) -> list[dict]:
     }
     # A range marker where the recommendation genuinely spans time; a point
     # marker for a cut, which has no duration by definition.
-    if entry.duration >= 0.25 and entry.category != "structure_cut":
+    if entry.duration >= 0.25 and entry.category not in (
+        "structure_cut", "beat_marker"
+    ):
         op["duration"] = round(entry.duration, 3)
     return [op]
 
@@ -199,6 +202,8 @@ def _to_marker_ops(entry: EditRecommendation, asset_paths: dict) -> list[dict]:
 def _marker_name(entry: EditRecommendation) -> str:
     if entry.category == "structure_cut":
         return "CUT"
+    if entry.category == "beat_marker":
+        return "BEAT"
     effect = entry.effects[0].upper() if entry.effects else "NOTE"
     return f"{effect}"[:32]
 

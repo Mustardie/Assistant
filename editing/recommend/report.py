@@ -57,7 +57,13 @@ def render(
     lines.append(_rule("TOP MOMENTS"))
     top = recommendations.top(limit)
     if not top:
-        lines.append("  (nothing was accepted -- see REMOVED below)")
+        # Distinguish "the planner accepted nothing" from "you asked for zero
+        # rows" -- the first is a finding, the second is a display setting.
+        accepted = len(recommendations.accepted())
+        lines.append(
+            f"  ({accepted} accepted, none shown at limit {limit})" if accepted
+            else "  (nothing was accepted -- see REMOVED below)"
+        )
     for entry in top:
         lines.append(
             f"  {_clock(entry.start)}-{_clock(entry.end)}  "

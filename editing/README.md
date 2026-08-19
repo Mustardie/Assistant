@@ -41,6 +41,23 @@ python -m editing.cli removed      # what the safety pass threw out, and why
 python -m editing.cli draft        # the draft Premiere plan (executes nothing)
 ```
 
+Export any artefact to a path of your choosing:
+
+```bash
+python -m editing.cli export timeline        --out D:/handoff/ep12_timeline.json
+python -m editing.cli export recommendations --out D:/handoff/ep12_recs.json
+python -m editing.cli export report          --out D:/handoff/ep12_report.txt
+python -m editing.cli export plan            --out D:/handoff/ep12_plan.json
+```
+
+If you build a timeline *before* running `audio`, fold the audio in afterwards
+without re-analysing anything:
+
+```bash
+python -m editing.cli audio
+python -m editing.cli attach
+```
+
 Or all of it in one call:
 
 ```bash
@@ -514,8 +531,8 @@ from.
 |---|---|
 | 1. **story** | What kind of moment is this? Markers on payoffs, reveals, danger, deaths; cuts where the story actually turns |
 | 2. **pacing** | Cut, trim dead air, **hold**, speed up, preserve anticipation before a payoff |
-| 3. **visual** | Punch-in, slow push-in, freeze frame, text overlay, caption emphasis |
-| 4. **audio** | Music cue, impact sound, comedic sting, ducking, audio fade (placeholders) |
+| 3. **visual** | Punch-in, slow push-in, freeze frame, text overlay, caption emphasis, visual callout |
+| 4. **audio** | Music cue, beat marker, impact sound, comedic sting, ducking, audio fade, and deliberate silence before a payoff |
 | 5. **polish** | Shadow lifts in caves, clipping fixes, "don't crop the HUD here" warnings |
 | 6. **safety** | Which of the above is actually a bad idea |
 
@@ -597,8 +614,14 @@ python -m editing.cli removed
 
 Categories: `structure_cut`, `trim_dead_air`, `hold`, `punch_in`,
 `slow_push_in`, `speed_ramp`, `freeze_frame`, `text_overlay`,
-`caption_emphasis`, `marker`, `music_cue`, `sound_effect`, `ducking`,
-`audio_fade`, `color_adjust`, `transition`.
+`caption_emphasis`, `marker`, `visual_callout`, `music_cue`, `beat_marker`,
+`sound_effect`, `ducking`, `audio_fade`, `color_adjust`, `transition`.
+
+Two are placeholders with real timing but no chosen asset: `visual_callout`
+(no graphic designed) and `beat_marker`. **`beat_marker` does not do beat
+tracking** — there is no tempo estimation anywhere in this layer. It marks
+where a music-like bed *begins*, which is the one musical position the audio
+layer actually knows, and says so in its notes.
 
 Effects: `clarity`, `tension`, `comedy`, `impact`, `pacing`, `explanation`,
 `anticipation`, `payoff`. Risks: `over_editing`, `hides_gameplay`,
@@ -644,7 +667,7 @@ Recommendations are in **source file time**. Most Premiere operations act on
 no clip to apply itself to. Rather than emit operations that would fail or hit
 the wrong clip:
 
-- **`marker` and `structure_cut`** → `marker.add` on the **project item**, which
+- **`marker`, `structure_cut` and `beat_marker`** → `marker.add` on the **project item**, which
   works in source time with no sequence at all. The marker comment carries the
   reason, the evidence channels and the priority, so a human editor can judge it
   in Premiere without opening any JSON.
@@ -732,7 +755,7 @@ that window.
 ## 10. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 450 tests, ~1.5s
+python -m pytest tests/editing -q        # 476 tests, ~2s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -748,7 +771,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_sampling.py` | coverage, densification, bounds, determinism |
 | `test_editing_cache.py` | key construction, hit/miss, invalidation, corruption |
 | `test_editing_analyzer.py` | messy model output, failures, cache behaviour |
-| `test_editing_align.py` | match/contrast/neutral, scoring, merging |
+| `test_editing_align.py` | match/contrast/neutral, scoring, merging, **audio attachment** |
 | `test_editing_audio.py` | detectors, confidence ceiling, markers, caching |
 | `test_editing_recommend.py` | layers, safety pass, dry-run, no execution |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
@@ -765,6 +788,10 @@ Tests worth knowing about, because they pin the promises this layer makes:
   — asserted at both the plan and the CLI boundary
 - `test_premiere_mapping_is_read_only` — every op this layer issues is
   non-mutating in the catalog
+- `test_audio_events_survive_the_export_round_trip` — the deliverable carries
+  the audio channel, not just computes with it
+- `test_dead_air_is_never_usable_however_good_the_picture` — audio can veto a
+  visually strong segment
 
 ---
 
@@ -829,8 +856,9 @@ measured optima. Change them with `--budget-seconds` and `--repeat-gap`.
 convert, because everything else needs the footage on a sequence. That is a real
 gap, reported per category rather than hidden.
 
-**Sound and music libraries are not wired up.** `music_cue`, `sound_effect` and
-`ducking` are placeholders with real timing and no chosen asset.
+**Sound and music libraries are not wired up.** `music_cue`, `beat_marker`,
+`sound_effect`, `ducking` and `visual_callout` are placeholders with real timing
+and no chosen asset or graphic.
 
 **No editing.** By design. This layer describes footage and proposes edits; it
 does not cut anything, and it never executes the plan it writes.

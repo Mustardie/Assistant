@@ -39,7 +39,9 @@ EDIT_CATEGORIES = (
     "text_overlay",
     "caption_emphasis",
     "marker",               # leave a timeline marker for the human editor
+    "visual_callout",       # placeholder: point at a thing on screen
     "music_cue",            # placeholder: music starts/changes here
+    "beat_marker",          # placeholder: a musical anchor to cut against
     "sound_effect",         # placeholder: an impact/comedic sound here
     "ducking",              # placeholder: duck the bed under speech
     "audio_fade",
@@ -53,12 +55,12 @@ EDIT_CATEGORIES = (
 #: markers and holds are annotations, and ten of them in a row is fine.
 ACTIVE_CATEGORIES = frozenset({
     "punch_in", "slow_push_in", "speed_ramp", "freeze_frame", "text_overlay",
-    "caption_emphasis", "transition", "color_adjust",
+    "caption_emphasis", "transition", "color_adjust", "visual_callout",
 })
 
 #: Categories that are purely advisory -- they never become a Premiere edit
 #: without a human, so they are exempt from the over-editing budget.
-PASSIVE_CATEGORIES = frozenset({"hold", "marker", "unknown"})
+PASSIVE_CATEGORIES = frozenset({"hold", "marker", "beat_marker", "unknown"})
 
 INTENSITIES = ("low", "medium", "high")
 
