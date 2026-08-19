@@ -105,7 +105,8 @@ _SYNONYMS = {
     "pvp": "fighting", "killing": "fighting", "hitting": "fighting",
     "fleeing": "escaping", "running_away": "escaping", "retreating": "escaping",
     "escape": "escaping",
-    "opening_chest": "looting", "chest_looting": "looting",
+    "opening_chest": "looting", "chest_looting": "looting", "chest": "looting",
+    "loot": "looting", "loots": "looting",
     "collecting": "looting", "gathering": "looting", "picking_up": "looting",
     "crafting_table": "crafting", "smelting": "crafting", "smithing": "crafting",
     "died": "dying", "death": "dying", "respawning": "dying",
@@ -173,6 +174,20 @@ def _coerce(value: Any, allowed: Iterable[str], default: str = "unknown") -> str
             return candidate
     for synonym, mapped in _SYNONYMS.items():
         if mapped in allowed and (synonym in token or token in synonym):
+            return mapped
+
+    # Word-level pass. A phrase answer like "opening a chest" contains neither
+    # an allowed value nor a synonym as a substring, because the filler word
+    # breaks both; matching its individual words and adjacent pairs catches it.
+    words = [word for word in token.split("_") if word]
+    pieces = words + [
+        f"{first}_{second}" for first, second in zip(words, words[1:])
+    ]
+    for piece in pieces:
+        if piece in allowed:
+            return piece
+        mapped = _SYNONYMS.get(piece)
+        if mapped in allowed:
             return mapped
     return default
 
