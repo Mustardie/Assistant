@@ -35,6 +35,9 @@ from editing.recommend import report as report_module
 from editing.recommend.planner import PlannerOptions, plan_recommendations
 from editing.recommend.premiere_plan import DraftPlan, build_and_dry_run
 from editing.recommend.schema import RecommendationSet
+from editing.roughcut import execute as roughcut_execute, review as review_module
+from editing.roughcut.build import RoughCutOptions, build_rough_cut
+from editing.roughcut.schema import ExecutionReport, RoughCutPlan
 from editing.schema import (
     AudioEvent, MediaAsset, StructureTimeline, VisualEvent,
 )
@@ -566,6 +569,165 @@ class Pipeline:
         return report_module.write(
             self.config.recommendations_dir / f"{name}.txt", text
         )
+
+    # ------------------------------------------------------------------
+    # Rough cut
+    # ------------------------------------------------------------------
+
+    def rough_cut(
+        self,
+        *,
+        timeline: Optional[StructureTimeline] = None,
+        recommendations: Optional[RecommendationSet] = None,
+        options: Optional[RoughCutOptions] = None,
+        name: str = "structure",
+        validate: bool = True,
+        save: bool = True,
+    ) -> RoughCutPlan:
+        """Build a rough cut plan from the timeline and recommendations."""
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if recommendations is None:
+            recommendations = self.load_recommendations(name=name)
+        assets = self.assets or self._assets_or_empty()
+
+        plan = build_rough_cut(
+            timeline, recommendations,
+            assets=assets, options=options, validate=validate,
+        )
+
+        self.say(
+            f"Rough cut '{plan.sequence_name}': {len(plan.placements)} clip(s), "
+            f"{plan.total_duration:.1f}s from {plan.source_duration:.1f}s of "
+            f"footage, {plan.operation_count} operation(s)."
+        )
+        if validate:
+            self.say(
+                "  dry run: " + ("passed" if plan.dry_run_passed else "FAILED")
+            )
+            if plan.dry_run_error:
+                self.say(f"  ! {plan.dry_run_error.get('error')}")
+        for warning in plan.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_rough_cut(plan, name=name)
+        return plan
+
+    def _assets_or_empty(self) -> list:
+        try:
+            return self.load_assets()
+        except FootageError:
+            return []
+
+    def write_rough_cut(self, plan: RoughCutPlan, *, name: str = "structure") -> Path:
+        self.config.roughcut_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.roughcut_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_rough_cut(self, *, name: str = "structure") -> RoughCutPlan:
+        target = self.config.roughcut_dir / f"{name}.json"
+        if not target.exists():
+            raise EditingError(
+                f"No rough cut named '{name}' has been built yet",
+                hint="Run `python -m editing.cli roughcut build` first.",
+            )
+        return RoughCutPlan.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def run_rough_cut(
+        self,
+        plan: Optional[RoughCutPlan] = None,
+        *,
+        mode: str = "dry_run",
+        allow_active_sequence: bool = False,
+        name: str = "structure",
+        engine=None,
+        save: bool = True,
+    ) -> ExecutionReport:
+        """Carry a rough cut plan out to the depth ``mode`` allows."""
+        if plan is None:
+            plan = self.load_rough_cut(name=name)
+
+        report = roughcut_execute.run(
+            plan,
+            mode=mode,
+            bridge=self.bridge,
+            engine=engine,
+            allow_active_sequence=allow_active_sequence,
+        )
+
+        if report.refused_reason:
+            self.say(f"Refused: {report.refused_reason}")
+        elif report.executed:
+            self.say(
+                f"Executed {report.operations_succeeded}/"
+                f"{report.operations_attempted} operation(s) on "
+                f"'{plan.sequence_name}'."
+            )
+        elif mode == "dry_run":
+            self.say(
+                "Dry run " + ("passed" if report.dry_run_passed else "FAILED")
+                + f" ({plan.operation_count} operation(s)); nothing was executed."
+            )
+        if report.error:
+            self.say(f"  ! {report.error.get('error')}")
+
+        if save:
+            self.write_execution_report(report, name=name)
+            self.write_rough_cut(plan, name=name)
+        return report
+
+    def write_execution_report(
+        self, report: ExecutionReport, *, name: str = "structure"
+    ) -> Path:
+        self.config.roughcut_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.roughcut_dir / f"{name}.execution.json"
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_execution_report(self, *, name: str = "structure") -> ExecutionReport:
+        target = self.config.roughcut_dir / f"{name}.execution.json"
+        if not target.exists():
+            raise EditingError(
+                f"No execution report named '{name}' exists yet",
+                hint="Run `python -m editing.cli roughcut dry-run` or "
+                     "`roughcut execute` first.",
+            )
+        return ExecutionReport.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def review_frames(
+        self,
+        plan: Optional[RoughCutPlan] = None,
+        *,
+        name: str = "structure",
+        position: float = review_module.DEFAULT_POSITION,
+        width: int = review_module.DEFAULT_WIDTH,
+    ):
+        """Export one representative frame per clip in the cut."""
+        if plan is None:
+            plan = self.load_rough_cut(name=name)
+
+        review = review_module.export_frames(
+            plan, self.config, position=position, width=width
+        )
+        self.say(
+            f"{len(review)} review frame(s) exported for "
+            f"'{plan.sequence_name}'."
+        )
+        for warning in review.warnings:
+            self.say(f"  ! {warning}")
+        return review
 
     # ------------------------------------------------------------------
     # Whole run

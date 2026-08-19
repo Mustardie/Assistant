@@ -1,8 +1,9 @@
-# Editing Brain V1 — Structure + Recommendations
+# Editing Brain V1 — Structure, Recommendations, Rough Cut
 
 Turns a folder of Minecraft footage into a machine-readable timeline of **what
-happens on screen**, **what is being said**, and **what is heard** — then
-proposes the edits worth making, with the evidence for each one.
+happens on screen**, **what is being said**, and **what is heard** — proposes
+the edits worth making, with the evidence for each one — and assembles them
+into a real Premiere rough cut.
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -11,12 +12,15 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
                                                     ↓
                        six recommendation layers → safety pass
                                                     ↓
-                    draft Premiere plan → offline dry-run (never executed)
+                     rough cut: selected ranges → scratch sequence plan
+                                                    ↓
+              offline dry-run → (explicit command only) execute → review frames
 ```
 
-**Nothing here applies an edit.** The draft plan is built, validated offline and
-written to disk; running it is a separate decision for a person. Everything the
-layer writes is JSON, plus one plain-text report.
+**Nothing runs unless you say so, twice.** Every plan is validated offline
+first, execution needs an explicit `--yes`, and the target is always a scratch
+sequence the plan creates itself — never the sequence you have open. Everything
+the layer writes is JSON, plus one plain-text report.
 
 ---
 
@@ -30,6 +34,10 @@ python -m editing.cli audio                               # silence, spikes, rea
 python -m editing.cli analyze                             # run Qwen3-VL over sampled windows
 python -m editing.cli timeline                            # combine all three channels
 python -m editing.cli recommend --with-plan               # propose edits + dry-run a plan
+python -m editing.cli roughcut build                      # assemble a rough cut plan
+python -m editing.cli roughcut dry-run                    # validate it offline
+python -m editing.cli roughcut execute --yes              # build it in Premiere
+python -m editing.cli review                              # export frames to check it
 ```
 
 Then read the results:
@@ -686,7 +694,167 @@ the wrong clip:
 
 ---
 
-## 8. Where outputs go
+## 8. The rough cut
+
+The draft plan in section 7 is markers only. This is the one that builds a
+sequence you can actually watch.
+
+```bash
+python -m editing.cli roughcut build
+python -m editing.cli roughcut dry-run
+python -m editing.cli roughcut execute --yes
+```
+
+```
+Rough cut: Nova Rough Cut
+  6 clip(s), 84.5s from 132.0s of footage
+  3 protected, 2 sped up, 17 marker(s)
+  31 operation(s), 4 recommendation(s) unconverted
+  dry run    : passed
+  on scratch : True  (nothing has been applied)
+```
+
+### What goes in the cut
+
+Selection is a set of stated rules, not a score threshold alone:
+
+| Footage | Decision |
+|---|---|
+| Dead air (silent, no narration) | **dropped** |
+| An accepted `trim_dead_air` range | **dropped** |
+| Segments whose visual analysis failed | **dropped** — a failure is not evidence |
+| A deliberate `hold` | **kept, protected** — no effects, no retime |
+| Payoff / reveal / danger / funny | **kept, protected** at full speed |
+| The beat *before* a payoff | **kept, protected** — anticipation is what makes the payoff land |
+| Scores above `--keep-threshold` | kept at full speed |
+| Dull but with narration | kept at full speed — sped-up dialogue is unusable |
+| Dull and silent | kept at `--filler-speed` (default 2x), or dropped with `--drop-filler` |
+
+Adjacent kept ranges merge, so the cut does not contain a seam every eight
+seconds where two analysis windows happened to meet. Each range gets a small
+handle either side (`--handle`, default 0.25s) so cuts do not land on a window
+boundary — and where handles push two ranges into each other, **the protected
+one keeps the contested frames**, so a slice of a payoff can never end up inside
+the sped-up filler clip next to it.
+
+### The layout is computed, not observed
+
+Every sequence position is arithmetic done before Premiere is touched: a clip
+sped 2x occupies half its source duration, and everything after it moves. That
+is what makes markers, punch-ins and review frames placeable offline, and the
+whole plan dry-runnable.
+
+```bash
+python -m editing.cli roughcut placements
+```
+
+```
+  [    0.00-    5.12] <-     0.00-   10.25  filler         2x
+      p_38f5ef75c862  recs=0 segments=1
+  [    5.12-   35.62] <-    19.75-   50.25  hold           protected
+      p_cf5d7c4dbcca  recs=3 segments=4
+```
+
+The chain **source file → source range → recommendation → sequence position →
+operation** is preserved end to end. Every clip in the cut can be traced back to
+the evidence that justified keeping it.
+
+### Operation order
+
+Order is load-bearing and fixed by the builder:
+
+1. `project.import` — media must be in the project before it can be placed
+2. `sequence.create` from the first clip, so the scratch sequence inherits its
+   resolution and frame rate (`--preset` uses a `.sqpreset` instead)
+3. `sequence.activate`
+4. `clip.remove` — Premiere puts the source clip on the timeline when creating
+   a sequence from it; the assembly starts empty
+5. `clip.append` per range, in playback order
+6. `clip.speed` for retimed clips, **in reverse order with ripple** — rippling
+   shifts everything after a clip, so working backwards means each clip is
+   still where the plan says when its turn comes
+7. Punch-ins, targeted by sequence time
+8. `marker.add` last, at final post-retime positions
+
+Steps 7 and 8 come after all retiming precisely because retiming moves clips. A
+marker placed earlier would end up pointing at whatever slid into that spot.
+
+### What converts, and what refuses
+
+Only conservative edits become real picture changes. A zoom is **refused** when:
+
+- the clip is a protected hold — zooming would edit a moment the pacing layer
+  said to leave raw
+- the clip is retimed — that compounds two edits on the same footage
+- the clip is shorter than 1.5s on the timeline — a zoom that brief reads as a
+  glitch
+- a full-screen UI is open anywhere in the clip, or low health is visible
+
+That last check is re-run against the *merged* clip, not just the original
+recommendation: the cut may have joined segments, so a clip can span footage the
+original recommendation never saw.
+
+Scale is capped at **115%** for a punch and **108%** for a push. Refusals become
+a `ZOOM?` marker so a human editor still sees where emphasis was wanted.
+
+Everything else — music cues, SFX, text, callouts, ducking, colour — becomes a
+**marker** carrying its reason, evidence channels and priority. That is the
+honest form of "something belongs here but the asset does not exist yet".
+
+```bash
+python -m editing.cli roughcut unconverted
+```
+
+### Execution modes and their guards
+
+| Mode | Validates | Runs |
+|---|---|---|
+| `--plan-only` | no | no |
+| `roughcut dry-run` | yes | no |
+| `roughcut execute --yes` | yes, in the same call | yes, on a scratch sequence |
+
+Four guards, each of which **refuses** rather than warns:
+
+1. **No default runs anything.** Building and dry-running are the only things a
+   bare command does.
+2. **A dry run must pass in the same invocation.** A previously-recorded pass is
+   not accepted — the plan may have been rebuilt since.
+3. **The target must provably be a scratch sequence.** This is checked
+   *structurally* — the plan must create and activate its own sequence before
+   placing anything — not trusted from a flag. Editing the sequence you have
+   open requires `--allow-active-sequence`.
+4. **A refusal is a result, not a crash.** The execution report says what it
+   declined to do and why.
+
+```bash
+python -m editing.cli roughcut report
+```
+
+---
+
+## 9. Review frames
+
+```bash
+python -m editing.cli review           # export one frame per clip
+python -m editing.cli review --list    # see what would be exported first
+```
+
+One representative frame per clip, taken a third of the way in (past the
+incoming cut, before any trailing motion), each linked back to the
+recommendation and segment that put the clip in the cut. A `review.json`
+manifest sits alongside them.
+
+**Frames come from the source files, not from Premiere.** The cut is an assembly
+of source ranges with known in/out points, so a frame at sequence time *t* is a
+frame at a computable source time. That means review frames can be exported from
+a plan that was **never executed** — which is what makes them useful for
+checking a cut before committing to it.
+
+This prepares the input for a later critic pass. It does not judge the cut.
+
+---
+
+## 10. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
@@ -699,7 +867,11 @@ data/editing/
 ├── timelines/structure.json        the combined timeline
 ├── recommendations/structure.json  ← every recommendation, with evidence
 ├── recommendations/structure.txt   ← the human-readable report
-├── plans/structure.json            ← draft Premiere plan + dry-run result
+├── plans/structure.json            draft Premiere plan (markers) + dry-run
+├── roughcut/structure.json         ← the rough cut: placements + operations
+├── roughcut/structure.execution.json  what happened when it was run
+├── review/<sequence>/*.jpg         review frames
+├── review/<sequence>/review.json   review manifest
 ├── frames/                         extracted JPEGs (deleted unless --keep-frames)
 └── cache/
     ├── probe/       ffprobe results
@@ -722,7 +894,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 9. Caching
+## 11. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -752,10 +924,10 @@ that window.
 
 ---
 
-## 10. Tests
+## 12. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 476 tests, ~2s
+python -m pytest tests/editing -q        # 558 tests, ~3s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -774,6 +946,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_align.py` | match/contrast/neutral, scoring, merging, **audio attachment** |
 | `test_editing_audio.py` | detectors, confidence ceiling, markers, caching |
 | `test_editing_recommend.py` | layers, safety pass, dry-run, no execution |
+| `test_editing_roughcut.py` | selection, layout maths, conversion, **execution guards** |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
 
 Tests worth knowing about, because they pin the promises this layer makes:
@@ -792,6 +965,12 @@ Tests worth knowing about, because they pin the promises this layer makes:
   the audio channel, not just computes with it
 - `test_dead_air_is_never_usable_however_good_the_picture` — audio can veto a
   visually strong segment
+- `test_a_stale_dry_run_pass_is_not_trusted` — validation reruns every time
+- `test_execution_refuses_a_plan_that_does_not_build_its_own_sequence` — the
+  scratch guarantee, checked structurally
+- `test_a_protected_range_wins_the_contested_frames` — a payoff can never end up
+  inside a sped-up filler clip
+- `test_no_cli_command_builds_a_plan_that_edits_the_active_sequence`
 
 ---
 
@@ -852,16 +1031,39 @@ later without changing the schema.
 seconds between repeats — these are defaults for a cinematic style, not
 measured optima. Change them with `--budget-seconds` and `--repeat-gap`.
 
-**Most recommendations cannot become Premiere operations yet.** Only markers
-convert, because everything else needs the footage on a sequence. That is a real
-gap, reported per category rather than hidden.
+**The rough cut is a rough cut.** It assembles ranges, retimes filler, places
+markers and applies conservative zooms. It does not do transitions, colour
+grading, text placement, audio mixing or anything requiring taste about
+composition. `roughcut unconverted` lists exactly what it declined.
+
+**Speed changes assume ripple works as documented.** The plan retimes clips back
+to front so each is still in position when its turn comes. If a Premiere build
+ripples differently, the later marker positions drift. The dry run cannot catch
+this — it validates operation shape, not Premiere's runtime behaviour. Check the
+first executed cut against `roughcut placements` before trusting the layout.
+
+**Punch-ins are applied blind to composition.** The refusal rules cover open
+UIs, low health, protected clips and short clips. They do not know where the
+subject is in frame, so a 115% punch on a subject already near the edge can
+still crop it. Conservative caps limit the damage rather than prevent it.
+
+**Only one video track.** Everything assembles onto V1. Overlays, B-roll and
+picture-in-picture need a track model this does not have yet.
+
+**Audio is carried, not mixed.** Appended clips bring their audio with them.
+There is no ducking, no levelling, no music bed — those remain markers.
 
 **Sound and music libraries are not wired up.** `music_cue`, `beat_marker`,
 `sound_effect`, `ducking` and `visual_callout` are placeholders with real timing
 and no chosen asset or graphic.
 
-**No editing.** By design. This layer describes footage and proposes edits; it
-does not cut anything, and it never executes the plan it writes.
+**Review frames are evidence, not a verdict.** They are exported and manifested
+for a critic pass that does not exist yet. Nothing currently looks at them.
+
+**Execution is opt-in and scratch-only.** The layer will now build a real
+sequence, but only on an explicit `roughcut execute --yes`, only after a dry run
+passes in the same call, and only onto a sequence it creates itself. Your open
+sequence is never touched without `--allow-active-sequence`.
 
 ---
 

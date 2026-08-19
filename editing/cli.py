@@ -37,6 +37,8 @@ from editing.pipeline import Pipeline, build_pipeline
 from editing.schema import StructureTimeline
 from editing.recommend import report as report_module
 from editing.recommend.planner import PlannerOptions
+from editing.roughcut import review as review_module
+from editing.roughcut.build import RoughCutOptions
 from editing.transcripts import premiere_source
 from editing.visual import qwen
 
@@ -527,6 +529,221 @@ def cmd_draft(args) -> int:
     return EXIT_OK
 
 
+def _roughcut_options(args) -> RoughCutOptions:
+    return RoughCutOptions(
+        sequence_name=args.sequence,
+        keep_threshold=args.keep_threshold,
+        filler_speed=args.filler_speed,
+        handle=args.handle,
+        drop_filler=args.drop_filler,
+        allow_zooms=not args.no_zooms,
+        preset=args.preset or "",
+    )
+
+
+def cmd_roughcut(args) -> int:
+    pipeline = _pipeline(args)
+    command = args.roughcut_command
+
+    # -- build ----------------------------------------------------------
+    if command == "build":
+        plan = pipeline.rough_cut(
+            options=_roughcut_options(args),
+            name=args.name,
+            validate=not args.plan_only,
+        )
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        _print_roughcut(plan, limit=args.limit)
+        if args.plan_only:
+            print("\nplan-only: NOT validated. Run `roughcut dry-run` next.")
+        return EXIT_OK
+
+    # -- dry-run --------------------------------------------------------
+    if command == "dry-run":
+        plan = pipeline.load_rough_cut(name=args.name)
+        report = pipeline.run_rough_cut(plan, mode="dry_run", name=args.name)
+        if args.json:
+            _emit({"success": True, "report": report.to_dict(),
+                   "dry_run_passed": plan.dry_run_passed,
+                   "explanation": plan.explanation})
+            return EXIT_OK
+        print(f"Dry run: {'PASSED' if plan.dry_run_passed else 'FAILED'}")
+        print(f"  operations : {plan.operation_count}")
+        print(f"  executed   : {report.executed}  <- nothing has been applied")
+        if plan.dry_run_error:
+            print(f"  error      : {plan.dry_run_error.get('error')}")
+            if plan.dry_run_error.get("hint"):
+                print(f"  hint       : {plan.dry_run_error['hint']}")
+        for line in plan.explanation[: args.limit]:
+            print(f"    {line}")
+        return EXIT_OK
+
+    # -- execute --------------------------------------------------------
+    if command == "execute":
+        plan = pipeline.load_rough_cut(name=args.name)
+        if not args.yes:
+            raise EditingError(
+                "Execution needs an explicit confirmation",
+                hint="This writes to Premiere. Re-run with --yes once you have "
+                     "read the dry run.",
+            )
+        report = pipeline.run_rough_cut(
+            plan,
+            mode="execute_on_scratch",
+            allow_active_sequence=args.allow_active_sequence,
+            name=args.name,
+        )
+        if args.json:
+            _emit({"success": report.ok, **report.to_dict()})
+            return EXIT_OK if report.ok or report.refused_reason else EXIT_ERROR
+
+        print(f"Rough cut execution ({plan.sequence_name})")
+        print(f"  dry run    : {'passed' if report.dry_run_passed else 'FAILED'}")
+        print(f"  on scratch : {report.on_scratch}")
+        print(f"  executed   : {report.executed}")
+        print(f"  operations : {report.operations_succeeded}/"
+              f"{report.operations_attempted}")
+        if report.refused_reason:
+            print(f"  refused    : {report.refused_reason}")
+        if report.error:
+            print(f"  error      : {report.error.get('error')}")
+        return EXIT_OK if report.executed or report.refused_reason else EXIT_ERROR
+
+    # -- placements -----------------------------------------------------
+    if command == "placements":
+        plan = pipeline.load_rough_cut(name=args.name)
+        if args.json:
+            _emit({"success": True, "sequence": plan.sequence_name,
+                   "placements": [p.to_dict() for p in plan.placements]})
+            return EXIT_OK
+        print(f"{len(plan.placements)} clip(s) in '{plan.sequence_name}':")
+        for placement in plan.placements:
+            flags = []
+            if placement.protected:
+                flags.append("protected")
+            if placement.speed != 1.0:
+                flags.append(f"{placement.speed:g}x")
+            print(
+                f"  [{placement.sequence_start:8.2f}-{placement.sequence_end:8.2f}] "
+                f"<- {placement.source_in:8.2f}-{placement.source_out:8.2f}  "
+                f"{placement.keep_reason:<14} {' '.join(flags)}"
+            )
+            print(f"      {placement.placement_id}  "
+                  f"recs={len(placement.recommendation_ids)} "
+                  f"segments={len(placement.segment_ids)}")
+        return EXIT_OK
+
+    # -- unconverted ----------------------------------------------------
+    if command == "unconverted":
+        plan = pipeline.load_rough_cut(name=args.name)
+        if args.json:
+            _emit({"success": True, "count": len(plan.unconverted),
+                   "unconverted": [u.to_dict() for u in plan.unconverted]})
+            return EXIT_OK
+        if not plan.unconverted:
+            print("Everything accepted was converted into the cut.")
+            return EXIT_OK
+        print(f"{len(plan.unconverted)} recommendation(s) not in the cut:")
+        for entry in plan.unconverted[: args.limit]:
+            print(f"  {entry.start:8.2f}s {entry.category:<16} "
+                  f"{entry.recommendation_id}")
+            print(f"      {entry.reason}")
+        return EXIT_OK
+
+    # -- report ---------------------------------------------------------
+    if command == "report":
+        report = pipeline.load_execution_report(name=args.name)
+        if args.json:
+            _emit({"success": True, **report.to_dict()})
+            return EXIT_OK
+        print(f"Execution report ({args.name})")
+        for label, value in (
+            ("mode", report.mode), ("executed", report.executed),
+            ("on scratch", report.on_scratch),
+            ("dry run passed", report.dry_run_passed),
+            ("sequence", report.sequence_name),
+            ("operations", f"{report.operations_succeeded}/"
+                           f"{report.operations_attempted}"),
+            ("elapsed", f"{report.elapsed:.2f}s"),
+        ):
+            print(f"  {label:<15}: {value}")
+        if report.refused_reason:
+            print(f"  refused        : {report.refused_reason}")
+        if report.error:
+            print(f"  error          : {report.error.get('error')}")
+        return EXIT_OK
+
+    raise EditingError("Unknown roughcut command")
+
+
+def cmd_review(args) -> int:
+    """Export review frames from the rough cut."""
+    pipeline = _pipeline(args)
+    plan = pipeline.load_rough_cut(name=args.name)
+
+    if args.list:
+        frames = review_module.plan_frames(plan, position=args.position)
+        if args.json:
+            _emit({"success": True, "exported": False,
+                   "frames": [f.to_dict() for f in frames]})
+            return EXIT_OK
+        print(f"{len(frames)} frame(s) would be exported:")
+        for frame in frames[: args.limit]:
+            print(f"  seq {frame.sequence_time:8.2f}s <- src "
+                  f"{frame.source_time:8.2f}s  {frame.keep_reason:<14} "
+                  f"{frame.placement_id}")
+        return EXIT_OK
+
+    review = pipeline.review_frames(
+        plan, name=args.name, position=args.position, width=args.width
+    )
+    if args.json:
+        _emit({"success": True, **review.to_dict()})
+        return EXIT_OK
+
+    print(f"{len(review)} review frame(s) for '{plan.sequence_name}'.")
+    for frame in review.frames[: args.limit]:
+        print(f"  seq {frame.sequence_time:8.2f}s  {frame.keep_reason:<14} "
+              f"{Path(frame.path).name}")
+        if frame.marker_names:
+            print(f"      markers: {', '.join(frame.marker_names)}")
+    for warning in review.warnings:
+        print(f"  ! {warning}")
+    print(f"\nWritten to {pipeline.config.review_dir}")
+    return EXIT_OK
+
+
+def _print_roughcut(plan, *, limit: int = 30) -> None:
+    stats = plan.stats()
+    print(f"Rough cut: {plan.sequence_name}")
+    print(f"  {stats['placements']} clip(s), {stats['cut_duration']}s from "
+          f"{stats['source_duration']}s of footage")
+    print(f"  {stats['protected']} protected, {stats['sped_up']} sped up, "
+          f"{stats['markers']} marker(s)")
+    print(f"  {stats['operations']} operation(s), "
+          f"{stats['unconverted']} recommendation(s) unconverted")
+    print(f"  dry run    : {'passed' if plan.dry_run_passed else 'not run'}")
+    print(f"  on scratch : {plan.on_scratch}  (nothing has been applied)")
+
+    if plan.placements:
+        print("\n  Assembly:")
+        for placement in plan.placements[:limit]:
+            flags = " ".join(filter(None, [
+                "protected" if placement.protected else "",
+                f"{placement.speed:g}x" if placement.speed != 1.0 else "",
+            ]))
+            print(f"    [{placement.sequence_start:7.2f}-"
+                  f"{placement.sequence_end:7.2f}] "
+                  f"{placement.keep_reason:<14} {flags}")
+
+    if plan.warnings:
+        print("\n  Warnings:")
+        for warning in plan.warnings:
+            print(f"    ! {warning}")
+
+
 def cmd_timeline(args) -> int:
     pipeline = _pipeline(args)
     assets = _assets_for(pipeline, args)
@@ -913,6 +1130,10 @@ def build_parser() -> argparse.ArgumentParser:
                "  python -m editing.cli analyze\n"
                "  python -m editing.cli timeline\n"
                "  python -m editing.cli recommend --with-plan\n"
+               "  python -m editing.cli roughcut build\n"
+               "  python -m editing.cli roughcut dry-run\n"
+               "  python -m editing.cli roughcut execute --yes\n"
+               "  python -m editing.cli review\n"
                "\nOr all of it at once:\n"
                "  python -m editing.cli run --folder D:/Footage/ep12 --recommend\n"
                "\nNothing here applies an edit. `draft` validates a Premiere\n"
@@ -1074,6 +1295,93 @@ def build_parser() -> argparse.ArgumentParser:
     draft.add_argument("--limit", type=int, default=30)
     _add_common(draft)
     draft.set_defaults(func=cmd_draft)
+
+    # -- roughcut -------------------------------------------------------
+    roughcut = subparsers.add_parser(
+        "roughcut",
+        help="build, validate and (explicitly) execute a rough cut sequence")
+    roughcut_subs = roughcut.add_subparsers(
+        dest="roughcut_command", required=True)
+
+    rc_build = roughcut_subs.add_parser(
+        "build", help="select ranges and build the operation plan")
+    rc_build.add_argument("--name", default="structure")
+    rc_build.add_argument("--sequence", default="Nova Rough Cut",
+                          help="scratch sequence name")
+    rc_build.add_argument("--keep-threshold", type=float, default=0.40,
+                          help="usefulness below which a segment is dropped "
+                               "(default 0.40)")
+    rc_build.add_argument("--filler-speed", type=float, default=2.0,
+                          help="playback rate for dull silent footage "
+                               "(default 2.0)")
+    rc_build.add_argument("--handle", type=float, default=0.25,
+                          help="seconds of handle either side of a kept range")
+    rc_build.add_argument("--drop-filler", action="store_true",
+                          help="drop low-value footage instead of speeding it up")
+    rc_build.add_argument("--no-zooms", action="store_true",
+                          help="markers only; do not animate Motion > Scale")
+    rc_build.add_argument("--preset", help="a .sqpreset path for the sequence")
+    rc_build.add_argument("--plan-only", action="store_true",
+                          help="build the operations without validating them")
+    rc_build.add_argument("--limit", type=int, default=30)
+    _add_common(rc_build)
+    rc_build.set_defaults(func=cmd_roughcut)
+
+    rc_dry = roughcut_subs.add_parser(
+        "dry-run", help="validate the plan offline (executes nothing)")
+    rc_dry.add_argument("--name", default="structure")
+    rc_dry.add_argument("--limit", type=int, default=40)
+    _add_common(rc_dry)
+    rc_dry.set_defaults(func=cmd_roughcut)
+
+    rc_exec = roughcut_subs.add_parser(
+        "execute",
+        help="run the plan on a scratch sequence -- needs --yes")
+    rc_exec.add_argument("--name", default="structure")
+    rc_exec.add_argument("--yes", action="store_true",
+                         help="required: confirms you have read the dry run")
+    rc_exec.add_argument(
+        "--allow-active-sequence", action="store_true",
+        help="permit editing the sequence currently open instead of a scratch "
+             "one. Off by default, and rarely what you want.")
+    rc_exec.add_argument("--limit", type=int, default=40)
+    _add_common(rc_exec)
+    rc_exec.set_defaults(func=cmd_roughcut)
+
+    rc_place = roughcut_subs.add_parser(
+        "placements", help="what lands where on the sequence")
+    rc_place.add_argument("--name", default="structure")
+    rc_place.add_argument("--limit", type=int, default=60)
+    _add_common(rc_place)
+    rc_place.set_defaults(func=cmd_roughcut)
+
+    rc_unconv = roughcut_subs.add_parser(
+        "unconverted", help="recommendations that did not make the cut, and why")
+    rc_unconv.add_argument("--name", default="structure")
+    rc_unconv.add_argument("--limit", type=int, default=40)
+    _add_common(rc_unconv)
+    rc_unconv.set_defaults(func=cmd_roughcut)
+
+    rc_report = roughcut_subs.add_parser(
+        "report", help="the last execution report")
+    rc_report.add_argument("--name", default="structure")
+    rc_report.add_argument("--limit", type=int, default=40)
+    _add_common(rc_report)
+    rc_report.set_defaults(func=cmd_roughcut)
+
+    # -- review ---------------------------------------------------------
+    review = subparsers.add_parser(
+        "review", help="export representative frames from the rough cut")
+    review.add_argument("--name", default="structure")
+    review.add_argument("--position", type=float, default=0.34,
+                        help="where in each clip to sample, 0-1 (default 0.34)")
+    review.add_argument("--width", type=int, default=960,
+                        help="exported frame width (default 960)")
+    review.add_argument("--list", action="store_true",
+                        help="list what would be exported without extracting")
+    review.add_argument("--limit", type=int, default=40)
+    _add_common(review)
+    review.set_defaults(func=cmd_review)
 
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")
