@@ -23,3 +23,7 @@ data/premiere_styles.json
 build/
 dist/
 installer/
+
+# Local secrets/settings
+.env
+data/nova_settings.json
