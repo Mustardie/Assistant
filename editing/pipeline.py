@@ -43,6 +43,9 @@ from editing.recommend.planner import PlannerOptions, plan_recommendations
 from editing.recommend.premiere_plan import DraftPlan, build_and_dry_run
 from editing.recommend.schema import RecommendationSet
 from editing.roughcut import execute as roughcut_execute, review as review_module
+from editing.style import compile as style_compile, execute as style_execute
+from editing.style import presets as style_presets, report as style_report
+from editing.style.schema import LayeredEditPlan
 from editing.roughcut.build import RoughCutOptions, build_rough_cut
 from editing.roughcut.schema import ExecutionReport, RoughCutPlan
 from editing.schema import (
@@ -1073,6 +1076,187 @@ class Pipeline:
                 f"No revision execution report named '{name}' exists yet",
                 hint="Run `python -m editing.cli review dry-run` or "
                      "`review execute --yes` first.",
+            )
+        return ExecutionReport.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    # ------------------------------------------------------------------
+    # Style and layers
+    # ------------------------------------------------------------------
+
+    def layers(
+        self,
+        *,
+        name: str = "structure",
+        style=None,
+        timeline: Optional[StructureTimeline] = None,
+        recommendations: Optional[RecommendationSet] = None,
+        roughcut: Optional[RoughCutPlan] = None,
+        revisions=None,
+        options=None,
+        save: bool = True,
+    ) -> LayeredEditPlan:
+        """Compile a layered, styled edit from the rough cut, and dry-run it."""
+        if roughcut is None:
+            roughcut = self.load_rough_cut(name=name)
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if recommendations is None:
+            recommendations = self.load_recommendations(name=name)
+        if revisions is None:
+            revisions = self._revisions_or_none(name)
+
+        preset = style if style is not None else style_presets.get()
+        plan = style_compile.compile_layers(
+            timeline, roughcut,
+            style=preset,
+            recommendations=recommendations,
+            revisions=revisions,
+            options=options,
+            roughcut_executed=self._roughcut_was_executed(name, roughcut),
+        )
+        style_execute.dry_run(plan)
+
+        density = plan.density()
+        stats = plan.stats()
+        self.say(
+            f"Layered edit '{plan.sequence_name}' in {plan.style}: "
+            f"{stats['planned']} item(s) planned, {stats['deferred']} held "
+            f"back, {plan.operation_count} operation(s)."
+        )
+        self.say(
+            f"  density: {density['edits_per_minute']:.2f} active edit(s)/min "
+            f"(ceiling {preset.max_edits_per_minute:g}), "
+            f"{density['captions_per_minute']:.2f} caption(s)/min "
+            f"(ceiling {preset.max_captions_per_minute:g})."
+        )
+        self.say(
+            "  dry run: " + ("passed" if plan.dry_run_passed else "FAILED")
+        )
+        if plan.dry_run_error:
+            self.say(f"  ! {plan.dry_run_error.get('error')}")
+        for warning in plan.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_layers(plan, name=name)
+            self.write_layers_report(plan, name=name)
+        return plan
+
+    def _revisions_or_none(self, name: str):
+        try:
+            return self.load_revisions(name=name)
+        except EditingError:
+            return None
+
+    def write_layers(
+        self, plan: LayeredEditPlan, *, name: str = "structure"
+    ) -> Path:
+        self.config.layers_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.layers_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_layers(self, *, name: str = "structure") -> LayeredEditPlan:
+        target = self.config.layers_dir / f"{name}.json"
+        if not target.exists():
+            raise EditingError(
+                f"No layered edit named '{name}' has been built yet",
+                hint="Run `python -m editing.cli layers build --style "
+                     "<preset>` first.",
+            )
+        return LayeredEditPlan.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def write_layers_report(
+        self, plan: LayeredEditPlan, *, name: str = "structure", limit: int = 30
+    ) -> Path:
+        """The human-readable layered report, beside the rough cut's own.
+
+        Never over it: a style pass is one interpretation of a cut, and the
+        cut it interprets has to survive being interpreted.
+        """
+        text = style_report.render(plan, limit=limit)
+        self.config.layers_dir.mkdir(parents=True, exist_ok=True)
+        return style_report.write(
+            self.config.layers_dir / f"{name}.txt", text
+        )
+
+    def run_layers(
+        self,
+        plan: Optional[LayeredEditPlan] = None,
+        *,
+        mode: str = "dry_run",
+        name: str = "structure",
+        roughcut: Optional[RoughCutPlan] = None,
+        allow_active_sequence: bool = False,
+        engine=None,
+        save: bool = True,
+    ) -> ExecutionReport:
+        """Carry a layered plan out to the depth ``mode`` allows."""
+        if plan is None:
+            plan = self.load_layers(name=name)
+        if roughcut is None:
+            try:
+                roughcut = self.load_rough_cut(name=name)
+            except EditingError:
+                roughcut = None
+
+        report = style_execute.run(
+            plan,
+            mode=mode,
+            roughcut=roughcut,
+            bridge=self.bridge,
+            engine=engine,
+            allow_active_sequence=allow_active_sequence,
+        )
+
+        if report.refused_reason:
+            self.say(f"Refused: {report.refused_reason}")
+        elif report.executed:
+            self.say(
+                f"Applied {report.operations_succeeded}/"
+                f"{report.operations_attempted} layer operation(s) to "
+                f"'{plan.sequence_name}'."
+            )
+        elif mode == "dry_run":
+            self.say(
+                "Dry run " + ("passed" if report.dry_run_passed else "FAILED")
+                + f" ({plan.operation_count} operation(s)); nothing was applied."
+            )
+        if report.error:
+            self.say(f"  ! {report.error.get('error')}")
+
+        if save:
+            self.write_layers_execution(report, name=name)
+            self.write_layers(plan, name=name)
+        return report
+
+    def write_layers_execution(
+        self, report: ExecutionReport, *, name: str = "structure"
+    ) -> Path:
+        self.config.layers_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.layers_dir / f"{name}.execution.json"
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_layers_execution(
+        self, *, name: str = "structure"
+    ) -> ExecutionReport:
+        target = self.config.layers_dir / f"{name}.execution.json"
+        if not target.exists():
+            raise EditingError(
+                f"No layer execution report named '{name}' exists yet",
+                hint="Run `python -m editing.cli layers dry-run` or "
+                     "`layers execute --yes` first.",
             )
         return ExecutionReport.from_dict(
             json.loads(target.read_text(encoding="utf-8"))

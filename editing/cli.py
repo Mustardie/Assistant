@@ -16,6 +16,9 @@ Commands, in the order a session normally uses them::
     roughcut    build | dry-run | execute | placements | unconverted | report
     review      export-frames | critique | plan | dry-run | execute --yes |
                 report | show-issues   -- the critic pass over a rough cut
+    style       list | show <preset>   -- the editing styles available
+    layers      build | report | export | dry-run | execute --yes |
+                show-deferred | show-density   -- a styled, layered edit
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -45,6 +48,8 @@ from editing.critic.frames import CoverageOptions
 from editing.critic.revise import RevisionOptions
 from editing.roughcut import review as review_module
 from editing.roughcut.build import RoughCutOptions
+from editing.style import presets as style_presets, report as layers_report
+from editing.style.compile import CompileOptions
 from editing.transcripts import premiere_source
 from editing.visual import qwen
 
@@ -963,6 +968,292 @@ def _print_revision_plan(revisions, plan, *, limit: int = 30) -> None:
         print(f"  ! {warning}")
 
 
+def cmd_style(args) -> int:
+    """Inspect the editing styles. Reads nothing and writes nothing."""
+    command = args.style_command
+
+    if command == "list":
+        presets = [style_presets.get(name) for name in style_presets.names()]
+        if args.json:
+            _emit({"success": True, "default": style_presets.DEFAULT_PRESET,
+                   "presets": [preset.to_dict() for preset in presets]})
+            return EXIT_OK
+        print(f"{len(presets)} style preset(s) "
+              f"(default: {style_presets.DEFAULT_PRESET}):\n")
+        for preset in presets:
+            print("  " + preset.summary())
+        print("\n  Every number in a preset is a ceiling, never a target: a "
+              "style can only\n  make the edit quieter than the evidence "
+              "justifies, never busier.")
+        return EXIT_OK
+
+    if command == "show":
+        preset = style_presets.get(args.preset)
+        if args.json:
+            _emit({"success": True, **preset.to_dict()})
+            return EXIT_OK
+        print(f"{preset.name} -- {preset.label}")
+        print(f"\n{preset.description}\n")
+        for heading, rows in (
+            ("pacing", (
+                ("pacing", preset.pacing),
+                ("max edits / minute", preset.max_edits_per_minute),
+                ("min edit spacing", f"{preset.min_edit_spacing:g}s"),
+                ("dead air tolerated", f"{preset.dead_air_tolerance:g}s"),
+                ("trim aggression", preset.trim_aggression),
+            )),
+            ("text", (
+                ("max captions / minute", preset.max_captions_per_minute),
+                ("min caption spacing", f"{preset.min_caption_spacing:g}s"),
+                ("max words per caption", preset.max_caption_words),
+                ("min line score", preset.caption_min_priority),
+                ("zones", ", ".join(preset.text_zones)),
+                ("draws real text", preset.allow_real_text),
+            )),
+            ("visual emphasis", (
+                ("max punch scale", f"{preset.max_zoom_scale:g}%"),
+                ("max push scale", f"{preset.max_push_scale:g}%"),
+                ("max zooms / minute", preset.max_zooms_per_minute),
+                ("zoom protected clips", preset.zoom_protected_clips),
+                ("zoom retimed clips", preset.zoom_retimed_clips),
+            )),
+            ("cards", (
+                ("title cards", preset.title_cards),
+                ("chapter cards", preset.chapter_cards),
+                ("card duration", f"{preset.card_duration:g}s"),
+                ("min section length", f"{preset.min_section_seconds:g}s"),
+            )),
+            ("audio", (
+                ("placeholders", ", ".join(sorted(preset.audio_kinds)) or "none"),
+                ("real audio ops", preset.allow_audio_ops),
+            )),
+            ("safety", (
+                ("min confidence", preset.min_confidence),
+                ("min stack spacing", f"{preset.min_stack_spacing:g}s"),
+                ("marker prefix", preset.marker_prefix or "(none)"),
+            )),
+        ):
+            print(f"  {heading}")
+            for label, value in rows:
+                print(f"    {label:<24}: {value}")
+            print()
+        if preset.preferred_kinds:
+            print("  prefers  : " + ", ".join(sorted(preset.preferred_kinds)))
+        if preset.limited_kinds:
+            print("  limits   : " + ", ".join(
+                f"{kind} <= {rate:g}/min"
+                for kind, rate in sorted(preset.limited_kinds.items())
+            ))
+        if preset.forbidden_kinds:
+            print("  never    : " + ", ".join(sorted(preset.forbidden_kinds)))
+        problems = preset.problems()
+        if problems:
+            print("\n  PROBLEMS:")
+            for problem in problems:
+                print(f"    ! {problem}")
+        return EXIT_OK
+
+    raise EditingError("Unknown style command")
+
+
+def _compile_options(args) -> CompileOptions:
+    return CompileOptions(
+        include_base=not getattr(args, "no_base", False),
+        use_critic=not getattr(args, "no_critic", False),
+        markers_only=getattr(args, "markers_only", False),
+        max_operations=getattr(args, "max_operations", None) or 400,
+    )
+
+
+def _style_from(args):
+    """The preset named on the command line, with any inline overrides."""
+    overrides = {}
+    for flag, field in (
+        ("max_edits_per_minute", "max_edits_per_minute"),
+        ("max_captions_per_minute", "max_captions_per_minute"),
+        ("max_zooms_per_minute", "max_zooms_per_minute"),
+    ):
+        value = getattr(args, flag, None)
+        if value is not None:
+            overrides[field] = value
+    if getattr(args, "no_text", False):
+        overrides["max_captions_per_minute"] = 0.0
+    if getattr(args, "no_zooms", False):
+        overrides["max_zoom_scale"] = 100.0
+        overrides["max_zooms_per_minute"] = 0.0
+    return style_presets.get(getattr(args, "style", None), **overrides)
+
+
+def cmd_layers(args) -> int:
+    """Build, inspect, validate and (explicitly) apply a styled layered edit."""
+    pipeline = _pipeline(args)
+    command = args.layers_command
+
+    # -- build ------------------------------------------------------------
+    if command == "build":
+        plan = pipeline.layers(
+            name=args.name,
+            style=_style_from(args),
+            options=_compile_options(args),
+        )
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        _print_layers(plan, limit=args.limit)
+        print(f"\nWritten to {pipeline.config.layers_dir}")
+        return EXIT_OK
+
+    # -- report -----------------------------------------------------------
+    if command == "report":
+        plan = pipeline.load_layers(name=args.name)
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        print(layers_report.render(plan, limit=args.limit))
+        return EXIT_OK
+
+    # -- export -----------------------------------------------------------
+    if command == "export":
+        plan = pipeline.load_layers(name=args.name)
+        target = Path(args.out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.suffix.lower() == ".txt":
+            layers_report.write(target, layers_report.render(plan, limit=200))
+        else:
+            target.write_text(
+                json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if args.json:
+            _emit({"success": True, "written": str(target),
+                   "items": len(plan), "operations": plan.operation_count})
+            return EXIT_OK
+        print(f"Wrote {len(plan)} layer item(s) to {target}")
+        return EXIT_OK
+
+    # -- dry-run ----------------------------------------------------------
+    if command == "dry-run":
+        plan = pipeline.load_layers(name=args.name)
+        report = pipeline.run_layers(plan, mode="dry_run", name=args.name)
+        if args.json:
+            _emit({"success": True, "report": report.to_dict(),
+                   "dry_run_passed": plan.dry_run_passed,
+                   "explanation": plan.explanation})
+            return EXIT_OK
+        print(f"Layer dry run: "
+              f"{'PASSED' if plan.dry_run_passed else 'FAILED'}")
+        print(f"  style      : {plan.style}")
+        print(f"  operations : {plan.operation_count}")
+        print(f"  executed   : {report.executed}  <- nothing has been applied")
+        if plan.dry_run_error:
+            print(f"  error      : {plan.dry_run_error.get('error')}")
+            if plan.dry_run_error.get("hint"):
+                print(f"  hint       : {plan.dry_run_error['hint']}")
+        for line in plan.explanation[: args.limit]:
+            print(f"    {line}")
+        for warning in plan.warnings:
+            print(f"  ! {warning}")
+        return EXIT_OK
+
+    # -- execute ----------------------------------------------------------
+    if command == "execute":
+        plan = pipeline.load_layers(name=args.name)
+        if not args.yes:
+            raise EditingError(
+                "Applying a layered edit needs an explicit confirmation",
+                hint="This writes to the rough cut sequence in Premiere. "
+                     "Re-run with --yes once you have read the dry run and "
+                     "`layers report`.",
+            )
+        report = pipeline.run_layers(
+            plan,
+            mode="execute",
+            name=args.name,
+            allow_active_sequence=args.allow_active_sequence,
+        )
+        if args.json:
+            _emit({"success": report.ok, **report.to_dict()})
+            return EXIT_OK if report.ok or report.refused_reason else EXIT_ERROR
+
+        print(f"Layered edit execution ({plan.sequence_name}, {plan.style})")
+        print(f"  dry run    : {'passed' if report.dry_run_passed else 'FAILED'}")
+        print(f"  on scratch : {report.on_scratch}")
+        print(f"  executed   : {report.executed}")
+        print(f"  operations : {report.operations_succeeded}/"
+              f"{report.operations_attempted}")
+        if report.refused_reason:
+            print(f"  refused    : {report.refused_reason}")
+        if report.error:
+            print(f"  error      : {report.error.get('error')}")
+        return EXIT_OK if report.executed or report.refused_reason else EXIT_ERROR
+
+    # -- show-deferred ----------------------------------------------------
+    if command == "show-deferred":
+        plan = pipeline.load_layers(name=args.name)
+        held = plan.deferred() + plan.rejected()
+        if args.json:
+            _emit({"success": True, "count": len(held), "style": plan.style,
+                   "deferred": [item.to_dict() for item in held]})
+            return EXIT_OK
+        print(layers_report.render_deferred(plan, limit=args.limit))
+        return EXIT_OK
+
+    # -- show-density -----------------------------------------------------
+    if command == "show-density":
+        plan = pipeline.load_layers(name=args.name)
+        if args.json:
+            _emit({"success": True, "style": plan.style, **plan.density()})
+            return EXIT_OK
+        print(layers_report.render_density(plan))
+        return EXIT_OK
+
+    raise EditingError("Unknown layers command")
+
+
+def _print_layers(plan, *, limit: int = 20) -> None:
+    density = plan.density()
+    stats = plan.stats()
+    preset = plan.preset or {}
+
+    print(f"Layered edit: {plan.sequence_name}  [{plan.style}]")
+    print(f"  {stats['planned']} item(s) planned, {stats['deferred']} held "
+          f"back, {stats['rejected']} rejected")
+    print(f"  {stats['convertible']} become operations "
+          f"({stats['marker_only']} of them markers)")
+    print(f"  density    : {density['edits_per_minute']:.2f} edits/min "
+          f"(<= {preset.get('max_edits_per_minute', '?')}), "
+          f"{density['captions_per_minute']:.2f} captions/min "
+          f"(<= {preset.get('max_captions_per_minute', '?')})")
+    print(f"  dry run    : {'passed' if plan.dry_run_passed else 'not run'}")
+    print(f"  on scratch : {plan.on_scratch}  (nothing has been applied)")
+
+    by_layer = density["by_layer"]
+    if by_layer:
+        print("\n  Planned by layer:")
+        for layer, count in sorted(by_layer.items()):
+            print(f"    {layer:<10} {count}")
+
+    interesting = [
+        item for item in plan.planned()
+        if item.layer not in ("base",)
+    ]
+    if interesting:
+        print("\n  Timeline:")
+        for item in sorted(interesting, key=lambda i: i.start)[:limit]:
+            detail = (item.payload.get("text")
+                      or item.payload.get("placeholder") or "")
+            flag = " (marker)" if item.is_marker_only else ""
+            print(f"    [{item.start:8.2f}] {item.layer:<9} {item.kind:<18} "
+                  f"{str(detail)[:32]}{flag}")
+        if len(interesting) > limit:
+            print(f"    ... and {len(interesting) - limit} more.")
+
+    if plan.dry_run_error:
+        print(f"\n  ! {plan.dry_run_error.get('error')}")
+    for warning in plan.warnings:
+        print(f"  ! {warning}")
+
+
 def _print_roughcut(plan, *, limit: int = 30) -> None:
     stats = plan.stats()
     print(f"Rough cut: {plan.sequence_name}")
@@ -1416,6 +1707,10 @@ def build_parser() -> argparse.ArgumentParser:
                "  python -m editing.cli review plan\n"
                "  python -m editing.cli review dry-run\n"
                "  python -m editing.cli review execute --yes\n"
+               "  python -m editing.cli style list\n"
+               "  python -m editing.cli layers build --style fast_funny\n"
+               "  python -m editing.cli layers dry-run\n"
+               "  python -m editing.cli layers execute --yes\n"
                "\nOr all of it at once:\n"
                "  python -m editing.cli run --folder D:/Footage/ep12 --recommend\n"
                "\nNothing here applies an edit. `draft` validates a Premiere\n"
@@ -1733,6 +2028,106 @@ def build_parser() -> argparse.ArgumentParser:
     rv_issues.add_argument("--limit", type=int, default=40)
     _add_common(rv_issues)
     rv_issues.set_defaults(func=cmd_review)
+
+    # -- style ----------------------------------------------------------
+    style = subparsers.add_parser(
+        "style", help="the editing style presets available")
+    style_subs = style.add_subparsers(dest="style_command", required=True)
+
+    st_list = style_subs.add_parser("list", help="every preset, one line each")
+    _add_common(st_list)
+    st_list.set_defaults(func=cmd_style)
+
+    st_show = style_subs.add_parser(
+        "show", help="every number in one preset, and why")
+    st_show.add_argument("preset", help="preset name")
+    _add_common(st_show)
+    st_show.set_defaults(func=cmd_style)
+
+    # -- layers ---------------------------------------------------------
+    layers = subparsers.add_parser(
+        "layers",
+        help="build, inspect and (explicitly) apply a styled layered edit")
+    layers_subs = layers.add_subparsers(dest="layers_command", required=True)
+
+    ly_build = layers_subs.add_parser(
+        "build", help="compile the layers for a style and dry-run them")
+    ly_build.add_argument("--name", default="structure")
+    ly_build.add_argument(
+        "--style", default=style_presets.DEFAULT_PRESET,
+        choices=style_presets.names(),
+        help=f"which preset to apply (default {style_presets.DEFAULT_PRESET})")
+    ly_build.add_argument("--markers-only", action="store_true",
+                          help="draw and scale nothing; record every choice "
+                               "as a marker instead")
+    ly_build.add_argument("--no-text", action="store_true",
+                          help="plan no captions or cards at all")
+    ly_build.add_argument("--no-zooms", action="store_true",
+                          help="never scale the picture, whatever the style says")
+    ly_build.add_argument("--no-base", action="store_true",
+                          help="omit the rough cut's own clips from the plan")
+    ly_build.add_argument("--no-critic", action="store_true",
+                          help="ignore critic findings when placing text and "
+                               "emphasis")
+    ly_build.add_argument("--max-edits-per-minute", type=float,
+                          help="override the style's edit ceiling")
+    ly_build.add_argument("--max-captions-per-minute", type=float,
+                          help="override the style's caption ceiling")
+    ly_build.add_argument("--max-zooms-per-minute", type=float,
+                          help="override the style's zoom ceiling")
+    ly_build.add_argument("--max-operations", type=int, default=400)
+    ly_build.add_argument("--limit", type=int, default=20)
+    _add_common(ly_build)
+    ly_build.set_defaults(func=cmd_layers)
+
+    ly_report = layers_subs.add_parser(
+        "report", help="the full layered report, layer by layer")
+    ly_report.add_argument("--name", default="structure")
+    ly_report.add_argument("--limit", type=int, default=30)
+    _add_common(ly_report)
+    ly_report.set_defaults(func=cmd_layers)
+
+    ly_export = layers_subs.add_parser(
+        "export", help="write the layered plan somewhere of your choosing")
+    ly_export.add_argument("--name", default="structure")
+    ly_export.add_argument("--out", required=True,
+                           help="destination path (.json, or .txt for the report)")
+    _add_common(ly_export)
+    ly_export.set_defaults(func=cmd_layers)
+
+    ly_dry = layers_subs.add_parser(
+        "dry-run", help="validate the layered plan offline (applies nothing)")
+    ly_dry.add_argument("--name", default="structure")
+    ly_dry.add_argument("--limit", type=int, default=40)
+    _add_common(ly_dry)
+    ly_dry.set_defaults(func=cmd_layers)
+
+    ly_exec = layers_subs.add_parser(
+        "execute", help="apply the layers to the rough cut -- needs --yes")
+    ly_exec.add_argument("--name", default="structure")
+    ly_exec.add_argument("--yes", action="store_true",
+                         help="required: confirms you have read the dry run")
+    ly_exec.add_argument(
+        "--allow-active-sequence", action="store_true",
+        help="permit styling a sequence this system cannot prove is the "
+             "rough cut's scratch one. Off by default.")
+    ly_exec.add_argument("--limit", type=int, default=40)
+    _add_common(ly_exec)
+    ly_exec.set_defaults(func=cmd_layers)
+
+    ly_def = layers_subs.add_parser(
+        "show-deferred", help="what the style held back, and why")
+    ly_def.add_argument("--name", default="structure")
+    ly_def.add_argument("--limit", type=int, default=60)
+    _add_common(ly_def)
+    ly_def.set_defaults(func=cmd_layers)
+
+    ly_den = layers_subs.add_parser(
+        "show-density", help="edits per minute, against the style's ceilings")
+    ly_den.add_argument("--name", default="structure")
+    ly_den.add_argument("--limit", type=int, default=40)
+    _add_common(ly_den)
+    ly_den.set_defaults(func=cmd_layers)
 
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")

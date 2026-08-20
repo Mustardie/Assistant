@@ -1,9 +1,10 @@
-# Editing Brain V1 — Structure, Recommendations, Rough Cut, Critic
+# Editing Brain V1 — Structure, Recommendations, Rough Cut, Critic, Style
 
 Turns a folder of Minecraft footage into a machine-readable timeline of **what
 happens on screen**, **what is being said**, and **what is heard** — proposes
 the edits worth making, with the evidence for each one — assembles them into a
-real Premiere rough cut, and then looks at that cut and improves it once.
+real Premiere rough cut, looks at that cut and improves it once, and then
+layers a chosen editing style over it.
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -19,6 +20,10 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
                      Qwen3-VL critic → findings → revision recommendations
                                                     ↓
               offline dry-run → (explicit --yes only) apply to the same sequence
+                                                    ↓
+         style preset → seven layers: captions, emphasis, audio, cards, markers
+                                                    ↓
+        density ceilings enforced → offline dry-run → (--yes only) applied on top
 ```
 
 **Nothing runs unless you say so, twice.** Every plan is validated offline
@@ -26,6 +31,18 @@ first, execution needs an explicit `--yes`, and the target is always a scratch
 sequence — one the rough cut creates itself, and the only one the revision pass
 is allowed to touch. Your open sequence is never edited. Everything the layer
 writes is JSON, plus two plain-text reports.
+
+**A style can only make the edit quieter.** Every number in a preset is a
+ceiling, never a target: the compiler removes candidates to fit inside one, and
+never invents an edit to fill a quota. So a style cannot make the system busier
+than the evidence justifies — which is the difference between an edit that
+feels intentionally styled and one that feels randomly over-edited.
+
+**The style pass cannot change timing.** Its operation allowlist contains no
+`clip.*` operation at all. It adds a track, scales clips already on the
+timeline, writes audio keyframes, places overlays and drops markers — so the
+rough cut's layout is untouched underneath it, and the whole pass can be undone
+by deleting one track and its markers.
 
 **The critic pass is one iteration, not a loop.** It exists to catch the obvious
 mistakes an automatic assembly makes — a zoom that crops the HUD, a caption over
@@ -54,6 +71,12 @@ python -m editing.cli review critique                     # what the critic thin
 python -m editing.cli review plan                         # findings → revisions
 python -m editing.cli review dry-run                      # validate the revisions
 python -m editing.cli review execute --yes                # apply them
+
+python -m editing.cli style list                          # the editing styles
+python -m editing.cli layers build --style fast_funny     # captions, emphasis, audio
+python -m editing.cli layers show-density                 # is it over-edited?
+python -m editing.cli layers dry-run                      # validate the layers
+python -m editing.cli layers execute --yes                # apply them
 ```
 
 Then read the results:
@@ -65,6 +88,8 @@ python -m editing.cli removed      # what the safety pass threw out, and why
 python -m editing.cli draft        # the draft Premiere plan (executes nothing)
 python -m editing.cli review show-issues   # what the critic found, worst first
 python -m editing.cli review report        # the full revision report
+python -m editing.cli layers report        # every layer, and what was held back
+python -m editing.cli layers show-deferred # what the style refused, and why
 ```
 
 Export any artefact to a path of your choosing:
@@ -1093,7 +1118,284 @@ under a list of successes is how a report stops being read.
 
 ---
 
-## 11. Where outputs go
+## 11. Style presets
+
+```bash
+python -m editing.cli style list                    # all four, one line each
+python -m editing.cli style show cinematic_minecraft # every number, and why
+```
+
+A rough cut assembled from recommendations is *correct* and characterless. The
+difference between a cut and an edit is not more effects — it is a consistent
+set of choices about density, emphasis and restraint, applied everywhere. A
+preset is that set of choices, written down.
+
+| Preset | Feel | Edits/min | Captions/min | Zoom | Cards |
+|---|---|---|---|---|---|
+| `cinematic_minecraft` | let it breathe | 1.8 | 0.8 | ≤108% | title |
+| `fast_funny` | keep it moving | 7.0 | 4.0 | ≤118% | title |
+| `documentary_story` | explain it clearly | 2.5 | 2.0 | ≤104% | title + chapter |
+| `minimal_clean` | get out of the way | 0.8 | 0.4 | **none** | none |
+
+`minimal_clean` is the **default**, deliberately: it draws no text and scales
+nothing, so the first style you get without asking is the one that cannot
+surprise you.
+
+Each preset defines pacing density, per-minute ceilings, caption length and
+placement zones, zoom intensity caps, preferred and forbidden edit kinds,
+marker naming, audio placeholder behaviour, and safety thresholds. `style show`
+prints all of it.
+
+### Ceilings only ever subtract
+
+This is the property the whole session rests on. The compiler never adds an
+edit to reach a quota; it only removes candidates that would exceed one. A
+looser style lets more of the evidence through — it cannot manufacture
+evidence. So:
+
+- switching from `minimal_clean` to `fast_funny` can only ever **add** edits
+  that were already justified and held back;
+- a style with `max_zoom_scale: 100.0` emits no zooms at all, in any
+  circumstance;
+- and if a compiled plan ever exceeds its own style's density, that is a bug,
+  not a style choice — there is a test asserting it for every preset.
+
+### Validation
+
+Presets are validated, not trusted. `problems()` returns every fault in plain
+English, naming the field:
+
+```
+max_zoom_scale is 200.0; past about 125% a 1080p source visibly softens and
+the HUD starts leaving the frame.
+max_push_scale (120.0) is above max_zoom_scale (105.0); a gradual push must
+never end up stronger than a hard punch.
+```
+
+A hand-edited preset with one bad number **clamps to something workable**
+rather than stopping a run — the same stance `SamplingConfig` and `AudioConfig`
+take — and `style show` prints the problems so you know what was clamped.
+
+Override any field inline without editing the preset:
+
+```bash
+python -m editing.cli layers build --style fast_funny --max-captions-per-minute 1.5
+python -m editing.cli layers build --style documentary_story --no-zooms
+```
+
+---
+
+## 12. The layered edit
+
+```bash
+python -m editing.cli layers build --style cinematic_minecraft
+python -m editing.cli layers show-density      # edits/min against the ceilings
+python -m editing.cli layers show-deferred     # what was held back, and why
+python -m editing.cli layers report            # the full thing, layer by layer
+python -m editing.cli layers export --out D:/handoff/ep12_layers.json
+python -m editing.cli layers dry-run
+python -m editing.cli layers execute --yes
+```
+
+Seven layers, kept separate all the way to the operation plan — because "the
+captions are too dense" and "the punch-ins are wrong" are separate judgements
+with separate fixes, and a flat list of ninety operations supports neither.
+
+| Layer | What it holds |
+|---|---|
+| `base` | the rough cut's own clips, as read-only context (no operations) |
+| `marker` | structure notes from recommendations nothing else realises |
+| `caption` | reaction captions, key phrases, danger text, callout labels |
+| `emphasis` | punch-ins, push-ins, and markers for the ones refused |
+| `audio` | music/SFX placeholders, plus the two fades that are real |
+| `title` | title and chapter cards at genuine section boundaries |
+| `polish` | colour and transition notes |
+| `deferred` | everything held back, with the reason on each |
+
+### Captions: chosen, condensed, and refused
+
+Captions come **only** from transcript lines that already exist and are already
+aligned to the timeline. Nothing is written or paraphrased.
+
+A line is *scored* against what the picture, the audio and the words are all
+doing at that moment — an audio spike, a payoff on screen, a reaction phrase, a
+named threat, agreement or deadpan disagreement between words and picture — and
+anything below the style's `caption_min_priority` never becomes a candidate.
+"just walking for a bit here nothing much" over boring footage scores below
+every style's bar.
+
+A long line is **condensed to its strongest phrase**, not truncated:
+
+```
+"okay so anyway I think that was probably a creeper behind us"
+                        ↓ max 4 words
+"...that was probably a creeper..."
+```
+
+The window with the most keyword hits wins, ties going to the earliest — a
+viewer reads the front of a line. Truncating instead would keep "okay so anyway
+I think" and throw away the only part worth reading.
+
+Placement is **refused rather than guessed**. Minecraft puts health, hunger and
+the hotbar across the bottom centre and the crosshair dead centre, so those are
+never caption zones. When a full-screen menu is open, when the critic flagged
+text at that moment, or when the style has no safe zone left, the item becomes
+a **marker carrying the line** — never text placed hopefully over the game.
+
+Anti-spam is enforced by the compiler, not here: captions per minute, minimum
+spacing, and a hard rule that two captions never share the screen.
+
+### Visual emphasis: stated as refusals
+
+| Rule | Protects |
+|---|---|
+| a protected hold is not zoomed | the pacing layer's decision to leave a moment raw |
+| a retimed clip is not zoomed | two edits compounding on one piece of footage |
+| a clip with an open UI or low health is not zoomed | what the viewer is reading |
+| a moment the critic flagged is not zoomed | not adding a second problem to one |
+| zooms do not stack | the style's `min_stack_spacing` |
+| the style's ceiling is applied last | no input combination can exceed it |
+
+A refused zoom still leaves a marker saying what was wanted and why it was
+declined. "The system decided not to zoom here" and "the system did nothing
+here" must not look the same on a timeline — the first is a decision an editor
+can overrule in two seconds.
+
+### Audio: honest about what does not exist
+
+No music is on this timeline and no sound library is wired up, so the layer
+splits sharply:
+
+- **Marker-only, because the asset does not exist:** music start and rise,
+  tension beds, impact and comedic SFX, whooshes, ambience, beat anchors, and
+  narration ducking. Each carries type, intensity, reason and evidence.
+  `duck_narration` even carries the computed speech ranges `audio.duck` would
+  need, so adding a bed by hand is a one-step job.
+- **Genuinely convertible:** `audio.fade` at the head and tail of the cut. It
+  acts on clips that are already there, it is reversible, and it is the one
+  audio operation this system can perform truthfully today. So it does.
+
+Cues are anchored to things the timeline already knows — the top of the cut, a
+boundary into a tense stretch, a measured audio spike, a long silence. Nothing
+is placed on a grid. A guessed audio event (capped at 0.45 confidence by the
+Session 2 rule) always ranks below a measured one.
+
+### Title and chapter cards
+
+Only `documentary_story` and `cinematic_minecraft` turn cards on. A card is the
+most intrusive thing this system can place, so the triggers are the strictest:
+the opening; after a death, failure or restart; on entering a new dimension or
+major location; before a stated objective. Never on a clock.
+
+Two rules keep them rare: a section must be at least `min_section_seconds` long
+to earn one, and cards closer than 20 seconds collapse. A run of biome changes
+while sprinting is one journey, not six chapters.
+
+Titles come from what is **actually known** — the environment, or the objective
+the narration stated, taken verbatim. When there is nothing to say, the card
+becomes a marker asking the editor to name it.
+
+### Density: the number that answers the question
+
+```bash
+python -m editing.cli layers show-density
+```
+
+```
+'Nova Rough Cut' in fast_funny -- 200.2s, 33 planned item(s)
+  active edits : 2.40/min (ceiling 7.0)
+  captions     : 1.80/min (ceiling 4.0)
+  zooms        : 1.20/min (ceiling 2.5)
+  markers      : 6.29/min
+
+  minute   active  captions  zooms  markers
+      0        2         1      0        6  ##
+      1        3         2      1        9  ###
+      2        2         2      0        6  ##
+      3        1         0      0        0  #
+```
+
+Per-minute buckets rather than a single average, because an average hides the
+case this exists to catch: a calm episode with one frantic minute in the middle.
+
+**Markers are not capped.** They change nothing, and an editor is well served
+by plenty of them — the asymmetry between cheap annotation and expensive
+picture change runs through the whole layer.
+
+The rules, applied to each candidate **most defensible first**, so a ceiling
+removes the weakest ideas rather than whichever came last:
+
+1. style permission — a forbidden kind never gets further;
+2. confidence — below the style's `min_confidence`, it is a note, not an edit;
+3. duplication — against the rough cut's existing markers *and* this pass;
+4. spacing — the style's own `min_edit_spacing` / `min_caption_spacing`;
+5. the rate itself, in one of two regimes (below);
+6. stacking — two changes to the *same sense* inside `min_stack_spacing`.
+
+Stacking is per sense: two things happening to the picture at once fight each
+other, but an audio fade under a title card is ordinary editing.
+
+**"N per minute" means two different things above and below one**, and the
+compiler treats them differently:
+
+- **At or above one a minute** it is a *rolling window count* — no more than
+  the rate inside any 60 seconds, or inside the whole cut when the cut is
+  shorter than that. Spacing stays the style's own explicit field, because how
+  tightly a style clusters is a separate choice from how many it allows.
+- **Below one a minute** a window count floors to zero and would forbid
+  everything, so it becomes a *whole-cut budget* (`rate × minutes`) plus the
+  spacing the rate implies (`60 / rate`). "0.4 zooms a minute" means one every
+  150 seconds, and none at all in a cut too short to have earned one.
+
+There is deliberately **no "at least one" floor**. A 30-second cut allowed 0.2
+zooms gets none — a ceiling a short cut may exceed is not a ceiling.
+
+A **section boundary held back for room still leaves a marker** rather than
+vanishing. A documentary that silently loses a chapter has lost the thing the
+style was chosen for.
+
+### Executing it
+
+The tightest allowlist of the three passes:
+
+```
+sequence.activate   track.add   animate   audio.fade   text.create   marker.add
+```
+
+No `clip.*` operation at all, so a style pass **cannot** trim, retime, move,
+split or remove a clip. Two consequences worth stating:
+
+- **Nothing ripples**, so no marker or overlay can end up describing a frame
+  that moved out from under it. The Session 4 revision pass had to compute
+  ripple corrections offline and warn they were unverified; this one has
+  nothing to correct.
+- **The pass is reversible by hand.** Every overlay lands on one added track
+  and every marker carries its item ID.
+
+Otherwise the guards are the familiar ones: no default runs anything, a dry run
+must pass *in the same call*, the first operation must be `sequence.activate`
+naming the rough cut's own sequence, the rough cut must have been built, and a
+refusal is a returned result with its reason.
+
+```bash
+python -m editing.cli layers execute          # refuses: needs --yes
+python -m editing.cli layers execute --yes    # runs, after validating again
+```
+
+Two flags make a pass safer still:
+
+```bash
+python -m editing.cli layers build --style fast_funny --markers-only
+python -m editing.cli layers build --style fast_funny --no-text --no-zooms
+```
+
+`--markers-only` records every choice as a note and draws nothing at all — the
+safest possible pass, and a good way to read what a style *wants* to do before
+letting it do any of it.
+
+---
+
+## 13. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
@@ -1116,6 +1418,9 @@ data/editing/
 ├── critic/structure.revisions.txt  ← the human-readable revision report
 ├── critic/structure.revision-plan.json      the operations + dry-run result
 ├── critic/structure.revision-execution.json what happened when it was applied
+├── layers/structure.json           ← the layered edit: every layer + operations
+├── layers/structure.txt            ← the human-readable layered report
+├── layers/structure.execution.json what happened when it was applied
 ├── frames/                         extracted JPEGs (deleted unless --keep-frames)
 └── cache/
     ├── probe/       ffprobe results
@@ -1139,7 +1444,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 12. Caching
+## 14. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -1175,10 +1480,10 @@ that window.
 
 ---
 
-## 13. Tests
+## 15. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 678 tests, ~9s
+python -m pytest tests/editing -q        # 804 tests, ~9s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -1199,6 +1504,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_recommend.py` | layers, safety pass, dry-run, no execution |
 | `test_editing_roughcut.py` | selection, layout maths, conversion, **execution guards** |
 | `test_editing_critic.py` | frame coverage, critic coercion, **the finding/fix line**, revision guards |
+| `test_editing_style.py` | preset validation, **density ceilings**, caption selection, emphasis safety, layer guards |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
 
 Tests worth knowing about, because they pin the promises this layer makes:
@@ -1236,6 +1542,20 @@ Tests worth knowing about, because they pin the promises this layer makes:
   can emit and the set it is permitted to emit are the same set
 - `test_the_rough_cut_report_survives_the_revision_pass` — a second opinion does
   not overwrite the thing it is judging
+- `test_no_style_ever_exceeds_its_own_ceilings` — run for all four presets on
+  the same input; this is the premise of the style layer, asserted directly
+- `test_a_style_pass_can_never_change_timing` / `test_the_allowlist_is_the_whole_guarantee`
+  — the additive-only guarantee, pinned from both ends
+- `test_two_captions_never_share_the_screen` and
+  `test_a_dull_line_over_dull_footage_never_becomes_a_caption` — the two halves
+  of not spamming text
+- `test_the_keyword_lists_are_disjoint` — one word in two lists scored an
+  utterance twice, which is how a caption reached 1.0 and outranked a chapter
+  card
+- `test_a_card_held_back_for_room_still_leaves_a_marker` — a documentary never
+  silently loses a chapter
+- `test_the_rough_cut_survives_being_styled` — restyling replaces the layer
+  plan and nothing else
 
 ---
 
@@ -1363,6 +1683,46 @@ exposure lift would be inventing a grade. Brightness findings become markers.
 **Nothing here is a loop.** Running `review critique` twice re-judges the same
 frames; running it after applying revisions requires re-exporting frames from an
 updated cut, which this session does not automate. One pass, on purpose.
+
+**Style presets are opinions, not measured optima.** 1.8 edits a minute for
+`cinematic_minecraft` and 7 for `fast_funny` are starting points chosen to feel
+distinct, not values derived from anything. They are meant to be edited — that
+is why `style show` prints every number and why every field can be overridden
+from the command line.
+
+**Caption selection is keywords, not understanding.** The scorer is a
+deterministic keyword-and-context heuristic, English-only, tuned for Minecraft
+commentary. It will miss sarcasm, running jokes and anything needing memory
+across an episode, and it will occasionally caption a line that reads flat on
+screen. It is explainable and free, which is why it is a heuristic; a model
+pass could sit on top of it without changing the schema.
+
+**Text is rasterised, not live.** `text.create` uses `engine="render"`, which
+produces a PNG overlay — available on every install, and **not editable inside
+Premiere after placement**. The MOGRT path gives live text but needs a
+registered template (`premiere.styles.set_default_mogrt`); until one is
+registered, restyling a caption means deleting it and rebuilding.
+
+**Everything the style layer draws lands on one added video track.** There is
+no track model beyond that: no B-roll, no picture-in-picture, no per-layer
+track assignment. It does mean the whole pass can be removed by deleting that
+track.
+
+**No music, no sound effects, no callout graphics exist.** Every audio cue
+except the two fades is a marker, and every callout is a label naming what to
+point at. `layers show-deferred` and the `marker_only` count in the report say
+exactly how much of a pass is placeholder rather than edit — usually most of it.
+
+**Chapter detection is structural, not semantic.** It fires on dimension
+changes, deaths and stated objectives. A section boundary a human would feel —
+a change of goal, a shift in tone — is invisible to it unless the narration
+says so out loud.
+
+**The style layer does not re-cut.** `trim_aggression` and `dead_air_tolerance`
+are carried on the preset and reported, but this pass cannot act on them: it
+has no `clip.*` operation. Changing the pacing of the assembly itself means
+rebuilding the rough cut with different `--keep-threshold` and `--filler-speed`
+values.
 
 ---
 

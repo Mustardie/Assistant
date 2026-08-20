@@ -383,6 +383,16 @@ class EditingConfig:
         return self.output_dir / "review"
 
     @property
+    def layers_dir(self) -> Path:
+        """Layered, styled edit plans and their reports.
+
+        Separate from ``roughcut_dir`` for the same reason ``critic_dir`` is:
+        a style pass is one interpretation of a cut, and re-styling must never
+        be able to destroy the cut being styled.
+        """
+        return self.output_dir / "layers"
+
+    @property
     def critic_dir(self) -> Path:
         """Critic findings, revisions and revision plans.
 
@@ -405,6 +415,7 @@ class EditingConfig:
             self.visual_dir, self.timelines_dir, self.frames_dir,
             self.audio_dir, self.recommendations_dir, self.plans_dir,
             self.roughcut_dir, self.review_dir, self.critic_dir,
+            self.layers_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

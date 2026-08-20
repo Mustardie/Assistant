@@ -1,13 +1,13 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-20 (Session 4).
+Context for continuing this work in a new chat. Updated 2026-08-20 (Session 5).
 
 ---
 
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all four sessions and 678 passing editing tests.
+This has all five sessions and 804 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -28,7 +28,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in four sessions
+## What was built, in five sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -50,6 +50,14 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
                                                     ↓
               offline dry-run → (explicit --yes only) apply to the same
                                 scratch sequence, under an op allowlist
+                                                    ↓
+        style preset → seven layers of candidates: captions, visual emphasis,
+        audio placeholders, title/chapter cards, structure and polish markers
+                                                    ↓
+     dedupe → per-minute density ceilings → ordered, additive-only operations
+                                                    ↓
+              offline dry-run → (explicit --yes only) applied on top of the
+                                same scratch sequence, changing no timing
 ```
 
 ### Session 1 — structure layer (`aa29677`)
@@ -58,21 +66,15 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
   **read-only** Premiere project mapping
 - `editing/transcripts/` — SRT/VTT/CSV/JSON/timestamped-TXT, Premiere
   Speech-to-Text via XMP word markers, sidecar auto-discovery
-- `editing/visual/` — sampling planner (motion-driven densification),
-  Qwen3-VL client (OpenAI-compatible / Ollama / mock), analyzer
+- `editing/visual/` — sampling planner, Qwen3-VL client, analyzer
 - `editing/align.py` — combined timeline with match/contrast/neutral alignment
 - `editing/cache.py` — keyed on fingerprint + model + sampling config
-
-Added two Premiere ops: `transcript.caps` and `transcript.read`
-(`extensions/PremiereBridge/host/modules/transcript.jsx`). Adobe documents no
-transcript API, so `caps` *measures* what the running build exposes.
 
 ### Session 2 — audio + recommendations (`9cfac35`, `bf1ca21`, `b50cad6`)
 
 - `editing/audio/` — silence, spikes, sudden reactions, clipping, low energy,
   speech density, plus inferred laughter/scream/music
-- `editing/recommend/` — six layers (story, pacing, visual, audio, polish,
-  safety) producing `EditRecommendation` records with evidence
+- `editing/recommend/` — six layers producing `EditRecommendation` records
 
 ### Session 3 — rough cut (`05baf82`, `1066d33`)
 
@@ -81,115 +83,111 @@ transcript API, so `caps` *measures* what the running build exposes.
 
 ### Session 4 — critic + one revision pass
 
-- `editing/critic/` — the whole pass:
-  - `schema.py` — `CriticFinding`, `RevisionRecommendation`, `RevisionPlan`
-  - `frames.py` — coverage rules and context enrichment (pure)
-  - `prompt.py` — what the critic is asked
-  - `critic.py` — the model call, the coercion, `MockCritic`
-  - `revise.py` — findings → revisions; **the safety rules live here**
-  - `plan.py` — accepted revisions → one ordered operation plan
-  - `execute.py` — three modes, the allowlist, the guards
-  - `report.py` — the human-readable output
-- `editing/roughcut/review.py` — `ReviewFrame` extended with context fields;
-  `export_frames(frames=...)` is the seam the critic plans through
-- `editing/roughcut/schema.py` — `ClipPlacement.sequence_to_source`, the
-  inverse the review pass needs
-- `editing/config.py` — `critic_dir`
-- `editing/pipeline.py` — `critique`, `revise`, `run_revisions`, and the
-  load/write pairs for each artefact
-- `editing/cli.py` — `review` became a subcommand group
-  (`export-frames | critique | plan | dry-run | execute --yes | report |
-  show-issues`); a bare `review` still means `export-frames`
-- `tests/editing/test_editing_critic.py` — 116 tests
+- `editing/critic/` — coverage frames, the Qwen3-VL critic, findings →
+  revisions, the revision plan, three execution modes with an op allowlist
+
+### Session 5 — style presets + layered execution
+
+- `editing/style/`
+  - `presets.py` — four `StylePreset`s, as numbers, with validation
+  - `schema.py` — `LayerItem`, `LayeredEditPlan`, seven layers
+  - `captions.py` — which lines earn text, condensing, safe zones
+  - `emphasis.py` — punches and pushes, stated as refusals
+  - `audio.py` — placeholders, plus the two fades that are real
+  - `cards.py` — title/chapter cards at genuine section boundaries
+  - `compile.py` — dedupe, density enforcement, ordered operations
+  - `execute.py` — three modes, the additive-only allowlist, the guards
+  - `report.py` — layer-by-layer output, density view, deferred view
+- `editing/config.py` — `layers_dir`
+- `editing/pipeline.py` — `layers`, `run_layers`, load/write pairs
+- `editing/cli.py` — `style list|show`, and `layers build|report|export|
+  dry-run|execute --yes|show-deferred|show-density`
+- `tests/editing/test_editing_style.py` — 126 tests
 
 ---
 
 ## Design decisions worth not re-litigating
 
 **Inferred audio is capped at 0.45 confidence.** Silence and clipping are
-*measured*; laughter and screaming are guessed from a loudness curve. The cap
-is enforced in code (`AudioConfig.max_inferred_confidence`), not just
-documented. A transcript marker (`[laughs]`) scores 0.85 and supersedes the
-heuristic guess so one laugh is not counted twice.
+*measured*; laughter and screaming are guessed. Enforced in code
+(`AudioConfig.max_inferred_confidence`), and it survives all the way into the
+style layer — a guessed SFX placeholder always ranks below a measured one.
 
 **`hold` is a first-class recommendation category.** A planner that can only
 say "cut here" edits everything.
 
-**The safety pass marks, never deletes.** Rejected and downgraded
-recommendations stay in the output with a reason.
+**Nothing is ever deleted, only marked.** The Session 2 safety pass, the
+Session 4 critic and the Session 5 compiler all record what they refused and
+why. Three passes, one rule.
 
-**Sequence layout is computed offline.** A clip sped 2x occupies half its
-source duration and everything after it moves — all arithmetic, done before
-Premiere is touched. That is what makes the plan dry-runnable.
+**Sequence layout is computed offline.** All the arithmetic happens before
+Premiere is touched, which is what makes every plan dry-runnable.
 
-**Speed ops run back-to-front with ripple.** Rippling shifts later clips, so
-working backwards means each clip is still where the plan says. Markers and
-zooms come after all retiming. Revision trims follow the same rule.
+**Execution guards, in all three passes:** no default runs anything; a dry run
+must pass in the *same* call (a stored pass is not evidence about this plan);
+the target must be provably the scratch sequence; a refusal is a returned
+result with a reason.
 
-**Execution has four guards, each refusing rather than warning:** no default
-runs anything; a dry run must pass in the *same* call; the target must
-*structurally* create and activate its own sequence (checked, not trusted from
-a flag); a refusal is a result with a reason.
+### From Session 4
 
-### New in Session 4
+**A finding is not a fix.** `CriticFinding` and `RevisionRecommendation` are
+separate records and the conversion is explicit rules.
 
-**A finding is not a fix.** `CriticFinding` (what the model saw) and
-`RevisionRecommendation` (what the system proposes) are separate records, and
-the conversion is a set of explicit rules in `revise.py`. This is what makes
-"unsafe findings stay recommendations" enforceable rather than aspirational.
+**A fix may only act on a premise the plan confirms.** A critic hallucinating a
+zoom must not be able to make the system edit one that never existed.
 
-**Confidence gates action; severity does not.** 0.60 to change the edit at all,
-0.70 for timing, 0.80 to cut footage. Severity only decides how loudly it is
-reported and whether it earns a marker.
+### From Session 5
 
-**A fix may only act on a premise the plan confirms.** `reduce_zoom` needs a
-zoom in the plan at that moment; `trim_dead_air` needs an audio event;
-`extend_hold` needs source headroom. Without it the fix is refused with
-`not_verifiable`. **A critic hallucinating a zoom must not be able to make the
-system edit one that never existed** — this is the single most important rule
-in the session and it has a test named after it.
+**Ceilings only ever subtract.** Every density field in a preset is a maximum.
+The compiler removes candidates to fit; it never invents one to fill a quota.
+A style cannot make the system busier than the evidence justifies — only
+quieter. This is the difference between "intentionally styled" and "randomly
+over-edited", and there is a test asserting it for all four presets on the same
+input.
 
-**Amounts are fixed, not suggested.** 106% for a reduced zoom, ≤0.5s for a hold
-extension, ≤1.0s for a trim, never leaving a clip under 1.0s. "Make it a bit
-less" from a VLM is not a number.
+**The style pass is additive only.** Its allowlist contains no `clip.*`
+operation, so it cannot trim, retime, move, split or remove a clip. Two things
+follow: nothing ripples (so unlike Session 4 there are no marker positions to
+correct and no unverified assumption), and the whole pass can be undone by
+deleting one track and its markers.
 
-**One frame per model call.** A small VLM shown six stills attributes a problem
-in frame four to frame one. A finding at the wrong moment is worse than none.
+**Markers are free; picture changes are expensive.** Markers are not counted
+against any ceiling, and `is_active` is false for a marker-only item — so a
+caption that could not be placed safely does not spend the budget that would
+have let the next real edit through.
 
-**The revision allowlist is the whole guarantee.** A rough cut proves safety by
-creating its own sequence; a revision cannot, because it edits one that already
-exists. Instead: the first op must be `sequence.activate` naming the rough
-cut's sequence, and every op must be one of six
-(`sequence.activate`, `property.reset`, `animate`, `clip.trim`, `marker.add`,
-`marker.remove`). Nothing on that list can reach another sequence or the disk.
-A test asserts the set of ops the code can emit equals the allowlist.
+**Refusing to place text is a first-class outcome.** When a menu is open, when
+the critic flagged the moment, or when no safe zone is left, the caption
+becomes a marker *carrying the line*. Never text placed hopefully over the
+game.
 
-**The rough cut's report is never overwritten.** Critic output lives in
-`data/editing/critic/`. A second opinion that destroyed its own baseline would
-be worthless.
+**A section boundary held back for room still leaves a marker.** Everything
+else deferred stays deferred, but a documentary that silently loses a chapter
+has lost the thing the style was chosen for.
 
-**Review-frame dedupe is per-clip, never across a cut.** The two edge probes
-either side of a cut are always closer together than the collapse threshold, so
-a global dedupe silently drops *every* incoming-cut frame in the review. This
-was a real bug found by running the CLI on real footage, and
-`test_both_sides_of_a_cut_are_sampled` is what stops it coming back.
+**Stacking is per sense.** Two things happening to the picture at once fight
+each other; an audio fade under a title card is ordinary editing. Enforcing one
+global stack rule made the pass drop fades for no reason.
 
-**The revision report leads with what it could not fix.** The automatic fixes
-are bounded and reversible by construction; the deferred findings are where the
-real problems are. Burying them under a list of successes is how a report stops
-being read.
+**Density is a window count, not a derived spacing.** Deriving "60/rate seconds
+apart" from the per-minute ceiling forced perfectly even distribution, and a
+style advertising seven edits a minute delivered four. The rate is now a count
+inside a rolling 60-second window (the whole cut, when the cut is shorter than
+a minute, so the headline figure stays honest); *spacing* comes from the
+style's own `min_edit_spacing` / `min_caption_spacing` fields, which is what
+those fields are for. The one exception is a rate below one per minute, which
+cannot be a window count at all and does imply spacing.
 
 ---
 
 ## Current state
 
-- **678 editing tests**, ~9s, needing no FFmpeg, GPU, model server or Premiere
-- `tests/premiere/` passes too (953 across both suites). The 30 failures noted
-  in the previous handoff no longer reproduce.
+- **804 editing tests**, ~9s, needing no FFmpeg, GPU, model server or Premiere
+- `tests/premiere/` passes too (1081 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
-  client) are pre-existing and unrelated to this work.
-- `editing/README.md` is the full user documentation (~1400 lines); sections 9
-  and 10 cover the critic pass.
+  client) are pre-existing and unrelated to this work
+- `editing/README.md` is the full user documentation (~1740 lines); sections 11
+  and 12 cover the style layer
 
 **Note on running the tests here:** pytest's default temp root
 (`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
@@ -203,39 +201,49 @@ python -m pytest tests/editing -q --basetemp=%TEMP%\pt
 
 ## The honest gaps
 
-1. **Never tested with a real Qwen3-VL critic.** The whole pass has been run end
-   to end on real footage with real FFmpeg, but only with `MockCritic`, which
-   reads frame metadata rather than pictures. **The critic prompt has never been
-   seen by a model.** This is the highest-value next action.
-2. **Marker positions after a timing change are computed, not observed.**
-   Premiere sequence markers do not ripple with clips. New markers this pass
-   places are corrected offline; pre-existing rough-cut markers after a trim are
-   counted and warned about, not moved. `--no-timing` avoids it entirely.
-3. **Speed ripple is still assumed, not verified** (Session 3's gap, unchanged).
-4. **Only markers convert in the Session 2 *draft* plan.** The rough cut and the
-   revision pass convert more; text, colour, transitions and audio still do not.
-5. **Single video track.** Everything assembles onto V1.
-6. **Audio is carried, not mixed.** No ducking, levelling or music bed.
-7. **Punch-ins are blind to composition** at planning time. The critic can now
-   catch a bad one *after the fact*, which is the mitigation, not a fix.
-8. **The pass is one iteration.** Re-critiquing after applying revisions needs
-   frames re-exported from an updated cut, which is not automated.
-9. **Text fixes move a placeholder marker, not text.** No graphic exists.
+1. **Never tested with a real Qwen3-VL critic.** The critic pass has been run
+   end to end on real footage with real FFmpeg, but only with `MockCritic`.
+   **The critic prompt has never been seen by a model.** Still the
+   highest-value next action.
+2. **Never executed against real Premiere.** Every plan in Sessions 3–5
+   dry-runs clean, but the only thing that has run against the real host is the
+   Premiere self-test. The first real `execute --yes` will find things the
+   validator cannot.
+3. **`text.create` uses the rasterised path**, so captions are PNG overlays and
+   are **not editable in Premiere after placement**. Live text needs a
+   registered `.mogrt` template.
+4. **Style numbers are opinions**, not measured optima. They are meant to be
+   edited.
+5. **Caption selection is keywords**, English-only, tuned for Minecraft
+   commentary. It will miss sarcasm and running jokes.
+6. **Chapter detection is structural** (dimension change, death, stated
+   objective). A tonal section change is invisible to it.
+7. **Single video track for overlays**, single video track for the assembly.
+   No B-roll, no picture-in-picture.
+8. **No music, SFX or callout graphics exist.** Every audio cue except the two
+   fades is a marker; usually most of a styled pass is placeholder.
+9. **The style layer cannot re-cut.** `trim_aggression` and
+   `dead_air_tolerance` are carried and reported but not acted on — changing
+   the assembly's pacing means rebuilding the rough cut.
+10. **Marker positions after a Session 4 timing change are computed, not
+    observed** (unchanged from Session 4; `review plan --no-timing` avoids it).
+11. **Speed ripple is still assumed, not verified** (Session 3's gap).
 
 ---
 
 ## Natural next steps
 
-- **Run the critic against a real Qwen3-VL server** on a cut built from real
-  footage, and read the findings. Expect the prompt to need tuning — the issue
-  guide and the "most frames are fine" instruction are the two levers.
-- **Measure the accept/defer ratio on real output.** If nearly everything
-  defers, the thresholds are too tight; if a lot converts, look hard at whether
-  the premise checks are actually catching hallucinated zooms.
-- **A second critic iteration**, driven off a re-export after revisions apply.
-- **Sequence-aware conversion** — once footage is on a timeline, the
-  currently-unconvertible categories become reachable.
-- **Audio mixing** — turn the ducking/music placeholders into real operations.
+- **Run the critic against a real Qwen3-VL server**, then read the findings.
+  Expect the prompt to need tuning.
+- **Execute a styled pass against real Premiere**, starting with
+  `layers build --style minimal_clean --markers-only` — which draws nothing,
+  scales nothing, and only places markers. If that lands cleanly, step up to
+  `cinematic_minecraft` and then to a style that draws text.
+- **Register a `.mogrt` template** so captions become live text.
+- **Tune the presets against real footage.** The accept/defer ratio per style
+  is the number to watch: `layers show-deferred` groups it by reason.
+- **Audio mixing** — turn the placeholders into real operations once a library
+  exists. The schema and the ranges are already there.
 
 ---
 
@@ -245,42 +253,41 @@ python -m pytest tests/editing -q --basetemp=%TEMP%\pt
 cd /d E:\Assistant
 git checkout claude/editing-brain-v1-structure-7p33pm
 
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt   REM expect 678 passed
-python -m editing.cli doctor                             REM what is available
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt   REM expect 804 passed
+python -m editing.cli doctor
 ```
 
 Put 3–4 short clips (1–3 min each) in one folder, then:
 
 ```cmd
-REM Stage 1 — plumbing, no GPU needed
-python -m editing.cli run --folder D:\Footage\test --recommend ^
-    --backend mock --max-windows 8 --no-premiere
-
-REM Stage 2 — real vision model
+REM Stages 1-3: structure, recommendations, rough cut
 python -m editing.cli run --folder D:\Footage\test --recommend --no-premiere
-
-REM Stage 3 — rough cut
 python -m editing.cli roughcut build
 python -m editing.cli roughcut dry-run
 python -m editing.cli roughcut execute --yes
 
-REM Stage 4 — the critic pass
+REM Stage 4: the critic pass
 python -m editing.cli review export-frames
-python -m editing.cli review export-frames --list    REM see the choice first
-python -m editing.cli review critique --backend mock REM plumbing check
-python -m editing.cli review critique                REM the real critic
-python -m editing.cli review show-issues --severity medium
+python -m editing.cli review critique
 python -m editing.cli review plan
-python -m editing.cli review report
 python -m editing.cli review dry-run
 python -m editing.cli review execute --yes
+
+REM Stage 5: the styled, layered edit
+python -m editing.cli style list
+python -m editing.cli style show cinematic_minecraft
+python -m editing.cli layers build --style minimal_clean --markers-only
+python -m editing.cli layers show-density
+python -m editing.cli layers show-deferred
+python -m editing.cli layers report
+python -m editing.cli layers dry-run
+python -m editing.cli layers execute --yes
 ```
 
-`--backend mock` marks every event and every finding `mock: true`, so mock
-output can never be mistaken for real analysis. FFmpeg is required for audio and
-review frames; without it the audio layer degrades to transcript markers only
-and says so.
+Restyling is free and non-destructive: `layers build --style <other>` replaces
+the layer plan and touches nothing else. The rough cut, the critique and the
+revisions all survive it.
 
-If a revision pass looks too aggressive, the two dials are
-`review plan --no-timing` (no trims or extensions at all) and
-`review plan --min-confidence 0.8`.
+If a styled pass looks too busy, the dials in order of bluntness are
+`--markers-only` (draws nothing at all), `--no-text` / `--no-zooms`,
+`--max-edits-per-minute N`, or simply a tighter preset.
