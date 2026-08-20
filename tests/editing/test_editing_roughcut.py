@@ -861,3 +861,74 @@ def test_the_plan_warns_when_audio_is_missing():
     timeline = timeline_of([visual(0, 20, importance="payoff")])
     plan = build_rough_cut(timeline, assets=[ASSET])
     assert any("audio" in warning.lower() for warning in plan.warnings)
+
+
+# ---------------------------------------------------------------------------
+# Multiple source files
+# ---------------------------------------------------------------------------
+
+def _multi_timeline():
+    """Four clips, deliberately named so hash order != filename order."""
+    from editing.fingerprint import asset_id_for
+
+    assets, events = [], {}
+    for index in range(1, 5):
+        path = f"/footage/clip{index}.mp4"
+        asset = MediaAsset(
+            asset_id=asset_id_for(path), path=path,
+            filename=f"clip{index}.mp4", duration=40.0,
+        )
+        assets.append(asset)
+        events[asset.asset_id] = [
+            VisualEvent(
+                event_id=f"e_{index}_{start}", source_file=path,
+                asset_id=asset.asset_id, start=start, end=start + 10,
+                confidence=0.85, environment="cave", actions=["mining"],
+                importance="payoff" if start == 10 else "setup",
+                suggested_range=TimeRange(start, start + 10), model="Q",
+            )
+            for start in (0, 10, 20)
+        ]
+    return assets, build_timeline(assets, events, {})
+
+
+def test_clips_assemble_in_filename_order_not_hash_order():
+    """Asset ids are hashes; sorting by them scrambles a capture session."""
+    assets, timeline = _multi_timeline()
+    plan = build_rough_cut(timeline, assets=assets)
+
+    order = []
+    for placement in plan.placements:
+        name = placement.source_file.rsplit("/", 1)[-1]
+        if name not in order:
+            order.append(name)
+    assert order == ["clip1.mp4", "clip2.mp4", "clip3.mp4", "clip4.mp4"]
+
+
+def test_every_source_file_is_imported_once():
+    assets, timeline = _multi_timeline()
+    plan = build_rough_cut(timeline, assets=assets)
+
+    imports = [op for op in plan.ops if op["op"] == "project.import"]
+    assert len(imports) == 1
+    assert sorted(imports[0]["paths"]) == sorted(a.path for a in assets)
+
+
+def test_a_multi_clip_layout_is_contiguous_and_validates():
+    assets, timeline = _multi_timeline()
+    plan = build_rough_cut(timeline, assets=assets)
+
+    assert plan.dry_run_passed is True
+    for earlier, later in zip(plan.placements, plan.placements[1:]):
+        assert later.sequence_start == pytest.approx(earlier.sequence_end)
+
+
+def test_ranges_never_span_two_files():
+    """A merge across files would splice unrelated footage into one clip."""
+    assets, timeline = _multi_timeline()
+    plan = build_rough_cut(timeline, assets=assets)
+
+    for placement in plan.placements:
+        owner = next(a for a in assets if a.asset_id == placement.asset_id)
+        assert placement.source_file == owner.path
+        assert placement.source_out <= owner.duration + 1.0

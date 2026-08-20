@@ -110,7 +110,11 @@ def select_ranges(
     trims = _trim_ranges(recommendations)
     selected: list[SelectedRange] = []
 
-    segments = sorted(timeline.segments, key=lambda s: (s.asset_id, s.start))
+    # Ordered by file *path*, not asset id. An asset id is a hash, so sorting
+    # by it would assemble a session's clips in an arbitrary order --
+    # clip1, clip3, clip4, clip2. Path order matches how the files are named,
+    # which for a numbered capture session is recording order.
+    segments = sorted(timeline.segments, key=lambda s: (s.source_file, s.start))
     for index, segment in enumerate(segments):
         following = segments[index + 1] if index + 1 < len(segments) else None
         decision = _decide(
@@ -268,7 +272,7 @@ def _merge(ranges: Sequence[SelectedRange]) -> list[SelectedRange]:
     a speed -- joining a 2x filler run to a 1x payoff would silently retime the
     payoff.
     """
-    ordered = sorted(ranges, key=lambda entry: (entry.asset_id, entry.start))
+    ordered = sorted(ranges, key=lambda entry: (entry.source_file, entry.start))
     merged: list[SelectedRange] = []
 
     for entry in ordered:
