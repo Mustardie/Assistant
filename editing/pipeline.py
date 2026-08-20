@@ -43,6 +43,12 @@ from editing.recommend.planner import PlannerOptions, plan_recommendations
 from editing.recommend.premiere_plan import DraftPlan, build_and_dry_run
 from editing.recommend.schema import RecommendationSet
 from editing.roughcut import execute as roughcut_execute, review as review_module
+from editing.assets import compile as asset_compile
+from editing.assets import execute as asset_execute
+from editing.assets import indexer as asset_indexer
+from editing.assets import library as asset_library
+from editing.assets import report as asset_report
+from editing.assets.schema import AssetLibrary, AssetPlacementPlan
 from editing.style import compile as style_compile, execute as style_execute
 from editing.style import presets as style_presets, report as style_report
 from editing.style.schema import LayeredEditPlan
@@ -1257,6 +1263,270 @@ class Pipeline:
                 f"No layer execution report named '{name}' exists yet",
                 hint="Run `python -m editing.cli layers dry-run` or "
                      "`layers execute --yes` first.",
+            )
+        return ExecutionReport.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    # ------------------------------------------------------------------
+    # Assets
+    # ------------------------------------------------------------------
+
+    def init_assets(self, *, root: Optional[str] = None) -> dict:
+        """Create the asset folder structure. Never overwrites anything."""
+        target = asset_library.resolve_root(self.config, root)
+        result = asset_library.initialise(target)
+        self.say(
+            f"Asset library at {target}: {len(result['created'])} folder(s) "
+            f"created, {len(result['existing'])} already there."
+        )
+        for path in result["docs"]:
+            self.say(f"  wrote {Path(path).name}")
+        return result
+
+    def index_assets(
+        self,
+        *,
+        root: Optional[str] = None,
+        probe_durations: bool = True,
+        reuse: bool = True,
+        save: bool = True,
+    ) -> AssetLibrary:
+        """Scan the asset folders into an index."""
+        previous = None
+        if reuse:
+            try:
+                previous = self.load_asset_library(root=root)
+            except EditingError:
+                previous = None
+
+        library = asset_indexer.index_library(
+            self.config, root=root, previous=previous,
+            probe_durations=probe_durations, say=self.say,
+        )
+        for warning in library.warnings:
+            self.say(f"  ! {warning}")
+        if save:
+            self.write_asset_library(library, root=root)
+        return library
+
+    def write_asset_library(
+        self, library: AssetLibrary, *, root: Optional[str] = None
+    ) -> Path:
+        target = asset_library.index_path(self.config, root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(library.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_asset_library(self, *, root: Optional[str] = None) -> AssetLibrary:
+        target = asset_library.index_path(self.config, root)
+        if not target.exists():
+            raise EditingError(
+                "The asset library has not been indexed yet",
+                hint="Run `python -m editing.cli assets index` first "
+                     "(`assets init` creates the folders).",
+                detail={"expected": str(target)},
+            )
+        return AssetLibrary.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def asset_library_or_empty(
+        self, *, root: Optional[str] = None
+    ) -> AssetLibrary:
+        """The index, or an empty library rather than an error.
+
+        An empty library is a valid input that produces a complete plan of
+        markers, so the planning path should not require anyone to have run
+        the indexer first.
+        """
+        try:
+            return self.load_asset_library(root=root)
+        except EditingError:
+            return AssetLibrary(
+                root=str(asset_library.resolve_root(self.config, root)),
+                warnings=[
+                    "No asset index exists yet, so this ran against an empty "
+                    "library. Run `assets index` once the folders have files "
+                    "in them."
+                ],
+            )
+
+    def asset_plan(
+        self,
+        *,
+        name: str = "structure",
+        root: Optional[str] = None,
+        library=None,
+        layers=None,
+        style=None,
+        timeline: Optional[StructureTimeline] = None,
+        revisions=None,
+        options=None,
+        limits=None,
+        save: bool = True,
+    ) -> AssetPlacementPlan:
+        """Resolve every layer placeholder against the asset library."""
+        if layers is None:
+            layers = self.load_layers(name=name)
+        if library is None:
+            library = self.asset_library_or_empty(root=root)
+        if timeline is None:
+            timeline = self._timeline_or_none(name)
+        if revisions is None:
+            revisions = self._revisions_or_none(name)
+
+        preset = style
+        if preset is None:
+            from editing.style import presets as style_presets
+
+            preset = style_presets.get(layers.style or None)
+
+        plan = asset_compile.compile_assets(
+            layers, library,
+            style=preset,
+            timeline=timeline,
+            revisions=revisions,
+            options=options,
+            limits=limits,
+            roughcut_executed=layers.roughcut_executed,
+        )
+        asset_execute.dry_run(plan)
+
+        stats = plan.stats()
+        self.say(
+            f"Asset placement for '{plan.sequence_name}' [{plan.style}]: "
+            f"{stats['placed']} placed, {stats['missing']} missing, "
+            f"{stats['rejected']} rejected, {stats['unsafe']} unsafe."
+        )
+        self.say(
+            f"  {plan.operation_count} operation(s), dry run "
+            + ("passed" if plan.dry_run_passed else "FAILED") + "."
+        )
+        if plan.dry_run_error:
+            self.say(f"  ! {plan.dry_run_error.get('error')}")
+        for warning in plan.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_asset_plan(plan, name=name)
+            self.write_asset_report(plan, library=library, name=name)
+        return plan
+
+    def write_asset_plan(
+        self, plan: AssetPlacementPlan, *, name: str = "structure"
+    ) -> Path:
+        self.config.asset_library_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.asset_library_dir / f"{name}.placement.json"
+        target.write_text(
+            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_asset_plan(self, *, name: str = "structure") -> AssetPlacementPlan:
+        target = self.config.asset_library_dir / f"{name}.placement.json"
+        if not target.exists():
+            raise EditingError(
+                f"No asset placement plan named '{name}' has been built yet",
+                hint="Run `python -m editing.cli assets plan` first.",
+            )
+        return AssetPlacementPlan.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def write_asset_report(
+        self,
+        plan: AssetPlacementPlan,
+        *,
+        library=None,
+        name: str = "structure",
+        limit: int = 30,
+    ) -> Path:
+        """The human-readable asset report, beside the layered one.
+
+        Never over it: an asset pass is one more interpretation of the same
+        cut, and the passes it builds on have to survive it.
+        """
+        text = asset_report.render(plan, library=library, limit=limit)
+        self.config.asset_library_dir.mkdir(parents=True, exist_ok=True)
+        return asset_report.write(
+            self.config.asset_library_dir / f"{name}.placement.txt", text
+        )
+
+    def run_assets(
+        self,
+        plan: Optional[AssetPlacementPlan] = None,
+        *,
+        mode: str = "dry_run",
+        name: str = "structure",
+        roughcut: Optional[RoughCutPlan] = None,
+        allow_active_sequence: bool = False,
+        engine=None,
+        save: bool = True,
+    ) -> ExecutionReport:
+        """Carry an asset placement plan out to the depth ``mode`` allows."""
+        if plan is None:
+            plan = self.load_asset_plan(name=name)
+        if roughcut is None:
+            try:
+                roughcut = self.load_rough_cut(name=name)
+            except EditingError:
+                roughcut = None
+
+        report = asset_execute.run(
+            plan,
+            mode=mode,
+            roughcut=roughcut,
+            bridge=self.bridge,
+            engine=engine,
+            allow_active_sequence=allow_active_sequence,
+        )
+
+        if report.refused_reason:
+            self.say(f"Refused: {report.refused_reason}")
+        elif report.executed:
+            self.say(
+                f"Placed {report.operations_succeeded}/"
+                f"{report.operations_attempted} asset operation(s) on "
+                f"'{plan.sequence_name}'."
+            )
+        elif mode == "dry_run":
+            self.say(
+                "Dry run " + ("passed" if report.dry_run_passed else "FAILED")
+                + f" ({plan.operation_count} operation(s)); nothing was placed."
+            )
+        if report.error:
+            self.say(f"  ! {report.error.get('error')}")
+
+        if save:
+            self.write_asset_execution(report, name=name)
+            self.write_asset_plan(plan, name=name)
+        return report
+
+    def write_asset_execution(
+        self, report: ExecutionReport, *, name: str = "structure"
+    ) -> Path:
+        self.config.asset_library_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.asset_library_dir / f"{name}.placement-execution.json"
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_asset_execution(
+        self, *, name: str = "structure"
+    ) -> ExecutionReport:
+        target = self.config.asset_library_dir / f"{name}.placement-execution.json"
+        if not target.exists():
+            raise EditingError(
+                f"No asset execution report named '{name}' exists yet",
+                hint="Run `python -m editing.cli assets dry-run` or "
+                     "`assets execute --yes` first.",
             )
         return ExecutionReport.from_dict(
             json.loads(target.read_text(encoding="utf-8"))

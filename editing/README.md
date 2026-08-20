@@ -1,10 +1,11 @@
-# Editing Brain V1 — Structure, Recommendations, Rough Cut, Critic, Style
+# Editing Brain V1 — Structure, Recommendations, Rough Cut, Critic, Style, Assets
 
 Turns a folder of Minecraft footage into a machine-readable timeline of **what
 happens on screen**, **what is being said**, and **what is heard** — proposes
 the edits worth making, with the evidence for each one — assembles them into a
-real Premiere rough cut, looks at that cut and improves it once, and then
-layers a chosen editing style over it.
+real Premiere rough cut, looks at that cut and improves it once, layers a
+chosen editing style over it, and fills that style's placeholders from a local
+library of your own music, effects and graphics.
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -24,6 +25,10 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
          style preset → seven layers: captions, emphasis, audio, cards, markers
                                                     ↓
         density ceilings enforced → offline dry-run → (--yes only) applied on top
+                                                    ↓
+      local asset library → matched per placeholder → mixing safety rules
+                                                    ↓
+   real SFX/music/graphics on their own tracks → dry-run → (--yes only) placed
 ```
 
 **Nothing runs unless you say so, twice.** Every plan is validated offline
@@ -43,6 +48,12 @@ feels intentionally styled and one that feels randomly over-edited.
 timeline, writes audio keyframes, places overlays and drops markers — so the
 rough cut's layout is untouched underneath it, and the whole pass can be undone
 by deleting one track and its markers.
+
+**Assets are local files only.** Nothing is ever downloaded, and nothing in
+your library is ever modified — trimming, gain, fades and ducking are all
+expressed as operations on the *placed clip*. A library with no files in it
+still produces a complete plan: every placeholder becomes a marker, and that
+list doubles as a shopping list.
 
 **The critic pass is one iteration, not a loop.** It exists to catch the obvious
 mistakes an automatic assembly makes — a zoom that crops the HUD, a caption over
@@ -76,7 +87,14 @@ python -m editing.cli style list                          # the editing styles
 python -m editing.cli layers build --style fast_funny     # captions, emphasis, audio
 python -m editing.cli layers show-density                 # is it over-edited?
 python -m editing.cli layers dry-run                      # validate the layers
-python -m editing.cli layers execute --yes                # apply them
+python -m editing.cli layers execute --yes                 # apply them
+
+python -m editing.cli assets init                         # make the folders
+python -m editing.cli assets index                        # scan your files
+python -m editing.cli assets plan                         # match placeholders
+python -m editing.cli assets show-missing                 # what to go and find
+python -m editing.cli assets dry-run
+python -m editing.cli assets execute --yes                # place them
 ```
 
 Then read the results:
@@ -90,6 +108,8 @@ python -m editing.cli review show-issues   # what the critic found, worst first
 python -m editing.cli review report        # the full revision report
 python -m editing.cli layers report        # every layer, and what was held back
 python -m editing.cli layers show-deferred # what the style refused, and why
+python -m editing.cli assets report        # library contents and coverage
+python -m editing.cli assets show-deferred # every placeholder that placed nothing
 ```
 
 Export any artefact to a path of your choosing:
@@ -1395,7 +1415,299 @@ letting it do any of it.
 
 ---
 
-## 13. Where outputs go
+## 13. The asset library
+
+```bash
+python -m editing.cli assets init          # create the folders + docs
+python -m editing.cli assets index         # scan them into an index
+python -m editing.cli assets list          # what is in there
+python -m editing.cli assets show <asset>  # one file, and where its tags came from
+python -m editing.cli assets validate      # what is broken, and how to fix it
+python -m editing.cli assets report        # which placeholder kinds you can serve
+```
+
+**Local files only.** Nothing is downloaded. Nothing in the library is ever
+modified — every trim, level and fade is applied to the *placed clip* in
+Premiere, never to your source file.
+
+### Folder structure
+
+`assets init` creates this under `<model dir>/assets` (override with `--root`),
+and never overwrites anything you have already put there:
+
+```
+assets/
+├── README.md               what goes where, written into the folder itself
+├── example.asset.json      a filled-in sidecar to copy
+├── music/                  tracks and beds
+├── sfx/                    short one-shots: impacts, pops, whooshes, stings
+├── ambience/               loopable room tone and atmosphere
+├── callout/                arrows, circles, labels (PNG with transparency)
+├── titles/                 title and chapter card backgrounds
+└── transitions/            whoosh-and-wipe overlays
+```
+
+The library lives beside the model weights rather than in `data/editing`
+because run outputs are disposable and a sound library is not. Only the derived
+*index* lands in the run output.
+
+**Subfolders become tags.** A file in `sfx/impacts/heavy/` picks up `impacts`
+and `heavy` automatically, so organising by folder is most of the work.
+
+### Supported files
+
+| Kind | Extensions |
+|---|---|
+| audio | `.wav` `.mp3` `.m4a` `.aac` `.flac` `.ogg` |
+| image | `.png` `.jpg` `.jpeg` `.webp` |
+| video | `.mp4` `.mov` `.webm` |
+| Motion Graphics | `.mogrt` — indexed and matched, but **placed as a marker only** |
+
+A `.mogrt` is deliberately still matched: you should be told "found your title
+template, cannot drive it, here is why" rather than "you have no title
+backgrounds". Driving one needs a registered template and a parameter mapping,
+which this system does not have.
+
+### What the indexer reads
+
+Four sources, in increasing priority:
+
+1. **the folder** — `sfx/impacts/heavy/` gives a category and two tags;
+2. **the filename** — `whoosh_fast_01.wav` gives `whoosh` and `fast`; `_loop`
+   marks it loopable; `impact`/`soft` set the intensity;
+3. **ffprobe** — a real duration, when ffprobe exists;
+4. **the sidecar** — a person typed it, so it wins over all of the above.
+
+Every tag remembers where it came from, which is what makes `assets show`
+able to answer *why did this match?*:
+
+```
+  tags (and where they came from):
+    bed                  sidecar   1.00
+    drone                sidecar   1.00
+    tension              sidecar   1.00
+    loop                 filename  0.60
+```
+
+**No FFmpeg is normal, not an error.** Durations stay unknown and duration fit
+is simply not judged — which makes matches less precise rather than wrong. Set
+a `duration` in a sidecar wherever the length actually matters.
+
+**A file that vanished is marked, not dropped.** Re-indexing keeps the record
+with `missing: true`, so a plan that refers to it explains itself instead of
+silently losing a placement. Build folders, `node_modules`, media caches and
+hidden directories are never descended into.
+
+### Sidecar metadata
+
+Optional. Put `<filename>.asset.json` next to any file:
+
+```
+impact_boom.wav
+impact_boom.asset.json
+```
+
+```json
+{
+  "category": "sfx",
+  "tags": ["impact", "boom", "heavy"],
+  "intensity": "high",
+  "mood": ["dramatic", "dark"],
+  "bpm": null,
+  "loopable": false,
+  "safe_for_auto": true,
+  "preferred_styles": ["cinematic_minecraft"],
+  "avoid_styles": ["minimal_clean"],
+  "license_notes": "Bought from <somewhere>, licence covers YouTube use.",
+  "start_offset": 0.0,
+  "end_offset": null,
+  "volume_adjust_db": -3.0,
+  "hud_risk": false,
+  "notes": "Long tail -- leave room after it."
+}
+```
+
+Every field is optional. Keys starting with `_` are treated as comments.
+
+**An invalid sidecar never crashes anything.** A file whose sidecar will not
+parse is still indexed, marked `needs_review`, and **held out of automatic
+placement** — because metadata we could not read is not the same as metadata
+that said "safe". Individual bad *fields* are dropped with a note while the
+rest of the document is kept, so one mistyped `intensity` does not throw away
+good tags:
+
+```
+sfx/boom.wav: intensity 'ENORMOUS' is not one of: low, medium, high
+              bpm 'quite fast' is not a number.
+              'looppable' is not a field this system reads; it was ignored.
+```
+
+`safe_for_auto: false` is the switch for "this sound is right but I want to
+place it myself" — it stays indexed and searchable, and the system leaves a
+marker naming it instead of using it.
+
+---
+
+## 14. Placing assets
+
+```bash
+python -m editing.cli assets match whoosh    # why would it pick what it picks?
+python -m editing.cli assets plan
+python -m editing.cli assets show-missing    # the shopping list
+python -m editing.cli assets show-deferred   # what placed nothing, and why
+python -m editing.cli assets dry-run
+python -m editing.cli assets execute --yes
+```
+
+Every Session 5 placeholder that could be a sound or a graphic gets exactly one
+placement, with exactly one of five outcomes — **four of which place nothing**:
+
+| Outcome | Means | What to do |
+|---|---|---|
+| `placed` | a real asset, real operations | — |
+| `missing` | the library has nothing of that kind at all | go and find one |
+| `rejected` | candidates existed, none qualified | tag them better, or lower `--min-score` |
+| `unsafe` | good match, wrong moment | usually correct; check the reason |
+| `marker_only` | matched and deliberately not placed | `--markers-only`, or a `.mogrt` |
+
+On most libraries most of a plan is markers. That is the design working, not a
+failure.
+
+### Matching
+
+Category is a **hard requirement**, never a score: an impact placeholder never
+gets a music track however many tags overlap. Beyond that the scoring is small,
+additive and fully visible — `assets match <kind>` prints every contribution
+for every candidate, winners and losers alike:
+
+```
+  + 0.86  whoosh_fast_01.wav
+        +0.30  in the preferred category (sfx)
+        +0.14  tags match: whoosh
+        +0.10  its name says 'whoosh', which is exactly what this kind is
+        +0.15  0.80s fits this kind
+        +0.12  medium intensity suits this
+        +0.05  described by a sidecar, so this is not guesswork
+  - 0.30  impact_boom_heavy.wav
+        ruled out: scored 0.30, below the 0.50 needed to place a short
+        transition whoosh automatically
+```
+
+**Rotation, not rationing.** Reusing an asset costs something *while a suitable
+alternative is still unused*; once everything has been used equally the penalty
+cancels out. A library with one arrow graphic uses that arrow every time, and a
+library with three whooshes cycles through them.
+
+**Below the threshold is a refusal, not a best effort.** A weak match placed is
+worse than a marker: a marker costs a viewer nothing and a wrong sound costs
+them the moment.
+
+### Audio placement
+
+| Placeholder | Becomes |
+|---|---|
+| `impact_sfx`, `comedic_sfx`, `whoosh` | one `clip.overwrite` at the moment, trimmed to the sound, plus `audio.gain` |
+| `tension_bed`, `ambience` | tiled across the range (loopable required), plus `audio.fade` |
+| `music_start`, `music_rise` | placed from the cue; if the track is shorter than the section it **runs out and fades**, which is ordinary editing |
+
+Levels are conservative, stated in one table, and overridable per file with
+`volume_adjust_db`: beds `-18 dB`, ambience `-26 dB`, one-shots `-8 dB`.
+
+**Ducking now actually works.** Session 5 computed the speech ranges and could
+not use them — `audio.duck` needs a bed clip and there was none. Placing one is
+what makes it available, so a bed covering dialogue gets a real `audio.duck`
+carrying those exact ranges, dipping to `-30 dB` under each line:
+
+```
+audio.duck [A3@60s]  under 6 speech range(s)  base -18 dB → duck -30 dB
+```
+
+### The mixing safety rules
+
+| Rule | Default | Why |
+|---|---|---|
+| minimum gap between one-shots | 2.5s | three impacts in four seconds is how an auto-scored edit announces itself |
+| one-shots per minute | 5 | — |
+| asset clips sounding at once | 2 | a bed plus one effect is a mix; a bed plus four is a mess |
+| graphics on screen at once | 1 | — |
+| callout on screen | ≤ 2.5s | — |
+| **two clips on one track** | never overlap | correctness, not taste: `clip.overwrite` destroys what is under it |
+
+Placeholders are considered **most defensible first**, so when a ceiling bites
+it drops the weakest moment rather than whichever came last.
+
+### Visual placement
+
+Graphics use the **same safe zones as captions** — never the centre of frame
+(the crosshair) and never the bottom centre (the hotbar and health), because a
+callout has exactly the same problem as a caption. A graphic is refused
+outright where the analysis pass saw an open menu or low health, where the
+critic flagged the moment, or where a sidecar sets `hud_risk`.
+
+### The shopping list
+
+When the library cannot fill something, `assets show-missing` groups it by what
+to go and find rather than listing it once per moment:
+
+```
+  whoosh  x3
+      wanted : a short transition whoosh
+      put in : assets/sfx/
+      tag as : whoosh, swoosh, swish, transition, sweep, pass
+      needed : 20.2s, 30.0s, 150.5s
+
+  tension_bed  x2
+      wanted : a loopable low-intensity bed
+      put in : assets/music/, assets/ambience/
+      tag as : tension, bed, drone, pad, dark, suspense
+      must be loopable (name it *_loop, or set loopable in a sidecar)
+      needed : 70.2s, 120.2s
+```
+
+### Executing it
+
+```
+sequence.activate  project.import  track.add  clip.overwrite
+graphic.image  audio.gain  audio.fade  audio.duck  marker.add
+```
+
+This is the first pass that places *clips*, so it is the first whose allowlist
+contains a `clip.*` operation. Two things keep it safe, and both are checked
+structurally on every operation rather than trusted:
+
+- **`clip.overwrite`, never `clip.insert`.** Insert ripples; overwrite does
+  not. Nothing this plan does can move a clip that was already there, so every
+  position computed by Sessions 3–5 stays exactly where those sessions put it.
+- **Never V1 or A1.** Those are the rough cut's tracks. Assets land on A2
+  (one-shots), A3 (beds) and V3 (graphics) — all added by the plan, all
+  configurable, and V1/A1 are rejected even as *configuration*.
+
+Plus one guard unique to this pass: **every `project.import` path must be
+inside the library root**, so a plan can never pull arbitrary files into your
+project.
+
+Together those mean the pass is undone by deleting the added tracks and the
+markers.
+
+```bash
+python -m editing.cli assets execute          # refuses: needs --yes
+python -m editing.cli assets execute --yes    # runs, after validating again
+```
+
+Execution also re-checks that every asset file **still exists**, because a plan
+built this morning can name a file that moved this afternoon, and Premiere's
+error for a missing import is much less clear than this one.
+
+The safest possible pass draws and plays nothing while still telling you
+exactly what it would have used:
+
+```bash
+python -m editing.cli assets plan --markers-only
+```
+
+---
+
+## 15. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
@@ -1421,6 +1733,10 @@ data/editing/
 ├── layers/structure.json           ← the layered edit: every layer + operations
 ├── layers/structure.txt            ← the human-readable layered report
 ├── layers/structure.execution.json what happened when it was applied
+├── assets/library.json             ← the asset index (the files live elsewhere)
+├── assets/structure.placement.json ← every placeholder resolved, with reasons
+├── assets/structure.placement.txt  ← the human-readable asset report
+├── assets/structure.placement-execution.json
 ├── frames/                         extracted JPEGs (deleted unless --keep-frames)
 └── cache/
     ├── probe/       ffprobe results
@@ -1444,7 +1760,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 14. Caching
+## 16. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -1480,10 +1796,10 @@ that window.
 
 ---
 
-## 15. Tests
+## 17. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 804 tests, ~9s
+python -m pytest tests/editing -q        # 924 tests, ~10s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -1505,6 +1821,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_roughcut.py` | selection, layout maths, conversion, **execution guards** |
 | `test_editing_critic.py` | frame coverage, critic coercion, **the finding/fix line**, revision guards |
 | `test_editing_style.py` | preset validation, **density ceilings**, caption selection, emphasis safety, layer guards |
+| `test_editing_assets.py` | indexing, sidecars, matching, **mixing safety**, track and import guards |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
 
 Tests worth knowing about, because they pin the promises this layer makes:
@@ -1556,6 +1873,18 @@ Tests worth knowing about, because they pin the promises this layer makes:
   silently loses a chapter
 - `test_the_rough_cut_survives_being_styled` — restyling replaces the layer
   plan and nothing else
+- `test_an_empty_library_still_produces_a_complete_plan` — nobody has a tagged
+  sound library on day one, and the pass has to work anyway
+- `test_an_invalid_sidecar_never_crashes_the_indexer` — hand-edited JSON will
+  have a trailing comma, and the answer is not a stack trace
+- `test_two_clips_never_overlap_on_one_track` — `clip.overwrite` destroys what
+  is under it, so this is correctness rather than taste
+- `test_placing_on_the_rough_cuts_own_track_is_refused` and
+  `test_importing_from_outside_the_library_is_refused` — the two guards unique
+  to the asset pass
+- `test_the_only_asset_of_its_kind_may_repeat` — rotation is not rationing
+- `test_a_name_that_says_what_it_is_matches_without_a_probe` — the case that
+  silently placed nothing on a machine with no FFmpeg
 
 ---
 
@@ -1717,6 +2046,39 @@ exactly how much of a pass is placeholder rather than edit — usually most of i
 changes, deaths and stated objectives. A section boundary a human would feel —
 a change of goal, a shift in tone — is invisible to it unless the narration
 says so out loud.
+
+**Asset matching is tags and folders, not listening.** Nothing here analyses
+audio content: an "impact" is a file in `sfx/` whose name or sidecar says
+impact. A badly named file in the right folder will match badly, and the fix is
+a sidecar rather than a smarter matcher. `assets match <kind>` shows the whole
+scoring so a surprising choice can be read rather than guessed at.
+
+**Loudness and BPM are never measured.** Both fields exist and are only ever
+populated from a sidecar. Levels are applied from a small table of category
+defaults (`-18` beds, `-26` ambience, `-8` one-shots), which are opinions, not
+measurements — expect to set `volume_adjust_db` on anything that matters.
+
+**Beds are tiled, not crossfaded.** A loopable bed under a long stretch becomes
+several copies end to end, up to twelve. If the file does not loop cleanly the
+seams will be audible, and the system has no way to tell whether it does — only
+the filename or the sidecar says so.
+
+**Music that is shorter than its section simply ends.** It is placed once and
+faded out rather than looped, because looping a non-loop track sounds worse
+than silence. The report says which placements stop early.
+
+**`.mogrt` templates are matched and never placed.** Driving one needs a
+registered template and a parameter mapping. The marker names the template.
+
+**Asset tracks are assumed, not discovered.** The plan writes to A2, A3 and V3
+and assumes the rough cut occupies V1/A1 only. It cannot read the sequence's
+real track layout offline, so if you have added tracks by hand, set
+`--sfx-track` / `--music-track` / `--visual-track` to match. V1 and A1 are
+rejected outright.
+
+**Nothing is ever removed.** Re-running the asset pass places assets again
+rather than replacing the previous run's. Delete the added tracks first, or
+work on a fresh rough cut.
 
 **The style layer does not re-cut.** `trim_aggression` and `dead_air_tolerance`
 are carried on the preset and reported, but this pass cannot act on them: it

@@ -383,6 +383,17 @@ class EditingConfig:
         return self.output_dir / "review"
 
     @property
+    def asset_library_dir(self) -> Path:
+        """The asset *index* and placement plans.
+
+        Note this is not where the asset files live. The library itself sits
+        beside the model weights (``<model_dir>/assets``) because a sound
+        library outlives any one run; what lands here is the derived index and
+        the plans, which are disposable.
+        """
+        return self.output_dir / "assets"
+
+    @property
     def layers_dir(self) -> Path:
         """Layered, styled edit plans and their reports.
 
@@ -415,7 +426,7 @@ class EditingConfig:
             self.visual_dir, self.timelines_dir, self.frames_dir,
             self.audio_dir, self.recommendations_dir, self.plans_dir,
             self.roughcut_dir, self.review_dir, self.critic_dir,
-            self.layers_dir,
+            self.layers_dir, self.asset_library_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

@@ -19,6 +19,9 @@ Commands, in the order a session normally uses them::
     style       list | show <preset>   -- the editing styles available
     layers      build | report | export | dry-run | execute --yes |
                 show-deferred | show-density   -- a styled, layered edit
+    assets      init | index | list | show | validate | report | match |
+                plan | dry-run | execute --yes | show-missing | show-deferred
+                -- a local sound/graphic library, and placing from it
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -48,6 +51,9 @@ from editing.critic.frames import CoverageOptions
 from editing.critic.revise import RevisionOptions
 from editing.roughcut import review as review_module
 from editing.roughcut.build import RoughCutOptions
+from editing.assets import report as assets_report
+from editing.assets.compile import AssetOptions
+from editing.assets.place import PlacementLimits
 from editing.style import presets as style_presets, report as layers_report
 from editing.style.compile import CompileOptions
 from editing.transcripts import premiere_source
@@ -1254,6 +1260,321 @@ def _print_layers(plan, *, limit: int = 20) -> None:
         print(f"  ! {warning}")
 
 
+def _asset_options(args) -> AssetOptions:
+    tracks = {}
+    for role, flag in (("sfx", "sfx_track"), ("music", "music_track"),
+                       ("visual", "visual_track")):
+        value = getattr(args, flag, None)
+        if value:
+            tracks[role] = value.strip().upper()
+    return AssetOptions(
+        min_score=getattr(args, "min_score", None) or 0.5,
+        allow_unsafe=getattr(args, "allow_unsafe", False),
+        markers_only=getattr(args, "markers_only", False),
+        use_critic=not getattr(args, "no_critic", False),
+        max_operations=getattr(args, "max_operations", None) or 500,
+        tracks=tracks or None,
+    )
+
+
+def _asset_limits(args) -> PlacementLimits:
+    limits = PlacementLimits()
+    for flag, field in (
+        ("min_sfx_gap", "min_sfx_gap"),
+        ("max_sfx_per_minute", "max_sfx_per_minute"),
+        ("max_concurrent_audio", "max_concurrent_audio"),
+    ):
+        value = getattr(args, flag, None)
+        if value is not None:
+            setattr(limits, field, value)
+    if getattr(args, "allow_music_over_speech", False):
+        limits.require_ducking_over_speech = False
+    return limits
+
+
+def cmd_assets(args) -> int:
+    """The local asset library, and placing from it."""
+    pipeline = _pipeline(args)
+    command = args.assets_command
+    root = getattr(args, "root", None)
+
+    # -- init -------------------------------------------------------------
+    if command == "init":
+        result = pipeline.init_assets(root=root)
+        if args.json:
+            _emit({"success": True, **result})
+            return EXIT_OK
+        print(f"Asset library at {result['root']}")
+        for path in result["created"]:
+            print(f"  created  {path}")
+        for path in result["existing"]:
+            print(f"  existing {path}")
+        for path in result["docs"]:
+            print(f"  wrote    {path}")
+        print("\n  Put local files in those folders, then run "
+              "`assets index`.\n  Nothing is downloaded and nothing in the "
+              "library is ever modified.")
+        return EXIT_OK
+
+    # -- index ------------------------------------------------------------
+    if command == "index":
+        library = pipeline.index_assets(
+            root=root,
+            probe_durations=not args.no_probe,
+            reuse=not args.rebuild,
+        )
+        if args.json:
+            _emit({"success": True, **library.to_dict()})
+            return EXIT_OK
+        stats = library.stats()
+        print(f"Indexed {stats['total']} asset(s) under {library.root}")
+        for label, key in (
+            ("usable", "usable"), ("need review", "needs_review"),
+            ("missing", "missing"), ("with sidecar", "with_sidecar"),
+            ("with duration", "with_duration"), ("skipped", "skipped"),
+        ):
+            print(f"  {label:<14}: {stats[key]}")
+        for name, count in sorted(stats["by_category"].items()):
+            print(f"    {name:<12} {count}")
+        for warning in library.warnings[: args.limit]:
+            print(f"  ! {warning}")
+        return EXIT_OK
+
+    # -- list -------------------------------------------------------------
+    if command == "list":
+        library = pipeline.asset_library_or_empty(root=root)
+        items = library.find(args.filter or "")
+        if args.category:
+            items = [item for item in items if item.category == args.category]
+        if args.json:
+            _emit({"success": True, "count": len(items),
+                   "root": library.root,
+                   "assets": [item.to_dict() for item in items]})
+            return EXIT_OK
+        print(f"{len(items)} asset(s) in {library.root or '(no library)'}:")
+        for item in items[: args.limit]:
+            print("  " + item.summary())
+        if len(items) > args.limit:
+            print(f"  ... and {len(items) - args.limit} more.")
+        if not items:
+            print("  (nothing indexed -- run `assets init` then `assets index`)")
+        return EXIT_OK
+
+    # -- show -------------------------------------------------------------
+    if command == "show":
+        library = pipeline.asset_library_or_empty(root=root)
+        matches = library.find(args.asset)
+        if not matches:
+            raise EditingError(
+                f"No asset matches '{args.asset}'",
+                hint="Run `assets list` to see what is indexed.",
+            )
+        item = matches[0]
+        if args.json:
+            _emit({"success": True, **item.to_dict()})
+            return EXIT_OK
+        print(assets_report.render_asset(library, item))
+        if len(matches) > 1:
+            print(f"\n  ({len(matches) - 1} other asset(s) also matched "
+                  f"'{args.asset}')")
+        return EXIT_OK
+
+    # -- validate ---------------------------------------------------------
+    if command == "validate":
+        library = pipeline.asset_library_or_empty(root=root)
+        problems = library.needing_review() + library.missing()
+        if args.json:
+            _emit({"success": True, "root": library.root,
+                   "problems": len(problems),
+                   "needs_review": [i.to_dict() for i in library.needing_review()],
+                   "missing": [i.to_dict() for i in library.missing()],
+                   "skipped": list(library.skipped),
+                   "warnings": list(library.warnings)})
+            return EXIT_OK
+        print(assets_report.render_validation(library, limit=args.limit))
+        return EXIT_OK
+
+    # -- report -----------------------------------------------------------
+    if command == "report":
+        library = pipeline.asset_library_or_empty(root=root)
+        if args.json:
+            from editing.assets.match import coverage
+
+            _emit({"success": True, "root": library.root,
+                   "stats": library.stats(),
+                   "coverage": coverage(library, style=args.style or "")})
+            return EXIT_OK
+        print(assets_report.render_library(
+            library, style=args.style or "", limit=args.limit
+        ))
+        return EXIT_OK
+
+    # -- match ------------------------------------------------------------
+    if command == "match":
+        from editing.assets.match import rank_candidates, requirement_for
+
+        library = pipeline.asset_library_or_empty(root=root)
+        requirement = requirement_for(args.kind)
+        if requirement is None:
+            raise EditingError(
+                f"'{args.kind}' is not a placeholder kind an asset can fill",
+                hint="Try one of: "
+                     + ", ".join(sorted(__import__(
+                         "editing.assets.match", fromlist=["REQUIREMENTS"]
+                     ).REQUIREMENTS)),
+            )
+        matches = rank_candidates(
+            args.kind, library, style=args.style or "",
+            slot_duration=args.slot or 0.0, min_score=args.min_score or 0.5,
+        )
+        if args.json:
+            _emit({"success": True, "kind": args.kind,
+                   "label": requirement.label,
+                   "count": len(matches),
+                   "matches": [m.to_dict() for m in matches]})
+            return EXIT_OK
+        print(f"{args.kind} wants {requirement.label}.")
+        print(f"{len(matches)} candidate(s) in the library:\n")
+        for match in matches[: args.limit]:
+            mark = "+" if match.accepted else "-"
+            print(f"  {mark} {match.score:.2f}  {match.filename}")
+            if match.rejected:
+                print(f"        ruled out: {match.rejected[:110]}")
+            for why, delta in match.reasons:
+                print(f"        {delta:+.2f}  {why[:100]}")
+        if not matches:
+            print("  (nothing in the library is even the right category)")
+        return EXIT_OK
+
+    # -- plan -------------------------------------------------------------
+    if command == "plan":
+        plan = pipeline.asset_plan(
+            name=args.name, root=root,
+            options=_asset_options(args), limits=_asset_limits(args),
+        )
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        _print_asset_plan(plan, limit=args.limit)
+        print(f"\nWritten to {pipeline.config.asset_library_dir}")
+        return EXIT_OK
+
+    # -- dry-run ----------------------------------------------------------
+    if command == "dry-run":
+        plan = pipeline.load_asset_plan(name=args.name)
+        report = pipeline.run_assets(plan, mode="dry_run", name=args.name)
+        if args.json:
+            _emit({"success": True, "report": report.to_dict(),
+                   "dry_run_passed": plan.dry_run_passed,
+                   "explanation": plan.explanation})
+            return EXIT_OK
+        print(f"Asset dry run: "
+              f"{'PASSED' if plan.dry_run_passed else 'FAILED'}")
+        print(f"  operations : {plan.operation_count}")
+        print(f"  executed   : {report.executed}  <- nothing has been placed")
+        if plan.dry_run_error:
+            print(f"  error      : {plan.dry_run_error.get('error')}")
+            if plan.dry_run_error.get("hint"):
+                print(f"  hint       : {plan.dry_run_error['hint']}")
+        for line in plan.explanation[: args.limit]:
+            print(f"    {line}")
+        for warning in plan.warnings:
+            print(f"  ! {warning}")
+        return EXIT_OK
+
+    # -- execute ----------------------------------------------------------
+    if command == "execute":
+        plan = pipeline.load_asset_plan(name=args.name)
+        if not args.yes:
+            raise EditingError(
+                "Placing assets needs an explicit confirmation",
+                hint="This imports media and writes clips into the rough cut "
+                     "sequence. Re-run with --yes once you have read the dry "
+                     "run and `assets report`.",
+            )
+        report = pipeline.run_assets(
+            plan, mode="execute", name=args.name,
+            allow_active_sequence=args.allow_active_sequence,
+        )
+        if args.json:
+            _emit({"success": report.ok, **report.to_dict()})
+            return EXIT_OK if report.ok or report.refused_reason else EXIT_ERROR
+
+        print(f"Asset placement ({plan.sequence_name}, {plan.style})")
+        print(f"  dry run    : {'passed' if report.dry_run_passed else 'FAILED'}")
+        print(f"  on scratch : {report.on_scratch}")
+        print(f"  executed   : {report.executed}")
+        print(f"  operations : {report.operations_succeeded}/"
+              f"{report.operations_attempted}")
+        if report.refused_reason:
+            print(f"  refused    : {report.refused_reason}")
+        if report.error:
+            print(f"  error      : {report.error.get('error')}")
+        return EXIT_OK if report.executed or report.refused_reason else EXIT_ERROR
+
+    # -- show-missing -----------------------------------------------------
+    if command == "show-missing":
+        plan = pipeline.load_asset_plan(name=args.name)
+        if args.json:
+            _emit({"success": True, "count": len(plan.missing()),
+                   "missing": [p.to_dict() for p in plan.missing()]})
+            return EXIT_OK
+        print(assets_report.render_missing(plan, limit=args.limit))
+        return EXIT_OK
+
+    # -- show-deferred ----------------------------------------------------
+    if command == "show-deferred":
+        plan = pipeline.load_asset_plan(name=args.name)
+        if args.json:
+            _emit({"success": True, "count": len(plan.deferred()),
+                   "deferred": [p.to_dict() for p in plan.deferred()]})
+            return EXIT_OK
+        print(assets_report.render_deferred(plan, limit=args.limit))
+        return EXIT_OK
+
+    raise EditingError("Unknown assets command")
+
+
+def _print_asset_plan(plan, *, limit: int = 20) -> None:
+    stats = plan.stats()
+    print(f"Asset placement: {plan.sequence_name}  [{plan.style}]")
+    print(f"  library    : {plan.library_root or '(none)'}"
+          f"  ({(plan.library_stats or {}).get('usable', 0)} usable)")
+    print(f"  tracks     : " + ", ".join(
+        f"{role}={name}" for role, name in sorted(plan.tracks.items())
+    ))
+    print(f"  placed     : {stats['placed']} "
+          f"({stats['distinct_assets']} distinct asset(s))")
+    print(f"  missing    : {stats['missing']}")
+    print(f"  rejected   : {stats['rejected']}")
+    print(f"  unsafe     : {stats['unsafe']}")
+    print(f"  marker only: {stats['marker_only']}")
+    print(f"  operations : {plan.operation_count}")
+    print(f"  dry run    : {'passed' if plan.dry_run_passed else 'not run'}")
+    print(f"  on scratch : {plan.on_scratch}  (nothing has been placed)")
+
+    placed = plan.placed()
+    if placed:
+        print("\n  Placed:")
+        for placement in placed[:limit]:
+            print(f"    [{placement.start:8.2f}] {placement.kind:<16} "
+                  f"{placement.asset_filename[:32]:<32} {placement.track}")
+
+    held = plan.deferred()
+    if held:
+        print("\n  Not placed:")
+        for placement in held[:limit]:
+            print(f"    [{placement.start:8.2f}] {placement.kind:<16} "
+                  f"{placement.status:<12} {placement.reason[:60]}")
+        if len(held) > limit:
+            print(f"    ... and {len(held) - limit} more.")
+
+    if plan.dry_run_error:
+        print(f"\n  ! {plan.dry_run_error.get('error')}")
+    for warning in plan.warnings:
+        print(f"  ! {warning}")
+
+
 def _print_roughcut(plan, *, limit: int = 30) -> None:
     stats = plan.stats()
     print(f"Rough cut: {plan.sequence_name}")
@@ -1711,6 +2032,11 @@ def build_parser() -> argparse.ArgumentParser:
                "  python -m editing.cli layers build --style fast_funny\n"
                "  python -m editing.cli layers dry-run\n"
                "  python -m editing.cli layers execute --yes\n"
+               "  python -m editing.cli assets init\n"
+               "  python -m editing.cli assets index\n"
+               "  python -m editing.cli assets plan\n"
+               "  python -m editing.cli assets dry-run\n"
+               "  python -m editing.cli assets execute --yes\n"
                "\nOr all of it at once:\n"
                "  python -m editing.cli run --folder D:/Footage/ep12 --recommend\n"
                "\nNothing here applies an edit. `draft` validates a Premiere\n"
@@ -2128,6 +2454,145 @@ def build_parser() -> argparse.ArgumentParser:
     ly_den.add_argument("--limit", type=int, default=40)
     _add_common(ly_den)
     ly_den.set_defaults(func=cmd_layers)
+
+    # -- assets ---------------------------------------------------------
+    assets = subparsers.add_parser(
+        "assets",
+        help="the local sound/graphic library, and placing from it")
+    assets_subs = assets.add_subparsers(dest="assets_command", required=True)
+
+    def _add_root(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--root",
+            help="asset library root (default <model dir>/assets)")
+
+    as_init = assets_subs.add_parser(
+        "init", help="create the asset folders and their documentation")
+    _add_root(as_init)
+    _add_common(as_init)
+    as_init.set_defaults(func=cmd_assets)
+
+    as_index = assets_subs.add_parser(
+        "index", help="scan the asset folders into an index")
+    _add_root(as_index)
+    as_index.add_argument("--no-probe", action="store_true",
+                          help="skip ffprobe; durations stay unknown")
+    as_index.add_argument("--rebuild", action="store_true",
+                          help="ignore the previous index and re-probe everything")
+    as_index.add_argument("--limit", type=int, default=20)
+    _add_common(as_index)
+    as_index.set_defaults(func=cmd_assets)
+
+    as_list = assets_subs.add_parser("list", help="what is in the library")
+    _add_root(as_list)
+    as_list.add_argument("--filter", help="substring of id, filename or tag")
+    as_list.add_argument("--category", choices=list(
+        __import__("editing.assets.schema", fromlist=["CATEGORIES"]).CATEGORIES))
+    as_list.add_argument("--limit", type=int, default=60)
+    _add_common(as_list)
+    as_list.set_defaults(func=cmd_assets)
+
+    as_show = assets_subs.add_parser(
+        "show", help="everything known about one asset")
+    as_show.add_argument("asset", help="asset id, filename or tag")
+    _add_root(as_show)
+    as_show.add_argument("--limit", type=int, default=40)
+    _add_common(as_show)
+    as_show.set_defaults(func=cmd_assets)
+
+    as_validate = assets_subs.add_parser(
+        "validate", help="what is wrong with the library, and how to fix it")
+    _add_root(as_validate)
+    as_validate.add_argument("--limit", type=int, default=40)
+    _add_common(as_validate)
+    as_validate.set_defaults(func=cmd_assets)
+
+    as_report = assets_subs.add_parser(
+        "report", help="library contents and what each placeholder can draw on")
+    _add_root(as_report)
+    as_report.add_argument("--style", choices=style_presets.names())
+    as_report.add_argument("--limit", type=int, default=40)
+    _add_common(as_report)
+    as_report.set_defaults(func=cmd_assets)
+
+    as_match = assets_subs.add_parser(
+        "match", help="rank the library against one placeholder kind")
+    as_match.add_argument("kind", help="e.g. impact_sfx, whoosh, tension_bed")
+    _add_root(as_match)
+    as_match.add_argument("--style", choices=style_presets.names())
+    as_match.add_argument("--slot", type=float,
+                          help="slot length in seconds, for duration fit")
+    as_match.add_argument("--min-score", type=float, default=0.5)
+    as_match.add_argument("--limit", type=int, default=15)
+    _add_common(as_match)
+    as_match.set_defaults(func=cmd_assets)
+
+    as_plan = assets_subs.add_parser(
+        "plan", help="resolve every layer placeholder against the library")
+    as_plan.add_argument("--name", default="structure")
+    _add_root(as_plan)
+    as_plan.add_argument("--markers-only", action="store_true",
+                         help="match but place nothing; record every choice")
+    as_plan.add_argument("--allow-unsafe", action="store_true",
+                         help="include assets whose sidecar says "
+                              "safe_for_auto: false")
+    as_plan.add_argument("--no-critic", action="store_true",
+                         help="ignore critic findings when placing graphics")
+    as_plan.add_argument("--min-score", type=float, default=0.5,
+                         help="match score needed to place anything "
+                              "(default 0.50)")
+    as_plan.add_argument("--min-sfx-gap", type=float,
+                         help="seconds between two placed one-shots")
+    as_plan.add_argument("--max-sfx-per-minute", type=float,
+                         help="ceiling on placed one-shots per minute")
+    as_plan.add_argument("--max-concurrent-audio", type=int,
+                         help="how many asset clips may sound at once")
+    as_plan.add_argument("--allow-music-over-speech", action="store_true",
+                         help="place beds over dialogue even without ducking")
+    as_plan.add_argument("--sfx-track", help="audio track for one-shots "
+                                             "(default A2)")
+    as_plan.add_argument("--music-track", help="audio track for beds "
+                                               "(default A3)")
+    as_plan.add_argument("--visual-track", help="video track for graphics "
+                                                "(default V3)")
+    as_plan.add_argument("--max-operations", type=int, default=500)
+    as_plan.add_argument("--limit", type=int, default=20)
+    _add_common(as_plan)
+    as_plan.set_defaults(func=cmd_assets)
+
+    as_dry = assets_subs.add_parser(
+        "dry-run", help="validate the asset plan offline (places nothing)")
+    as_dry.add_argument("--name", default="structure")
+    as_dry.add_argument("--limit", type=int, default=40)
+    _add_common(as_dry)
+    as_dry.set_defaults(func=cmd_assets)
+
+    as_exec = assets_subs.add_parser(
+        "execute", help="place the assets -- needs --yes")
+    as_exec.add_argument("--name", default="structure")
+    as_exec.add_argument("--yes", action="store_true",
+                         help="required: confirms you have read the dry run")
+    as_exec.add_argument(
+        "--allow-active-sequence", action="store_true",
+        help="permit placing on a sequence this system cannot prove is the "
+             "rough cut's scratch one. Off by default.")
+    as_exec.add_argument("--limit", type=int, default=40)
+    _add_common(as_exec)
+    as_exec.set_defaults(func=cmd_assets)
+
+    as_missing = assets_subs.add_parser(
+        "show-missing", help="a shopping list of what the library lacks")
+    as_missing.add_argument("--name", default="structure")
+    as_missing.add_argument("--limit", type=int, default=40)
+    _add_common(as_missing)
+    as_missing.set_defaults(func=cmd_assets)
+
+    as_deferred = assets_subs.add_parser(
+        "show-deferred", help="every placeholder that placed nothing, and why")
+    as_deferred.add_argument("--name", default="structure")
+    as_deferred.add_argument("--limit", type=int, default=60)
+    _add_common(as_deferred)
+    as_deferred.set_defaults(func=cmd_assets)
 
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")

@@ -1,13 +1,13 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-20 (Session 5).
+Context for continuing this work in a new chat. Updated 2026-08-20 (Session 6).
 
 ---
 
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all five sessions and 804 passing editing tests.
+This has all six sessions and 924 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -28,7 +28,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in five sessions
+## What was built, in six sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -48,38 +48,29 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
         revision recommendations — safe ones carry draft operations, the rest
         stay recommendations with the reason they could not be automated
                                                     ↓
-              offline dry-run → (explicit --yes only) apply to the same
-                                scratch sequence, under an op allowlist
+              offline dry-run → (--yes only) applied to the same sequence
                                                     ↓
-        style preset → seven layers of candidates: captions, visual emphasis,
-        audio placeholders, title/chapter cards, structure and polish markers
+        style preset → seven layers: captions, emphasis, audio placeholders,
+        title/chapter cards, structure and polish markers
                                                     ↓
-     dedupe → per-minute density ceilings → ordered, additive-only operations
+     dedupe → per-minute density ceilings → additive-only operations → dry-run
+                                → (--yes only) applied, changing no timing
                                                     ↓
-              offline dry-run → (explicit --yes only) applied on top of the
-                                same scratch sequence, changing no timing
+       local asset library (indexed, with optional sidecar metadata) matched
+       against every placeholder → mixing safety rules → real SFX, music beds,
+       ambience and graphics on their own tracks
+                                                    ↓
+              offline dry-run → (--yes only) placed, never on V1/A1
 ```
 
-### Session 1 — structure layer (`aa29677`)
+### Sessions 1–3 (`aa29677` … `1066d33`)
 
-- `editing/discovery.py`, `premiere_link.py` — footage scan, ffprobe metadata,
-  **read-only** Premiere project mapping
-- `editing/transcripts/` — SRT/VTT/CSV/JSON/timestamped-TXT, Premiere
-  Speech-to-Text via XMP word markers, sidecar auto-discovery
-- `editing/visual/` — sampling planner, Qwen3-VL client, analyzer
-- `editing/align.py` — combined timeline with match/contrast/neutral alignment
-- `editing/cache.py` — keyed on fingerprint + model + sampling config
-
-### Session 2 — audio + recommendations (`9cfac35`, `bf1ca21`, `b50cad6`)
-
-- `editing/audio/` — silence, spikes, sudden reactions, clipping, low energy,
-  speech density, plus inferred laughter/scream/music
-- `editing/recommend/` — six layers producing `EditRecommendation` records
-
-### Session 3 — rough cut (`05baf82`, `1066d33`)
-
-- `editing/roughcut/` — range selection, sequence layout maths, conversion to
-  catalog ops, four execution modes, review frame export
+- `editing/discovery.py`, `premiere_link.py`, `transcripts/`, `visual/`,
+  `align.py`, `cache.py` — the structure layer
+- `editing/audio/`, `editing/recommend/` — audio events and six
+  recommendation layers with a safety pass
+- `editing/roughcut/` — selection, layout maths, catalog ops, four execution
+  modes, review frames
 
 ### Session 4 — critic + one revision pass
 
@@ -88,106 +79,114 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
 
 ### Session 5 — style presets + layered execution
 
-- `editing/style/`
-  - `presets.py` — four `StylePreset`s, as numbers, with validation
-  - `schema.py` — `LayerItem`, `LayeredEditPlan`, seven layers
-  - `captions.py` — which lines earn text, condensing, safe zones
-  - `emphasis.py` — punches and pushes, stated as refusals
-  - `audio.py` — placeholders, plus the two fades that are real
-  - `cards.py` — title/chapter cards at genuine section boundaries
-  - `compile.py` — dedupe, density enforcement, ordered operations
-  - `execute.py` — three modes, the additive-only allowlist, the guards
-  - `report.py` — layer-by-layer output, density view, deferred view
-- `editing/config.py` — `layers_dir`
-- `editing/pipeline.py` — `layers`, `run_layers`, load/write pairs
-- `editing/cli.py` — `style list|show`, and `layers build|report|export|
-  dry-run|execute --yes|show-deferred|show-density`
-- `tests/editing/test_editing_style.py` — 126 tests
+- `editing/style/` — four presets, seven layers, density enforcement, an
+  additive-only allowlist (no `clip.*` at all)
+
+### Session 6 — asset library + real placement
+
+- `editing/assets/`
+  - `schema.py` — `AssetItem`, `AssetTag`, `AssetLibrary`, `AssetMatch`,
+    `AssetPlacement`, `AssetPlacementPlan`
+  - `library.py` — the folder layout, `init` (folders + README + example
+    sidecar), category inference, the skip list
+  - `indexer.py` — scanning, fingerprinting, probing, filename/folder inference
+  - `sidecar.py` — `<filename>.asset.json`, parsed so bad JSON never raises
+  - `match.py` — the whole matching policy as data, every rejection kept
+  - `place.py` — a chosen asset → operations, under the mixing rules
+  - `compile.py` — the pass, and the five possible outcomes
+  - `execute.py` — three modes, the allowlist, the track and import guards
+  - `report.py` — the shopping list, the refusals, and what was placed
+- `editing/config.py` — `asset_library_dir`
+- `editing/pipeline.py` — `init_assets`, `index_assets`, `asset_plan`,
+  `run_assets`, load/write pairs
+- `editing/cli.py` — `assets init|index|list|show|validate|report|match|plan|
+  dry-run|execute --yes|show-missing|show-deferred`
+- `tests/editing/test_editing_assets.py` — 120 tests
+
+**No new Premiere primitives were needed.** Everything the asset pass does uses
+ops that already existed: `clip.overwrite`, `graphic.image`, `audio.gain`,
+`audio.fade`, `audio.duck`, `track.add`, `project.import`.
 
 ---
 
 ## Design decisions worth not re-litigating
 
-**Inferred audio is capped at 0.45 confidence.** Silence and clipping are
-*measured*; laughter and screaming are guessed. Enforced in code
-(`AudioConfig.max_inferred_confidence`), and it survives all the way into the
-style layer — a guessed SFX placeholder always ranks below a measured one.
-
-**`hold` is a first-class recommendation category.** A planner that can only
-say "cut here" edits everything.
+**Inferred audio is capped at 0.45 confidence**, and the cap survives all the
+way into asset ranking: a guessed SFX placeholder scores below a measured one.
 
 **Nothing is ever deleted, only marked.** The Session 2 safety pass, the
-Session 4 critic and the Session 5 compiler all record what they refused and
-why. Three passes, one rule.
+Session 4 critic, the Session 5 compiler and the Session 6 placer all record
+what they refused and why. Four passes, one rule.
 
-**Sequence layout is computed offline.** All the arithmetic happens before
-Premiere is touched, which is what makes every plan dry-runnable.
-
-**Execution guards, in all three passes:** no default runs anything; a dry run
-must pass in the *same* call (a stored pass is not evidence about this plan);
-the target must be provably the scratch sequence; a refusal is a returned
-result with a reason.
+**Execution guards, in all four passes:** no default runs anything; a dry run
+must pass in the *same* call; the target must be provably the scratch sequence;
+a refusal is a returned result with a reason.
 
 ### From Session 4
 
-**A finding is not a fix.** `CriticFinding` and `RevisionRecommendation` are
-separate records and the conversion is explicit rules.
-
-**A fix may only act on a premise the plan confirms.** A critic hallucinating a
-zoom must not be able to make the system edit one that never existed.
+**A finding is not a fix**, and **a fix may only act on a premise the plan
+confirms** — a critic hallucinating a zoom cannot make the system edit one.
 
 ### From Session 5
 
-**Ceilings only ever subtract.** Every density field in a preset is a maximum.
-The compiler removes candidates to fit; it never invents one to fill a quota.
-A style cannot make the system busier than the evidence justifies — only
-quieter. This is the difference between "intentionally styled" and "randomly
-over-edited", and there is a test asserting it for all four presets on the same
-input.
+**Ceilings only ever subtract.** A style can make the edit quieter than the
+evidence justifies, never busier.
 
-**The style pass is additive only.** Its allowlist contains no `clip.*`
-operation, so it cannot trim, retime, move, split or remove a clip. Two things
-follow: nothing ripples (so unlike Session 4 there are no marker positions to
-correct and no unverified assumption), and the whole pass can be undone by
-deleting one track and its markers.
+**The style pass is additive only** — no `clip.*` operation at all, so nothing
+ripples and nothing it plans can describe a frame that moved.
 
-**Markers are free; picture changes are expensive.** Markers are not counted
-against any ceiling, and `is_active` is false for a marker-only item — so a
-caption that could not be placed safely does not spend the budget that would
-have let the next real edit through.
+**"N per minute" means two different things** above and below one: a rolling
+window count, or a whole-cut budget plus derived spacing.
 
-**Refusing to place text is a first-class outcome.** When a menu is open, when
-the critic flagged the moment, or when no safe zone is left, the caption
-becomes a marker *carrying the line*. Never text placed hopefully over the
-game.
+### From Session 6
 
-**A section boundary held back for room still leaves a marker.** Everything
-else deferred stays deferred, but a documentary that silently loses a chapter
-has lost the thing the style was chosen for.
+**Bad silence is better than random annoying SFX.** Every rule is written to
+make refusing cheap. Five outcomes per placeholder, four of which place
+nothing, each naming the rule that stopped it. On most libraries most of a plan
+is markers — that is the design working, and the marker list doubles as a
+shopping list.
 
-**Stacking is per sense.** Two things happening to the picture at once fight
-each other; an audio fade under a title card is ordinary editing. Enforcing one
-global stack rule made the pass drop fades for no reason.
+**An empty library is a valid input.** Zero files produces a complete,
+dry-run-valid plan of markers. Nobody has a tagged sound library on day one.
 
-**Density is a window count, not a derived spacing.** Deriving "60/rate seconds
-apart" from the per-minute ceiling forced perfectly even distribution, and a
-style advertising seven edits a minute delivered four. The rate is now a count
-inside a rolling 60-second window (the whole cut, when the cut is shorter than
-a minute, so the headline figure stays honest); *spacing* comes from the
-style's own `min_edit_spacing` / `min_caption_spacing` fields, which is what
-those fields are for. The one exception is a rate below one per minute, which
-cannot be a window count at all and does imply spacing.
+**Unreadable metadata is a flag, not a failure, and never "safe".** A file
+whose sidecar will not parse is indexed, marked `needs_review`, and held out of
+automatic placement — because metadata we could not read is not the same as
+metadata that said yes. Individual bad *fields* are dropped with a note while
+the rest of the document is kept.
+
+**`clip.overwrite`, never `clip.insert`.** Insert ripples; overwrite does not.
+That is what lets this pass place clips without moving anything Sessions 3–5
+computed.
+
+**Never V1 or A1**, checked structurally on every operation. Assets land on
+tracks the plan adds, so the pass is undone by deleting those tracks and the
+markers. V1/A1 are rejected even as *configuration*.
+
+**Two clips never overlap on one track** — correctness rather than taste, since
+`clip.overwrite` destroys what is under it. Two beds on A3 was the realistic
+case and it would have looked fine in the plan.
+
+**Rotation is not rationing.** Reusing an asset costs something only while a
+suitable alternative is unused; measured against the *viable* candidates, not
+the whole category. Measuring it against the category meant an unused impact
+sound made repeating the only whoosh look expensive.
+
+**Ducking is the Session 5 unlock.** `audio.duck` needed a bed clip and there
+was none; placing one makes it real, using the exact speech ranges Session 5
+already computed and stored in its `duck_narration` placeholder.
 
 ---
 
 ## Current state
 
-- **804 editing tests**, ~9s, needing no FFmpeg, GPU, model server or Premiere
-- `tests/premiere/` passes too (1081 across both suites)
+- **924 editing tests**, ~10s, needing no FFmpeg, GPU, model server, Premiere
+  or real media
+- `tests/premiere/` passes too (1200 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
-  client) are pre-existing and unrelated to this work
-- `editing/README.md` is the full user documentation (~1740 lines); sections 11
-  and 12 cover the style layer
+  client) are pre-existing and unrelated
+- `editing/README.md` is the full user documentation (~2130 lines); sections 13
+  and 14 cover the asset system
 
 **Note on running the tests here:** pytest's default temp root
 (`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
@@ -201,49 +200,46 @@ python -m pytest tests/editing -q --basetemp=%TEMP%\pt
 
 ## The honest gaps
 
-1. **Never tested with a real Qwen3-VL critic.** The critic pass has been run
-   end to end on real footage with real FFmpeg, but only with `MockCritic`.
-   **The critic prompt has never been seen by a model.** Still the
-   highest-value next action.
-2. **Never executed against real Premiere.** Every plan in Sessions 3–5
-   dry-runs clean, but the only thing that has run against the real host is the
+1. **Never tested with a real Qwen3-VL critic.** The critic prompt has never
+   been seen by a model. Still the highest-value next action.
+2. **Never executed against real Premiere.** Every plan in Sessions 3–6
+   dry-runs clean; the only thing that has run against the real host is the
    Premiere self-test. The first real `execute --yes` will find things the
    validator cannot.
-3. **`text.create` uses the rasterised path**, so captions are PNG overlays and
-   are **not editable in Premiere after placement**. Live text needs a
-   registered `.mogrt` template.
-4. **Style numbers are opinions**, not measured optima. They are meant to be
-   edited.
-5. **Caption selection is keywords**, English-only, tuned for Minecraft
-   commentary. It will miss sarcasm and running jokes.
-6. **Chapter detection is structural** (dimension change, death, stated
-   objective). A tonal section change is invisible to it.
-7. **Single video track for overlays**, single video track for the assembly.
-   No B-roll, no picture-in-picture.
-8. **No music, SFX or callout graphics exist.** Every audio cue except the two
-   fades is a marker; usually most of a styled pass is placeholder.
-9. **The style layer cannot re-cut.** `trim_aggression` and
-   `dead_air_tolerance` are carried and reported but not acted on — changing
-   the assembly's pacing means rebuilding the rough cut.
-10. **Marker positions after a Session 4 timing change are computed, not
-    observed** (unchanged from Session 4; `review plan --no-timing` avoids it).
-11. **Speed ripple is still assumed, not verified** (Session 3's gap).
+3. **Asset matching is tags and folders, not listening.** No audio content
+   analysis at all. A badly named file matches badly; the fix is a sidecar.
+4. **Loudness and BPM are never measured** — sidecar-only. Levels come from a
+   small table of category defaults, which are opinions.
+5. **Beds are tiled, not crossfaded.** Seams are audible if a file does not
+   loop cleanly, and only the filename or sidecar says whether it does.
+6. **Asset tracks are assumed, not discovered** (A2/A3/V3). The plan cannot
+   read the sequence's real track layout offline.
+7. **Nothing is ever removed.** Re-running the asset pass places assets again
+   rather than replacing the previous run's.
+8. **`.mogrt` is matched and never placed** — needs a registered template and
+   a parameter mapping.
+9. **`text.create` uses the rasterised path**, so captions are PNG overlays and
+   are not editable in Premiere after placement.
+10. **Style numbers and mixing limits are opinions**, meant to be edited.
+11. **Marker positions after a Session 4 timing change are computed, not
+    observed**; **speed ripple is still assumed** (Session 3's gap).
 
 ---
 
 ## Natural next steps
 
 - **Run the critic against a real Qwen3-VL server**, then read the findings.
-  Expect the prompt to need tuning.
-- **Execute a styled pass against real Premiere**, starting with
-  `layers build --style minimal_clean --markers-only` — which draws nothing,
-  scales nothing, and only places markers. If that lands cleanly, step up to
-  `cinematic_minecraft` and then to a style that draws text.
-- **Register a `.mogrt` template** so captions become live text.
-- **Tune the presets against real footage.** The accept/defer ratio per style
-  is the number to watch: `layers show-deferred` groups it by reason.
-- **Audio mixing** — turn the placeholders into real operations once a library
-  exists. The schema and the ranges are already there.
+- **Execute against real Premiere, in stages.** The safest ladder is:
+  `layers build --style minimal_clean --markers-only` (draws nothing), then
+  `assets plan --markers-only` (places nothing), then a real style, then real
+  assets. Each step is one `--yes` and each is undone by deleting a track.
+- **Put a real sound library together** and read `assets show-missing` — it is
+  written to be a shopping list.
+- **Loudness measurement.** `loudness_db` exists on every asset and is only
+  ever populated by hand; an ffmpeg `ebur128` pass would make levels measured
+  rather than assumed, and the schema is already shaped for it.
+- **Track discovery**, so A2/A3/V3 are read from the sequence rather than
+  assumed.
 
 ---
 
@@ -253,7 +249,7 @@ python -m pytest tests/editing -q --basetemp=%TEMP%\pt
 cd /d E:\Assistant
 git checkout claude/editing-brain-v1-structure-7p33pm
 
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt   REM expect 804 passed
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt   REM expect 924 passed
 python -m editing.cli doctor
 ```
 
@@ -275,19 +271,29 @@ python -m editing.cli review execute --yes
 
 REM Stage 5: the styled, layered edit
 python -m editing.cli style list
-python -m editing.cli style show cinematic_minecraft
-python -m editing.cli layers build --style minimal_clean --markers-only
+python -m editing.cli layers build --style cinematic_minecraft
 python -m editing.cli layers show-density
-python -m editing.cli layers show-deferred
-python -m editing.cli layers report
 python -m editing.cli layers dry-run
 python -m editing.cli layers execute --yes
+
+REM Stage 6: real sounds and graphics
+python -m editing.cli assets init
+REM ... copy your own music/SFX/PNGs into the folders it made ...
+python -m editing.cli assets index
+python -m editing.cli assets report            REM what you can and cannot serve
+python -m editing.cli assets validate          REM anything broken?
+python -m editing.cli assets plan
+python -m editing.cli assets show-missing      REM the shopping list
+python -m editing.cli assets show-deferred     REM what it refused, and why
+python -m editing.cli assets dry-run
+python -m editing.cli assets execute --yes
 ```
 
-Restyling is free and non-destructive: `layers build --style <other>` replaces
-the layer plan and touches nothing else. The rough cut, the critique and the
-revisions all survive it.
+`assets plan --markers-only` matches everything and places nothing — the best
+way to read what the pass *wants* to do before letting it do any of it.
+`assets match <kind>` prints the full scoring for every candidate, which is the
+tool for "why did it pick that?" and "why not mine?".
 
-If a styled pass looks too busy, the dials in order of bluntness are
-`--markers-only` (draws nothing at all), `--no-text` / `--no-zooms`,
-`--max-edits-per-minute N`, or simply a tighter preset.
+If a pass is too busy, the dials in order of bluntness are `--markers-only`,
+`--min-score 0.7`, `--max-sfx-per-minute 2`, `--min-sfx-gap 6`, or a tighter
+style preset.
