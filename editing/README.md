@@ -1,9 +1,9 @@
-# Editing Brain V1 — Structure, Recommendations, Rough Cut
+# Editing Brain V1 — Structure, Recommendations, Rough Cut, Critic
 
 Turns a folder of Minecraft footage into a machine-readable timeline of **what
 happens on screen**, **what is being said**, and **what is heard** — proposes
-the edits worth making, with the evidence for each one — and assembles them
-into a real Premiere rough cut.
+the edits worth making, with the evidence for each one — assembles them into a
+real Premiere rough cut, and then looks at that cut and improves it once.
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -15,12 +15,23 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
                      rough cut: selected ranges → scratch sequence plan
                                                     ↓
               offline dry-run → (explicit command only) execute → review frames
+                                                    ↓
+                     Qwen3-VL critic → findings → revision recommendations
+                                                    ↓
+              offline dry-run → (explicit --yes only) apply to the same sequence
 ```
 
 **Nothing runs unless you say so, twice.** Every plan is validated offline
 first, execution needs an explicit `--yes`, and the target is always a scratch
-sequence the plan creates itself — never the sequence you have open. Everything
-the layer writes is JSON, plus one plain-text report.
+sequence — one the rough cut creates itself, and the only one the revision pass
+is allowed to touch. Your open sequence is never edited. Everything the layer
+writes is JSON, plus two plain-text reports.
+
+**The critic pass is one iteration, not a loop.** It exists to catch the obvious
+mistakes an automatic assembly makes — a zoom that crops the HUD, a caption over
+the action, a beat cut a moment early. It is not trying to converge on a
+finished edit, and most of what it finds it deliberately hands back to you
+rather than fixing.
 
 ---
 
@@ -37,7 +48,12 @@ python -m editing.cli recommend --with-plan               # propose edits + dry-
 python -m editing.cli roughcut build                      # assemble a rough cut plan
 python -m editing.cli roughcut dry-run                    # validate it offline
 python -m editing.cli roughcut execute --yes              # build it in Premiere
-python -m editing.cli review                              # export frames to check it
+
+python -m editing.cli review export-frames                # frames worth a second look
+python -m editing.cli review critique                     # what the critic thinks
+python -m editing.cli review plan                         # findings → revisions
+python -m editing.cli review dry-run                      # validate the revisions
+python -m editing.cli review execute --yes                # apply them
 ```
 
 Then read the results:
@@ -47,6 +63,8 @@ python -m editing.cli top          # the moments most worth using
 python -m editing.cli reactions    # moments the audio made interesting
 python -m editing.cli removed      # what the safety pass threw out, and why
 python -m editing.cli draft        # the draft Premiere plan (executes nothing)
+python -m editing.cli review show-issues   # what the critic found, worst first
+python -m editing.cli review report        # the full revision report
 ```
 
 Export any artefact to a path of your choosing:
@@ -835,14 +853,12 @@ python -m editing.cli roughcut report
 ## 9. Review frames
 
 ```bash
-python -m editing.cli review           # export one frame per clip
-python -m editing.cli review --list    # see what would be exported first
+python -m editing.cli review export-frames          # the frames worth looking at
+python -m editing.cli review export-frames --list   # see the choice without extracting
+python -m editing.cli review export-frames --simple # one frame per clip, no context
 ```
 
-One representative frame per clip, taken a third of the way in (past the
-incoming cut, before any trailing motion), each linked back to the
-recommendation and segment that put the clip in the cut. A `review.json`
-manifest sits alongside them.
+A bare `python -m editing.cli review` still means `review export-frames`.
 
 **Frames come from the source files, not from Premiere.** The cut is an assembly
 of source ranges with known in/out points, so a frame at sequence time *t* is a
@@ -850,11 +866,234 @@ frame at a computable source time. That means review frames can be exported from
 a plan that was **never executed** — which is what makes them useful for
 checking a cut before committing to it.
 
-This prepares the input for a later critic pass. It does not judge the cut.
+### Which moments get a frame
+
+Not one per clip. The mistakes an automatic assembly makes cluster in specific
+places, so frames are chosen by rule:
+
+| Kind | Where | Why |
+|---|---|---|
+| `clip_start` | 0.35s after the incoming cut | did the next shot land? |
+| `clip_end` | 0.35s before the outgoing cut | was the beat clipped or held too long? |
+| `zoom` | at the **end** of a punch-in or push-in | the only point that answers "too far?" |
+| `marker` | at each planned marker | does the picture match what the plan claims? |
+| `text_placeholder` | at a text/caption/callout marker | is there room for it here? |
+| `speed_change` | mid-clip on a retimed clip | does the footage still read at 2x? |
+| `high_priority` | mid-clip on a payoff/reveal/danger/funny | where a defect costs most |
+| `sanity` | pseudo-random inside long stretches | a critic that only looks where problems are expected confirms the plan instead of testing it |
+
+Sanity probes are random in *placement* and deterministic in *result*: the
+offsets come from a hash of the clip's ID, so the same cut always samples the
+same moments and the critic's cache stays useful.
+
+Two probes landing on the same moment **in the same clip** collapse into the
+more specific one. Two probes either side of a **cut** never collapse — they are
+different shots from different files answering different questions, and the two
+edge probes are always closer together than the collapse threshold.
+
+Turn individual rules off with `--no-cut-points`, `--no-markers`, `--no-zooms`,
+`--no-speed`, `--no-text`, `--no-priority`, `--no-sanity`, and cap the whole
+pass with `--max-frames` (default 120; trimmed least-informative-kind first).
+
+### What each frame carries
+
+A vision model looking at one still cannot see that it is mid-punch-in, sped to
+2x, or two frames before a cut. So every frame is exported with its context
+attached, and the critic prompt states it plainly:
+
+- the sequence, the clip placement, and the source file and time it came from
+- the recommendation IDs and segment IDs behind the clip
+- **applied edits at that moment** — zoom (with the recommendation that asked
+  for it), speed, protected-hold status, and any marker within a second
+- **nearby transcript text**, **nearby audio events** (with type, span and
+  confidence), and **nearby visual events** (environment, actions, entities,
+  threats, HUD flags)
+- how long the clip runs on the timeline, and why the frame was picked
+
+Where the pipeline does not know something — no transcript, no audio pass, no
+timeline — the line is simply absent rather than present and empty. An empty
+field reads to a model as *there is nothing there*, which is a different claim
+from *I do not know*.
+
+A `review.json` manifest sits alongside the JPEGs with all of it.
 
 ---
 
-## 10. Where outputs go
+## 10. The critic pass
+
+```bash
+python -m editing.cli review critique                 # Qwen3-VL looks at the frames
+python -m editing.cli review show-issues              # one line per issue, worst first
+python -m editing.cli review show-issues --severity high
+python -m editing.cli review plan                     # findings → revisions → a plan
+python -m editing.cli review dry-run                  # validate it offline
+python -m editing.cli review execute --yes            # apply it
+python -m editing.cli review report                   # the whole story, in text
+```
+
+`--backend mock` works here exactly as it does for `analyze`: it exercises the
+whole path without a GPU, and every finding is marked `mock` so it can never be
+read as a real visual judgement.
+
+### What the critic looks for
+
+One frame per model call. Batching is cheaper and much worse — a small VLM shown
+six stills reliably attributes a problem in frame four to frame one, and a
+finding pointing at the wrong moment is worse than no finding.
+
+The vocabulary is closed. Anything the model invents coerces to
+`needs_human_review` rather than being dropped, with its original wording kept
+in `raw_issue`:
+
+```
+bad_crop              hud_hidden            action_hidden
+zoom_too_strong       text_unreadable       text_placed_badly
+caption_covers_gameplay                     too_dark / too_bright
+boring_too_long       cut_too_early         cut_too_late
+marker_mismatch       callout_needed        hold_longer
+remove_edit           needs_human_review
+```
+
+Every finding carries a **severity**, a **confidence** and its **evidence** —
+what in the frame the model says shows it.
+
+### Findings are not fixes
+
+This is the line the whole pass is built around. A *finding* is what the critic
+saw. A *revision* is what the system proposes doing about it, and the conversion
+between them is a set of explicit rules — not a model's opinion.
+
+**Confidence gates action; severity does not.** A high-severity finding the
+critic is 40% sure about becomes a note for a person, not an edit. Severity only
+decides how loudly it is reported and whether it earns a marker on the timeline.
+
+| Threshold | Value | Applies to |
+|---|---|---|
+| change the edit at all | 0.60 | every automatic fix (`--min-confidence`) |
+| change timing | 0.70 | extending a hold |
+| cut footage out | 0.80 | trimming dead air |
+
+**A fix may only act on something the plan knows is there.** `reduce_zoom`
+requires a zoom in the plan at that moment; `trim_dead_air` requires an audio
+event confirming dead air; `extend_hold` requires source footage past the out
+point. Without the premise the fix is refused with `not_verifiable` — a critic
+hallucinating a zoom cannot make the system edit one that never existed.
+
+**Amounts are fixed, not suggested.** Zooms reduce to a flat 106% rather than to
+whatever the model proposed; holds extend by at most 0.5s; trims take at most
+1.0s and never leave a clip under a second long.
+
+### What converts, and what does not
+
+| Fix | Becomes | Notes |
+|---|---|---|
+| `remove_zoom` | `property.reset` on Motion > Scale | one reversible reset |
+| `reduce_zoom` | `property.reset` **then** `animate` to 106% | resetting first is why the result is one gentle push rather than two stacked ones |
+| `move_text_placeholder` | `marker.remove` + `marker.add` | no text exists on this timeline; this re-sites the **placeholder marker**, and says so |
+| `color_marker` | `marker.add` `COLOR` | "too dark" carries no number; guessing an exposure lift would be inventing a grade |
+| `callout_marker` | `marker.add` `CALLOUT` | no callout graphic exists yet |
+| `review_marker` | `marker.add` `REVIEW` | put it in front of a person at the right moment |
+| `extend_hold` | `clip.trim` `edge=out`, negative, rippled | needs source headroom and 0.70 confidence |
+| `trim_dead_air` | `clip.trim` on a clip edge, rippled | needs an audio event and 0.80 confidence |
+| `shorten_section` | **nothing** | a timing change big enough that a person should make it |
+| `reframe` | **nothing** | this system cannot re-compose a shot |
+
+Everything in the second group — and everything that fails a gate above — stays
+a **revision recommendation** with `status: needs_human_review` and the reason
+attached. Nothing is silently dropped and nothing is faked: a finding with no
+safe automatic form does not quietly become a marker and get counted as fixed.
+
+Deferred findings at `medium` severity or above (and at least 0.45 confidence)
+*additionally* get a `REVIEW` marker on the timeline, so a problem the system
+could not fix is still visible where it happens rather than only in a report.
+Turn that off with `--no-review-markers`.
+
+### The revision schema
+
+```json
+{
+  "revision_id": "rv_8c1f0a2b4d3e",
+  "source_recommendation_id": "r_punch_31",
+  "finding_id": "cf_3a91...", "frame_id": "rf_...", "placement_id": "p_...",
+  "start": 31.4, "end": 32.4,
+  "issue": "hud_hidden", "severity": "high", "confidence": 0.78,
+  "visual_evidence": "the hearts are cropped off the bottom left",
+  "transcript_evidence": "oh my god that was close",
+  "audio_evidence": ["sudden_reaction"],
+  "suggested_fix": "remove_zoom",
+  "fix_detail": "Reset Motion > Scale on the clip at 31.90s, clearing the 115% zoom.",
+  "risks": ["removes_an_edit"],
+  "status": "accepted",
+  "status_reason": "A zoom is planned here and removing it is a single reversible property reset.",
+  "premiere_ops": [{"op": "property.reset", "...": "..."}],
+  "is_actionable": true
+}
+```
+
+`status` is one of `accepted`, `rejected`, `needs_human_review`, and it is the
+gate: only `accepted` **with operations** reaches the plan.
+
+### Operation order, and the one thing it cannot verify
+
+The revision plan fixes its own order, because the order is load-bearing:
+
+1. `sequence.activate` — the rough cut's sequence, **by name**. A revision plan
+   never *creates* a sequence.
+2. Zoom fixes. They change one clip's Scale and move nothing.
+3. Timing fixes, **back to front**. Rippling shifts every later clip, so working
+   backwards means each clip is still where the plan says when its turn comes.
+4. Marker operations, at positions **corrected for the ripple above**.
+5. `REVIEW` markers for what could not be fixed.
+
+Step 4 is the genuinely uncertain part, and the plan warns about it out loud.
+Premiere's sequence markers do not ripple with clips, so a trim earlier in the
+sequence moves the picture out from under any marker after it. New markers this
+plan places are corrected offline; **pre-existing rough-cut markers after a trim
+are not** — the plan counts them and tells you. For a pass that cannot cause
+this at all, use `--no-timing`, which proposes no trims or extensions and leaves
+the cut's timing exactly as it was.
+
+### The guards
+
+The rough cut's three guards, plus one that replaces the guarantee a revision
+cannot make. A rough cut *creates* its own scratch sequence, which is what
+proves it cannot touch your timeline. A revision edits a sequence that already
+exists, so "did you build your own sandbox" is unanswerable. In its place:
+
+- **Nothing runs without an explicit mode**, and the CLI additionally requires
+  `--yes`.
+- **A dry run must pass in the same call.** A stored pass from an earlier build
+  is not evidence about the plan being run now — validation reruns every time.
+- **The first operation must be `sequence.activate` naming the rough cut's
+  sequence**, so the target is fixed by the plan rather than inherited from
+  whatever happens to be open. A second activate anywhere in the plan is refused.
+- **Every operation must be on a short allowlist**: `sequence.activate`,
+  `property.reset`, `animate`, `clip.trim`, `marker.add`, `marker.remove`.
+  Nothing else can affect another sequence or anything on disk, so a plan
+  containing an import, a save, a clip removal or a sequence creation is refused
+  rather than inspected further.
+- **The rough cut must itself have been scratch-safe**, and must actually have
+  been executed — otherwise the sequence being activated probably does not exist.
+- **A refusal is a returned result, not an exception**, with the reason on it.
+
+```bash
+python -m editing.cli review execute            # refuses: needs --yes
+python -m editing.cli review execute --yes      # runs, after validating again
+```
+
+### The reports
+
+Two files, and the rough cut's own report is **never overwritten** — a second
+opinion that destroyed the baseline it was judging would be worthless.
+
+`critic/<name>.revisions.txt` leads with **what it could not fix**, before what
+it could. The automatic fixes are bounded and reversible by construction; the
+deferred findings are where the real problems with the cut are, and burying them
+under a list of successes is how a report stops being read.
+
+---
+
+## 11. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
@@ -871,14 +1110,20 @@ data/editing/
 ├── roughcut/structure.json         ← the rough cut: placements + operations
 ├── roughcut/structure.execution.json  what happened when it was run
 ├── review/<sequence>/*.jpg         review frames
-├── review/<sequence>/review.json   review manifest
+├── review/<sequence>/review.json   review manifest (frames + their context)
+├── critic/structure.critique.json  ← what the critic saw, per frame
+├── critic/structure.revisions.json ← revision recommendations, with evidence
+├── critic/structure.revisions.txt  ← the human-readable revision report
+├── critic/structure.revision-plan.json      the operations + dry-run result
+├── critic/structure.revision-execution.json what happened when it was applied
 ├── frames/                         extracted JPEGs (deleted unless --keep-frames)
 └── cache/
     ├── probe/       ffprobe results
     ├── motion/      motion scans
     ├── audio/       loudness analyses
     ├── transcript/
-    └── visual/      one JSON per analysed window
+    ├── visual/      one JSON per analysed window
+    └── critic/      one JSON per critiqued frame
 ```
 
 Each stage writes as it goes, so an interrupted four-hour analysis loses
@@ -894,7 +1139,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 11. Caching
+## 12. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -908,6 +1153,11 @@ Every one of those genuinely changes the result, so a hit means the stored value
 *is* the value this run would have computed. Change the window length, switch
 models, or re-export the clip, and the cache correctly misses.
 
+Critic entries are keyed on the frame image **and the context it was judged
+against**. Both matter: a re-exported frame at a different width is a different
+picture, and the same picture with a zoom now planned over it is a different
+question. Either one changing misses the cache.
+
 Content hashing reads the **head and tail** of the file plus its size. Fully
 hashing a 20GB capture would cost more than the analysis being cached, and a
 video container's header shifts whenever the content does.
@@ -915,6 +1165,7 @@ video container's header shifts whenever the content does.
 ```bash
 python -m editing.cli cache info
 python -m editing.cli cache clear --kind visual
+python -m editing.cli cache clear --kind critic
 python -m editing.cli analyze --no-cache
 ```
 
@@ -924,10 +1175,10 @@ that window.
 
 ---
 
-## 12. Tests
+## 13. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 558 tests, ~3s
+python -m pytest tests/editing -q        # 678 tests, ~9s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -947,6 +1198,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_audio.py` | detectors, confidence ceiling, markers, caching |
 | `test_editing_recommend.py` | layers, safety pass, dry-run, no execution |
 | `test_editing_roughcut.py` | selection, layout maths, conversion, **execution guards** |
+| `test_editing_critic.py` | frame coverage, critic coercion, **the finding/fix line**, revision guards |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
 
 Tests worth knowing about, because they pin the promises this layer makes:
@@ -971,6 +1223,19 @@ Tests worth knowing about, because they pin the promises this layer makes:
 - `test_a_protected_range_wins_the_contested_frames` — a payoff can never end up
   inside a sped-up filler clip
 - `test_no_cli_command_builds_a_plan_that_edits_the_active_sequence`
+- `test_a_zoom_complaint_about_a_frame_with_no_zoom_is_refused` — a hallucinated
+  premise cannot cause an edit
+- `test_trimming_dead_air_needs_the_audio_layer_to_agree` — two channels have to
+  agree before footage is cut
+- `test_a_fix_with_no_safe_form_stays_a_recommendation` — nothing is silently
+  dropped and nothing is faked
+- `test_both_sides_of_a_cut_are_sampled` — the two edge probes are closer than
+  the collapse threshold, so this is the test that stops every incoming-cut
+  frame quietly vanishing
+- `test_the_allowlist_is_the_whole_guarantee` — the set of operations a revision
+  can emit and the set it is permitted to emit are the same set
+- `test_the_rough_cut_report_survives_the_revision_pass` — a second opinion does
+  not overwrite the thing it is judging
 
 ---
 
@@ -1057,13 +1322,47 @@ There is no ducking, no levelling, no music bed — those remain markers.
 `sound_effect`, `ducking` and `visual_callout` are placeholders with real timing
 and no chosen asset or graphic.
 
-**Review frames are evidence, not a verdict.** They are exported and manifested
-for a critic pass that does not exist yet. Nothing currently looks at them.
-
 **Execution is opt-in and scratch-only.** The layer will now build a real
 sequence, but only on an explicit `roughcut execute --yes`, only after a dry run
 passes in the same call, and only onto a sequence it creates itself. Your open
-sequence is never touched without `--allow-active-sequence`.
+sequence is never touched without `--allow-active-sequence`. The revision pass
+adds an operation allowlist on top of that, and refuses anything outside it.
+
+**The critic is one pass, and a small model.** Qwen3-VL-8B judging a single
+still is good at the gross defects — a blown-out frame, a caption over the
+crosshair, a subject half out of frame — and unreliable at anything needing
+comparison across frames or taste. Most of what it reports is deliberately
+handed back to you: on a typical cut, well over half the findings end as
+recommendations rather than edits. That ratio is the design working, not the
+critic failing.
+
+**The critic cannot see motion.** Everything it is told about timing, speed,
+zoom and placement comes from the metadata in the prompt, not from the picture.
+If the timeline is missing (no `timeline` built), the frames carry no context
+and the pass degrades to bare picture-quality judgements — the command says so
+when that happens.
+
+**Marker positions after a timing change are computed, not observed.** Premiere
+sequence markers do not ripple with clips, so a trim moves the picture out from
+under every marker after it. New markers this pass places are corrected offline;
+pre-existing rough-cut markers are counted and warned about, not moved. This has
+the same status as the Session 3 ripple assumption: the dry run validates
+operation *shape*, not Premiere's runtime behaviour. `--no-timing` avoids the
+question entirely.
+
+**Text fixes move a placeholder, not text.** Nothing has placed a title or a
+caption on this timeline; text categories are marker placeholders. A
+`move_text_placeholder` revision rewrites the marker that tells an editor where
+the graphic goes. The revision says so in its own `fix_detail` rather than
+letting the count of "fixes applied" imply work that was never done.
+
+**Colour is never corrected automatically.** Lumetri is reachable from the
+catalog, but "this frame is too dark" carries no number, and guessing an
+exposure lift would be inventing a grade. Brightness findings become markers.
+
+**Nothing here is a loop.** Running `review critique` twice re-judges the same
+frames; running it after applying revisions requires re-exporting frames from an
+updated cut, which this session does not automate. One pass, on purpose.
 
 ---
 

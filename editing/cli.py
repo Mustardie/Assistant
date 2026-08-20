@@ -13,6 +13,9 @@ Commands, in the order a session normally uses them::
     plan        preview sampling cost without analysing anything
     cache       info | clear
     doctor      check FFmpeg, the model server and Premiere
+    roughcut    build | dry-run | execute | placements | unconverted | report
+    review      export-frames | critique | plan | dry-run | execute --yes |
+                report | show-issues   -- the critic pass over a rough cut
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -37,6 +40,9 @@ from editing.pipeline import Pipeline, build_pipeline
 from editing.schema import StructureTimeline
 from editing.recommend import report as report_module
 from editing.recommend.planner import PlannerOptions
+from editing.critic import report as critic_report
+from editing.critic.frames import CoverageOptions
+from editing.critic.revise import RevisionOptions
 from editing.roughcut import review as review_module
 from editing.roughcut.build import RoughCutOptions
 from editing.transcripts import premiere_source
@@ -678,41 +684,283 @@ def cmd_roughcut(args) -> int:
     raise EditingError("Unknown roughcut command")
 
 
+def _coverage_options(args) -> Optional[CoverageOptions]:
+    """Coverage options from the flags, or None for "simple, one per clip"."""
+    if getattr(args, "simple", False):
+        return None
+    return CoverageOptions(
+        cut_points=not getattr(args, "no_cut_points", False),
+        markers=not getattr(args, "no_markers", False),
+        zooms=not getattr(args, "no_zooms", False),
+        speed_changes=not getattr(args, "no_speed", False),
+        text_placeholders=not getattr(args, "no_text", False),
+        high_priority=not getattr(args, "no_priority", False),
+        sanity=not getattr(args, "no_sanity", False),
+        max_frames=getattr(args, "max_frames", None) or 120,
+    )
+
+
+def _revision_options(args) -> RevisionOptions:
+    return RevisionOptions(
+        allow_timing=not getattr(args, "no_timing", False),
+        allow_zoom_edits=not getattr(args, "no_zoom_edits", False),
+        min_confidence=getattr(args, "min_confidence", None) or 0.60,
+    )
+
+
 def cmd_review(args) -> int:
-    """Export review frames from the rough cut."""
+    """The critic pass: frames, critique, revisions, dry run, execution."""
+    command = getattr(args, "review_command", None) or "export-frames"
     pipeline = _pipeline(args)
+
+    # -- export-frames ---------------------------------------------------
+    if command == "export-frames":
+        return _review_export(args, pipeline)
+
+    # -- critique --------------------------------------------------------
+    if command == "critique":
+        review = pipeline.load_review(name=args.name)
+        report = pipeline.critique(
+            review, name=args.name, limit=args.max_frames or 0
+        )
+        if args.json:
+            _emit({"success": True, **report.to_dict()})
+            return EXIT_OK
+        stats = report.stats()
+        print(f"Critique of '{report.sequence_name}' with {report.model}")
+        if report.mock:
+            print("  *** MOCK CRITIC -- metadata only, no picture examined ***")
+        print(f"  frames examined : {stats['frames_examined']}")
+        print(f"  clean           : {stats['frames_clean']}")
+        print(f"  failed          : {stats['frames_failed']}")
+        print(f"  findings        : {stats['findings']}")
+        for issue, count in sorted(
+            stats["by_issue"].items(), key=lambda kv: -kv[1]
+        ):
+            print(f"    {issue:<26} {count}")
+        for warning in report.warnings[: args.limit]:
+            print(f"  ! {warning}")
+        print(f"\nWritten to "
+              f"{pipeline.config.critic_dir / (args.name + '.critique.json')}")
+        return EXIT_OK
+
+    # -- plan -------------------------------------------------------------
+    if command == "plan":
+        revisions, plan = pipeline.revise(
+            name=args.name,
+            options=_revision_options(args),
+            plan_options={"mark_deferred": not args.no_review_markers},
+        )
+        if args.json:
+            _emit({"success": True, "revisions": revisions.to_dict(),
+                   "plan": plan.to_dict()})
+            return EXIT_OK
+        _print_revision_plan(revisions, plan, limit=args.limit)
+        print(f"\nWritten to {pipeline.config.critic_dir}")
+        return EXIT_OK
+
+    # -- dry-run ----------------------------------------------------------
+    if command == "dry-run":
+        plan = pipeline.load_revision_plan(name=args.name)
+        report = pipeline.run_revisions(plan, mode="dry_run", name=args.name)
+        if args.json:
+            _emit({"success": True, "report": report.to_dict(),
+                   "dry_run_passed": plan.dry_run_passed,
+                   "explanation": plan.explanation})
+            return EXIT_OK
+        print(f"Revision dry run: "
+              f"{'PASSED' if plan.dry_run_passed else 'FAILED'}")
+        print(f"  operations : {plan.operation_count}")
+        print(f"  executed   : {report.executed}  <- nothing has been applied")
+        if plan.dry_run_error:
+            print(f"  error      : {plan.dry_run_error.get('error')}")
+            if plan.dry_run_error.get("hint"):
+                print(f"  hint       : {plan.dry_run_error['hint']}")
+        for line in plan.explanation[: args.limit]:
+            print(f"    {line}")
+        for warning in plan.warnings:
+            print(f"  ! {warning}")
+        return EXIT_OK
+
+    # -- execute ----------------------------------------------------------
+    if command == "execute":
+        plan = pipeline.load_revision_plan(name=args.name)
+        if not args.yes:
+            raise EditingError(
+                "Applying revisions needs an explicit confirmation",
+                hint="This writes to the rough cut sequence in Premiere. "
+                     "Re-run with --yes once you have read the dry run and "
+                     "the revision report.",
+            )
+        report = pipeline.run_revisions(
+            plan,
+            mode="execute",
+            name=args.name,
+            allow_active_sequence=args.allow_active_sequence,
+        )
+        if args.json:
+            _emit({"success": report.ok, **report.to_dict()})
+            return EXIT_OK if report.ok or report.refused_reason else EXIT_ERROR
+
+        print(f"Revision execution ({plan.sequence_name})")
+        print(f"  dry run    : {'passed' if report.dry_run_passed else 'FAILED'}")
+        print(f"  on scratch : {report.on_scratch}")
+        print(f"  executed   : {report.executed}")
+        print(f"  operations : {report.operations_succeeded}/"
+              f"{report.operations_attempted}")
+        if report.refused_reason:
+            print(f"  refused    : {report.refused_reason}")
+        if report.error:
+            print(f"  error      : {report.error.get('error')}")
+        return EXIT_OK if report.executed or report.refused_reason else EXIT_ERROR
+
+    # -- report -----------------------------------------------------------
+    if command == "report":
+        revisions = pipeline.load_revisions(name=args.name)
+        critique = None
+        plan = None
+        try:
+            critique = pipeline.load_critique(name=args.name)
+        except EditingError:
+            pass
+        try:
+            plan = pipeline.load_revision_plan(name=args.name)
+        except EditingError:
+            pass
+        if args.json:
+            _emit({
+                "success": True,
+                "revisions": revisions.to_dict(),
+                "critique": critique.to_dict() if critique else None,
+                "plan": plan.to_dict() if plan else None,
+            })
+            return EXIT_OK
+        print(critic_report.render(
+            revisions, critique=critique, plan=plan, limit=args.limit
+        ))
+        return EXIT_OK
+
+    # -- show-issues -------------------------------------------------------
+    if command == "show-issues":
+        revisions = pipeline.load_revisions(name=args.name)
+        if args.json:
+            entries = revisions.ranked()
+            if args.severity:
+                from editing.critic.schema import SEVERITY_ORDER
+                floor = SEVERITY_ORDER.get(args.severity, 0)
+                entries = [
+                    entry for entry in entries
+                    if SEVERITY_ORDER.get(entry.severity, 0) >= floor
+                ]
+            _emit({"success": True, "count": len(entries),
+                   "mock": revisions.mock,
+                   "issues": [entry.to_dict() for entry in entries]})
+            return EXIT_OK
+        print(critic_report.render_issues(
+            revisions, limit=args.limit, severity=args.severity or ""
+        ))
+        return EXIT_OK
+
+    raise EditingError("Unknown review command")
+
+
+def _review_export(args, pipeline) -> int:
+    """``review export-frames``: choose the moments, then extract them."""
     plan = pipeline.load_rough_cut(name=args.name)
+    coverage = not getattr(args, "simple", False)
 
     if args.list:
-        frames = review_module.plan_frames(plan, position=args.position)
+        if coverage:
+            frames = pipeline_coverage_preview(pipeline, plan, args)
+        else:
+            frames = review_module.plan_frames(plan, position=args.position)
         if args.json:
             _emit({"success": True, "exported": False,
+                   "count": len(frames),
                    "frames": [f.to_dict() for f in frames]})
             return EXIT_OK
         print(f"{len(frames)} frame(s) would be exported:")
         for frame in frames[: args.limit]:
             print(f"  seq {frame.sequence_time:8.2f}s <- src "
-                  f"{frame.source_time:8.2f}s  {frame.keep_reason:<14} "
-                  f"{frame.placement_id}")
+                  f"{frame.source_time:8.2f}s  {frame.frame_kind:<16} "
+                  f"{frame.reason[:44]}")
         return EXIT_OK
 
     review = pipeline.review_frames(
-        plan, name=args.name, position=args.position, width=args.width
+        plan, name=args.name, position=args.position, width=args.width,
+        coverage=coverage, coverage_options=_coverage_options(args),
     )
     if args.json:
         _emit({"success": True, **review.to_dict()})
         return EXIT_OK
 
     print(f"{len(review)} review frame(s) for '{plan.sequence_name}'.")
+    for kind, count in sorted(review.stats()["by_frame_kind"].items()):
+        print(f"    {kind:<18} {count}")
     for frame in review.frames[: args.limit]:
-        print(f"  seq {frame.sequence_time:8.2f}s  {frame.keep_reason:<14} "
+        print(f"  seq {frame.sequence_time:8.2f}s  {frame.frame_kind:<16} "
               f"{Path(frame.path).name}")
         if frame.marker_names:
             print(f"      markers: {', '.join(frame.marker_names)}")
+        if frame.applied_edits:
+            print("      edits  : " + ", ".join(
+                str(edit.get("kind")) for edit in frame.applied_edits
+            ))
     for warning in review.warnings:
         print(f"  ! {warning}")
     print(f"\nWritten to {pipeline.config.review_dir}")
     return EXIT_OK
+
+
+def pipeline_coverage_preview(pipeline, plan, args):
+    """The coverage frame list, without extracting anything."""
+    from editing.critic import frames as critic_frames
+
+    return critic_frames.plan_coverage_frames(
+        plan,
+        timeline=pipeline._timeline_or_none(args.name),
+        recommendations=pipeline._recommendations_or_none(args.name),
+        options=_coverage_options(args),
+    )
+
+
+def _print_revision_plan(revisions, plan, *, limit: int = 30) -> None:
+    stats = revisions.stats()
+    print(f"Revisions for '{revisions.sequence_name}'")
+    if revisions.mock:
+        print("  *** MOCK CRITIC -- metadata only, no picture examined ***")
+    print(f"  findings turned into revisions : {stats['total']}")
+    print(f"  accepted (will be applied)     : {stats['accepted']}")
+    print(f"  kept for a human               : "
+          f"{stats['needs_human_review']}")
+    print(f"  rejected                       : {stats['rejected']}")
+    print(f"  operations                     : {plan.operation_count}")
+    print(f"  dry run                        : "
+          f"{'passed' if plan.dry_run_passed else 'FAILED'}")
+    print(f"  executed                       : {plan.executed}"
+          f"  <- nothing has been applied")
+
+    accepted = revisions.accepted()
+    if accepted:
+        print("\n  Would be applied:")
+        for revision in accepted[:limit]:
+            print(f"    [{revision.start:8.2f}s] {revision.issue:<24} "
+                  f"-> {revision.suggested_fix}")
+            if revision.fix_detail:
+                print(f"        {revision.fix_detail[:100]}")
+
+    deferred = revisions.needing_human()
+    if deferred:
+        print("\n  Kept as recommendations (NOT fixed automatically):")
+        for revision in deferred[:limit]:
+            print(f"    [{revision.start:8.2f}s] {revision.issue:<24} "
+                  f"{revision.severity:<6} {revision.confidence:.0%}")
+            print(f"        {revision.status_reason[:110]}")
+
+    if plan.dry_run_error:
+        print(f"\n  ! {plan.dry_run_error.get('error')}")
+    for warning in revisions.warnings + plan.warnings:
+        print(f"  ! {warning}")
 
 
 def _print_roughcut(plan, *, limit: int = 30) -> None:
@@ -1105,6 +1353,36 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verbose", action="store_true", help="debug logging")
 
 
+def _add_review_export_args(parser: argparse.ArgumentParser) -> None:
+    """Flags shared by ``review`` and ``review export-frames``.
+
+    Defined once and applied to both so the bare ``review`` command keeps
+    working exactly as Session 3 documented it.
+    """
+    parser.add_argument("--name", default="structure")
+    parser.add_argument("--position", type=float, default=0.34,
+                        help="where in each clip to sample in --simple mode, "
+                             "0-1 (default 0.34)")
+    parser.add_argument("--width", type=int, default=960,
+                        help="exported frame width (default 960)")
+    parser.add_argument("--list", action="store_true",
+                        help="list what would be exported without extracting")
+    parser.add_argument("--simple", action="store_true",
+                        help="one representative frame per clip, with no "
+                             "coverage rules and no context attached")
+    parser.add_argument("--max-frames", type=int, default=120,
+                        help="ceiling on frames exported (default 120)")
+    group = parser.add_argument_group("coverage rules")
+    group.add_argument("--no-cut-points", action="store_true")
+    group.add_argument("--no-markers", action="store_true")
+    group.add_argument("--no-zooms", action="store_true")
+    group.add_argument("--no-speed", action="store_true")
+    group.add_argument("--no-text", action="store_true")
+    group.add_argument("--no-priority", action="store_true")
+    group.add_argument("--no-sanity", action="store_true")
+    parser.add_argument("--limit", type=int, default=40)
+
+
 def _add_model(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("model")
     group.add_argument("--backend", choices=sorted(set(qwen.BACKENDS) | {"mock"}),
@@ -1133,7 +1411,11 @@ def build_parser() -> argparse.ArgumentParser:
                "  python -m editing.cli roughcut build\n"
                "  python -m editing.cli roughcut dry-run\n"
                "  python -m editing.cli roughcut execute --yes\n"
-               "  python -m editing.cli review\n"
+               "  python -m editing.cli review export-frames\n"
+               "  python -m editing.cli review critique\n"
+               "  python -m editing.cli review plan\n"
+               "  python -m editing.cli review dry-run\n"
+               "  python -m editing.cli review execute --yes\n"
                "\nOr all of it at once:\n"
                "  python -m editing.cli run --folder D:/Footage/ep12 --recommend\n"
                "\nNothing here applies an edit. `draft` validates a Premiere\n"
@@ -1370,18 +1652,87 @@ def build_parser() -> argparse.ArgumentParser:
     rc_report.set_defaults(func=cmd_roughcut)
 
     # -- review ---------------------------------------------------------
+    # A subcommand group, but the bare `review` still works and means
+    # `review export-frames` -- that is what Session 3 documented, and
+    # breaking it to add subcommands would be a bad trade.
     review = subparsers.add_parser(
-        "review", help="export representative frames from the rough cut")
-    review.add_argument("--name", default="structure")
-    review.add_argument("--position", type=float, default=0.34,
-                        help="where in each clip to sample, 0-1 (default 0.34)")
-    review.add_argument("--width", type=int, default=960,
-                        help="exported frame width (default 960)")
-    review.add_argument("--list", action="store_true",
-                        help="list what would be exported without extracting")
-    review.add_argument("--limit", type=int, default=40)
+        "review",
+        help="the critic pass: review frames, critique, revise, apply")
+    _add_review_export_args(review)
     _add_common(review)
-    review.set_defaults(func=cmd_review)
+    review.set_defaults(func=cmd_review, review_command="export-frames")
+    review_subs = review.add_subparsers(dest="review_command", required=False)
+
+    rv_frames = review_subs.add_parser(
+        "export-frames",
+        help="choose the moments worth reviewing and extract them")
+    _add_review_export_args(rv_frames)
+    _add_common(rv_frames)
+    rv_frames.set_defaults(func=cmd_review)
+
+    rv_crit = review_subs.add_parser(
+        "critique", help="run the visual critic over the exported frames")
+    rv_crit.add_argument("--name", default="structure")
+    rv_crit.add_argument("--max-frames", type=int, default=0,
+                         help="critique at most this many frames (0 = all)")
+    rv_crit.add_argument("--limit", type=int, default=40)
+    _add_model(rv_crit)
+    _add_common(rv_crit)
+    rv_crit.set_defaults(func=cmd_review)
+
+    rv_plan = review_subs.add_parser(
+        "plan", help="turn findings into revisions and a validated plan")
+    rv_plan.add_argument("--name", default="structure")
+    rv_plan.add_argument("--no-timing", action="store_true",
+                         help="propose no trims or hold extensions, so the "
+                              "cut's timing is left exactly as it was")
+    rv_plan.add_argument("--no-zoom-edits", action="store_true",
+                         help="never change a zoom; report them instead")
+    rv_plan.add_argument("--no-review-markers", action="store_true",
+                         help="do not put REVIEW markers on the timeline for "
+                              "findings that could not be fixed")
+    rv_plan.add_argument("--min-confidence", type=float, default=0.60,
+                         help="critic confidence needed to change the edit "
+                              "automatically (default 0.60)")
+    rv_plan.add_argument("--limit", type=int, default=30)
+    _add_common(rv_plan)
+    rv_plan.set_defaults(func=cmd_review)
+
+    rv_dry = review_subs.add_parser(
+        "dry-run", help="validate the revision plan offline (applies nothing)")
+    rv_dry.add_argument("--name", default="structure")
+    rv_dry.add_argument("--limit", type=int, default=40)
+    _add_common(rv_dry)
+    rv_dry.set_defaults(func=cmd_review)
+
+    rv_exec = review_subs.add_parser(
+        "execute", help="apply the revisions to the rough cut -- needs --yes")
+    rv_exec.add_argument("--name", default="structure")
+    rv_exec.add_argument("--yes", action="store_true",
+                         help="required: confirms you have read the dry run")
+    rv_exec.add_argument(
+        "--allow-active-sequence", action="store_true",
+        help="permit revising a sequence this system cannot prove is the "
+             "rough cut's scratch one. Off by default.")
+    rv_exec.add_argument("--limit", type=int, default=40)
+    _add_common(rv_exec)
+    rv_exec.set_defaults(func=cmd_review)
+
+    rv_report = review_subs.add_parser(
+        "report", help="the full revision report, including what it could not fix")
+    rv_report.add_argument("--name", default="structure")
+    rv_report.add_argument("--limit", type=int, default=40)
+    _add_common(rv_report)
+    rv_report.set_defaults(func=cmd_review)
+
+    rv_issues = review_subs.add_parser(
+        "show-issues", help="one line per issue, worst first")
+    rv_issues.add_argument("--name", default="structure")
+    rv_issues.add_argument("--severity", choices=["low", "medium", "high"],
+                           help="only this severity and above")
+    rv_issues.add_argument("--limit", type=int, default=40)
+    _add_common(rv_issues)
+    rv_issues.set_defaults(func=cmd_review)
 
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")

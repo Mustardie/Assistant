@@ -17,6 +17,9 @@ Layout::
     transcripts/    Premiere Speech-to-Text access + SRT/VTT/TXT/JSON import
     visual/         sampling plan, frame extraction, Qwen3-VL, event analysis
     align.py        transcript + visual events -> combined structure timeline
+    recommend/      six layers of edit proposals + a safety pass
+    roughcut/       selected ranges -> a validated scratch-sequence plan
+    critic/         review frames -> Qwen3-VL critique -> one revision pass
     pipeline.py     the orchestration each CLI command calls into
     cli.py          ``python -m editing.cli``
 

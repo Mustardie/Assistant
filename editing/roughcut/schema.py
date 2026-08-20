@@ -101,6 +101,19 @@ class ClipPlacement:
         rate = self.speed if self.speed > 0 else 1.0
         return self.sequence_start + (source_time - self.source_in) / rate
 
+    def sequence_to_source(self, sequence_time: float) -> Optional[float]:
+        """The inverse: a position on the sequence back to a source time.
+
+        Needed by the review pass, which chooses moments to look at *on the
+        timeline* (a cut point, a marker, the middle of a zoom) and then has to
+        find the frame in the original file, because frames are pulled from
+        source media rather than rendered out of Premiere.
+        """
+        if not (self.sequence_start <= sequence_time <= self.sequence_end):
+            return None
+        rate = self.speed if self.speed > 0 else 1.0
+        return self.source_in + (sequence_time - self.sequence_start) * rate
+
     def selector(self) -> dict:
         """The Premiere clip selector for this placement."""
         return {"track": self.track, "at": round(self.sequence_midpoint, 3)}

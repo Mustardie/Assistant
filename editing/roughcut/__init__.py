@@ -13,6 +13,8 @@
     convert.py  layout + recommendations -> catalog operations
     execute.py  the four execution modes and the guards around them
     review.py   representative frames, traced back to recommendations
+                (``editing.critic.frames`` plans the critic's coverage set;
+                ``export_frames(frames=...)`` is the seam it uses)
 
 The chain **source file -> source range -> recommendation -> sequence position
 -> operation** is preserved end to end, so every frame in the cut can be traced
@@ -27,7 +29,8 @@ from editing.roughcut.execute import (
     MODES, ExecutionReport, dry_run, run, summarise, targets_scratch_sequence,
 )
 from editing.roughcut.review import (
-    ReviewFrame, ReviewSet, export_frames, load_review, plan_frames, write_review,
+    FRAME_KINDS, ReviewFrame, ReviewSet, export_frames, load_review,
+    plan_frames, write_review,
 )
 from editing.roughcut.schema import (
     ClipPlacement, RoughCutPlan, SequenceMarker, Unconverted,
@@ -48,5 +51,5 @@ __all__ = [
     "dry_run", "run", "targets_scratch_sequence", "summarise", "MODES",
     # review
     "ReviewFrame", "ReviewSet", "plan_frames", "export_frames", "write_review",
-    "load_review",
+    "load_review", "FRAME_KINDS",
 ]

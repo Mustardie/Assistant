@@ -27,6 +27,13 @@ from editing import align
 from editing.cache import Cache, build_cache
 from editing.audio.analyzer import AudioAnalyzer, AudioResult
 from editing.config import AudioConfig, EditingConfig, SamplingConfig
+from editing.critic import (
+    critic as critic_module, execute as critic_execute, frames as critic_frames,
+    plan as critic_plan, report as critic_report, revise as critic_revise,
+)
+from editing.critic.schema import (
+    CriticReport, RevisionPlan, RevisionSet,
+)
 from editing.discovery import discover
 from editing.errors import EditingError, FootageError
 from editing.fingerprint import fingerprint
@@ -713,13 +720,43 @@ class Pipeline:
         name: str = "structure",
         position: float = review_module.DEFAULT_POSITION,
         width: int = review_module.DEFAULT_WIDTH,
+        coverage: bool = True,
+        coverage_options=None,
+        timeline: Optional[StructureTimeline] = None,
+        recommendations: Optional[RecommendationSet] = None,
     ):
-        """Export one representative frame per clip in the cut."""
+        """Export the review frames for a cut, with their context attached.
+
+        ``coverage=True`` (the default) plans frames by rule -- cut points,
+        markers, zooms, speed changes, placeholders, high-priority moments and
+        sanity probes -- which is what the critic pass needs. ``coverage=False``
+        falls back to Session 3's one representative frame per clip, which is
+        the right answer when a person just wants to flick through the cut.
+        """
         if plan is None:
             plan = self.load_rough_cut(name=name)
 
+        frames = None
+        if coverage:
+            if timeline is None:
+                timeline = self._timeline_or_none(name)
+            if recommendations is None:
+                recommendations = self._recommendations_or_none(name)
+            frames = critic_frames.plan_coverage_frames(
+                plan,
+                timeline=timeline,
+                recommendations=recommendations,
+                options=coverage_options,
+            )
+            if timeline is None:
+                self.say(
+                    "  ! No timeline was found, so frames carry no transcript, "
+                    "audio or visual context. The critic will be judging "
+                    "pictures with no idea what is happening in them."
+                )
+
         review = review_module.export_frames(
-            plan, self.config, position=position, width=width
+            plan, self.config, position=position, width=width, frames=frames
         )
         self.say(
             f"{len(review)} review frame(s) exported for "
@@ -728,6 +765,318 @@ class Pipeline:
         for warning in review.warnings:
             self.say(f"  ! {warning}")
         return review
+
+    def _timeline_or_none(self, name: str) -> Optional[StructureTimeline]:
+        try:
+            return self.load_timeline(name=name)
+        except EditingError:
+            return None
+
+    def _recommendations_or_none(self, name: str) -> Optional[RecommendationSet]:
+        try:
+            return self.load_recommendations(name=name)
+        except EditingError:
+            return None
+
+    def review_manifest_path(self, plan: RoughCutPlan) -> Path:
+        """Where ``export_frames`` writes the manifest for this cut."""
+        return (
+            self.config.review_dir
+            / review_module._slugify(plan.sequence_name)
+            / "review.json"
+        )
+
+    def load_review(self, *, name: str = "structure", plan=None):
+        """The review manifest for a cut, or a clear error saying to make one."""
+        if plan is None:
+            plan = self.load_rough_cut(name=name)
+        target = self.review_manifest_path(plan)
+        if not target.exists():
+            raise EditingError(
+                f"No review frames have been exported for "
+                f"'{plan.sequence_name}' yet",
+                hint="Run `python -m editing.cli review export-frames` first.",
+                detail={"expected": str(target)},
+            )
+        return review_module.load_review(target)
+
+    # ------------------------------------------------------------------
+    # Critic and revisions
+    # ------------------------------------------------------------------
+
+    def critic(self, *, model=None) -> critic_module.VisualCritic:
+        return critic_module.build_critic(
+            self.config, cache=self.cache, model=model
+        )
+
+    def critique(
+        self,
+        review=None,
+        *,
+        name: str = "structure",
+        model=None,
+        limit: int = 0,
+        save: bool = True,
+    ) -> CriticReport:
+        """Run the visual critic over the exported review frames."""
+        if review is None:
+            review = self.load_review(name=name)
+
+        critic = self.critic(model=model)
+        self.say(
+            f"Critiquing {len(review.frames)} frame(s) with "
+            f"{critic.model_name}..."
+        )
+
+        def progress(done: int, count: int, frame) -> None:
+            if count and (done == count or done % 10 == 0):
+                self.say(f"  {done}/{count} frames")
+
+        report = critic.critique(review, progress=progress, limit=limit)
+        stats = report.stats()
+        self.say(
+            f"{stats['findings']} finding(s) across "
+            f"{stats['frames_with_findings']} frame(s); "
+            f"{stats['frames_clean']} frame(s) clean."
+        )
+        for warning in report.warnings[:10]:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_critique(report, name=name)
+        return report
+
+    def write_critique(
+        self, report: CriticReport, *, name: str = "structure"
+    ) -> Path:
+        self.config.critic_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.critic_dir / f"{name}.critique.json"
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_critique(self, *, name: str = "structure") -> CriticReport:
+        target = self.config.critic_dir / f"{name}.critique.json"
+        if not target.exists():
+            raise EditingError(
+                f"No critique named '{name}' has been run yet",
+                hint="Run `python -m editing.cli review critique` first.",
+            )
+        return CriticReport.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def revise(
+        self,
+        *,
+        name: str = "structure",
+        critique: Optional[CriticReport] = None,
+        review=None,
+        roughcut: Optional[RoughCutPlan] = None,
+        options=None,
+        plan_options: Optional[dict] = None,
+        save: bool = True,
+    ):
+        """Findings -> revisions -> one validated revision plan."""
+        if roughcut is None:
+            roughcut = self.load_rough_cut(name=name)
+        if critique is None:
+            critique = self.load_critique(name=name)
+        if review is None:
+            review = self.load_review(name=name, plan=roughcut)
+
+        durations = {
+            asset.asset_id: asset.duration
+            for asset in (self.assets or self._assets_or_empty())
+        }
+        revisions = critic_revise.build_revisions(
+            critique, review, roughcut,
+            recommendations=self._recommendations_or_none(name),
+            asset_durations=durations,
+            options=options,
+        )
+
+        plan = critic_plan.build_revision_plan(
+            revisions, roughcut,
+            roughcut_executed=self._roughcut_was_executed(name, roughcut),
+            **(plan_options or {}),
+        )
+        critic_execute.dry_run(plan)
+
+        stats = revisions.stats()
+        self.say(
+            f"{stats['total']} revision(s): {stats['accepted']} accepted, "
+            f"{stats['needs_human_review']} kept for a human."
+        )
+        self.say(
+            f"Revision plan: {plan.operation_count} operation(s), dry run "
+            + ("passed" if plan.dry_run_passed else "FAILED") + "."
+        )
+        if plan.dry_run_error:
+            self.say(f"  ! {plan.dry_run_error.get('error')}")
+        for warning in revisions.warnings + plan.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_revisions(revisions, name=name)
+            self.write_revision_plan(plan, name=name)
+            self.write_revision_report(
+                revisions, critique=critique, plan=plan, name=name
+            )
+        return revisions, plan
+
+    def _roughcut_was_executed(self, name: str, roughcut: RoughCutPlan) -> bool:
+        """Whether this cut is actually in Premiere, per the execution report."""
+        try:
+            report = self.load_execution_report(name=name)
+        except EditingError:
+            return False
+        return bool(
+            report.executed and report.sequence_name == roughcut.sequence_name
+        )
+
+    def write_revisions(
+        self, revisions: RevisionSet, *, name: str = "structure"
+    ) -> Path:
+        self.config.critic_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.critic_dir / f"{name}.revisions.json"
+        target.write_text(
+            json.dumps(revisions.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_revisions(self, *, name: str = "structure") -> RevisionSet:
+        target = self.config.critic_dir / f"{name}.revisions.json"
+        if not target.exists():
+            raise EditingError(
+                f"No revisions named '{name}' have been planned yet",
+                hint="Run `python -m editing.cli review plan` first.",
+            )
+        return RevisionSet.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def write_revision_plan(
+        self, plan: RevisionPlan, *, name: str = "structure"
+    ) -> Path:
+        self.config.critic_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.critic_dir / f"{name}.revision-plan.json"
+        target.write_text(
+            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_revision_plan(self, *, name: str = "structure") -> RevisionPlan:
+        target = self.config.critic_dir / f"{name}.revision-plan.json"
+        if not target.exists():
+            raise EditingError(
+                f"No revision plan named '{name}' has been built yet",
+                hint="Run `python -m editing.cli review plan` first.",
+            )
+        return RevisionPlan.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def write_revision_report(
+        self,
+        revisions: RevisionSet,
+        *,
+        critique: Optional[CriticReport] = None,
+        plan: Optional[RevisionPlan] = None,
+        name: str = "structure",
+        limit: int = 40,
+    ) -> Path:
+        """The human-readable revision report.
+
+        Written beside the rough cut's report, never over it -- the baseline
+        being judged has to survive the judgement.
+        """
+        text = critic_report.render(
+            revisions, critique=critique, plan=plan, limit=limit
+        )
+        self.config.critic_dir.mkdir(parents=True, exist_ok=True)
+        return critic_report.write(
+            self.config.critic_dir / f"{name}.revisions.txt", text
+        )
+
+    def run_revisions(
+        self,
+        plan: Optional[RevisionPlan] = None,
+        *,
+        mode: str = "dry_run",
+        name: str = "structure",
+        roughcut: Optional[RoughCutPlan] = None,
+        allow_active_sequence: bool = False,
+        engine=None,
+        save: bool = True,
+    ) -> ExecutionReport:
+        """Carry a revision plan out to the depth ``mode`` allows."""
+        if plan is None:
+            plan = self.load_revision_plan(name=name)
+        if roughcut is None:
+            try:
+                roughcut = self.load_rough_cut(name=name)
+            except EditingError:
+                roughcut = None
+
+        report = critic_execute.run(
+            plan,
+            mode=mode,
+            roughcut=roughcut,
+            bridge=self.bridge,
+            engine=engine,
+            allow_active_sequence=allow_active_sequence,
+        )
+
+        if report.refused_reason:
+            self.say(f"Refused: {report.refused_reason}")
+        elif report.executed:
+            self.say(
+                f"Applied {report.operations_succeeded}/"
+                f"{report.operations_attempted} revision operation(s) to "
+                f"'{plan.sequence_name}'."
+            )
+        elif mode == "dry_run":
+            self.say(
+                "Dry run " + ("passed" if report.dry_run_passed else "FAILED")
+                + f" ({plan.operation_count} operation(s)); nothing was applied."
+            )
+        if report.error:
+            self.say(f"  ! {report.error.get('error')}")
+
+        if save:
+            self.write_revision_execution(report, name=name)
+            self.write_revision_plan(plan, name=name)
+        return report
+
+    def write_revision_execution(
+        self, report: ExecutionReport, *, name: str = "structure"
+    ) -> Path:
+        self.config.critic_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.critic_dir / f"{name}.revision-execution.json"
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_revision_execution(
+        self, *, name: str = "structure"
+    ) -> ExecutionReport:
+        target = self.config.critic_dir / f"{name}.revision-execution.json"
+        if not target.exists():
+            raise EditingError(
+                f"No revision execution report named '{name}' exists yet",
+                hint="Run `python -m editing.cli review dry-run` or "
+                     "`review execute --yes` first.",
+            )
+        return ExecutionReport.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
 
     # ------------------------------------------------------------------
     # Whole run

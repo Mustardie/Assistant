@@ -38,9 +38,33 @@ DEFAULT_POSITION = 0.34
 DEFAULT_WIDTH = 960
 
 
+#: Why a frame was chosen. A critic reads this to know what it is looking at:
+#: "is this framed well" is a different question at a cut point than in the
+#: middle of a punch-in.
+FRAME_KINDS = (
+    "clip_sample",      # the representative frame, a third of the way in
+    "clip_start",       # just after the incoming cut
+    "clip_end",         # just before the outgoing cut
+    "marker",           # at a planned marker
+    "zoom",             # inside a punch-in or push-in
+    "speed_change",     # inside a retimed clip
+    "text_placeholder", # where text/caption/callout was proposed
+    "high_priority",    # a moment the planner ranked highly
+    "sanity",           # a random probe inside a long stretch
+)
+
+
 @dataclass
 class ReviewFrame:
-    """One exported frame, with everything needed to trace it back."""
+    """One exported frame, with everything needed to trace it back.
+
+    The trailing fields are *context*: what was being said, heard and seen at
+    this moment, and what the cut did to it. They are denormalised onto the
+    frame rather than left as IDs because the consumer is a vision model
+    looking at one picture at a time -- it has no way to follow a reference,
+    and a critic that does not know a clip was sped to 2x will misread the
+    motion blur it is looking at.
+    """
 
     frame_id: str
     placement_id: str
@@ -58,14 +82,58 @@ class ReviewFrame:
     marker_names: list[str] = field(default_factory=list)
     note: str = ""
 
+    # -- context, filled in by ``editing.critic.frames`` ------------------
+    #: The sequence this frame belongs to, so a frame record reads alone.
+    sequence_name: str = ""
+    #: One of ``FRAME_KINDS``.
+    frame_kind: str = "clip_sample"
+    #: Why this frame was sampled, in a phrase.
+    reason: str = ""
+    #: What is being said at (or just around) this moment.
+    transcript: str = ""
+    #: Audio events overlapping this moment: ``{type, start, end, confidence}``.
+    audio_events: list[dict] = field(default_factory=list)
+    audio_types: list[str] = field(default_factory=list)
+    #: Visual events overlapping this moment, by ID plus a flattened summary.
+    visual_event_ids: list[str] = field(default_factory=list)
+    environment: str = ""
+    actions: list[str] = field(default_factory=list)
+    entities: list[str] = field(default_factory=list)
+    threats: list[str] = field(default_factory=list)
+    importance: str = ""
+    #: HUD/screen state read by the vision layer, e.g. ``["low_health"]``.
+    ui_flags: list[str] = field(default_factory=list)
+    #: Edits the rough cut applies at this moment: ``{kind, detail, ...}``.
+    applied_edits: list[dict] = field(default_factory=list)
+    #: Highest recommendation priority covering this moment, 0 when none.
+    priority: float = 0.0
+    #: How long the clip this frame came from runs on the timeline. Carried on
+    #: the frame because "is this stretch too long" is unanswerable from a
+    #: still, and the critic is asked that question.
+    clip_duration: float = 0.0
+
+    @property
+    def has_zoom(self) -> bool:
+        return any(edit.get("kind") == "zoom" for edit in self.applied_edits)
+
+    @property
+    def has_text(self) -> bool:
+        return any(
+            edit.get("kind") in ("text", "caption", "callout")
+            for edit in self.applied_edits
+        )
+
     def to_dict(self) -> dict:
         data = asdict(self)
         data["sequence_time"] = round(self.sequence_time, 3)
         data["source_time"] = round(self.source_time, 3)
+        data["priority"] = round(self.priority, 3)
+        data["clip_duration"] = round(self.clip_duration, 3)
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "ReviewFrame":
+        kind = str(data.get("frame_kind") or "clip_sample")
         return cls(
             frame_id=str(data.get("frame_id") or ""),
             placement_id=str(data.get("placement_id") or ""),
@@ -81,6 +149,28 @@ class ReviewFrame:
             segment_ids=[str(x) for x in (data.get("segment_ids") or [])],
             marker_names=[str(x) for x in (data.get("marker_names") or [])],
             note=str(data.get("note") or ""),
+            sequence_name=str(data.get("sequence_name") or ""),
+            frame_kind=kind if kind in FRAME_KINDS else "clip_sample",
+            reason=str(data.get("reason") or ""),
+            transcript=str(data.get("transcript") or ""),
+            audio_events=[
+                dict(entry) for entry in (data.get("audio_events") or [])
+                if isinstance(entry, dict)
+            ],
+            audio_types=[str(x) for x in (data.get("audio_types") or [])],
+            visual_event_ids=[str(x) for x in (data.get("visual_event_ids") or [])],
+            environment=str(data.get("environment") or ""),
+            actions=[str(x) for x in (data.get("actions") or [])],
+            entities=[str(x) for x in (data.get("entities") or [])],
+            threats=[str(x) for x in (data.get("threats") or [])],
+            importance=str(data.get("importance") or ""),
+            ui_flags=[str(x) for x in (data.get("ui_flags") or [])],
+            applied_edits=[
+                dict(entry) for entry in (data.get("applied_edits") or [])
+                if isinstance(entry, dict)
+            ],
+            priority=float(data.get("priority") or 0.0),
+            clip_duration=float(data.get("clip_duration") or 0.0),
         )
 
 
@@ -99,16 +189,28 @@ class ReviewSet:
     def __len__(self) -> int:
         return len(self.frames)
 
+    def frame(self, frame_id: str) -> Optional[ReviewFrame]:
+        for frame in self.frames:
+            if frame.frame_id == frame_id:
+                return frame
+        return None
+
     def stats(self) -> dict:
         by_reason: dict = {}
+        by_kind: dict = {}
         for frame in self.frames:
             by_reason[frame.keep_reason] = by_reason.get(frame.keep_reason, 0) + 1
+            by_kind[frame.frame_kind] = by_kind.get(frame.frame_kind, 0) + 1
         return {
             "frames": len(self.frames),
             "cut_duration": round(self.cut_duration, 2),
             "by_keep_reason": by_reason,
+            "by_frame_kind": by_kind,
             "with_recommendations": sum(
                 1 for frame in self.frames if frame.recommendation_ids
+            ),
+            "with_applied_edits": sum(
+                1 for frame in self.frames if frame.applied_edits
             ),
         }
 
@@ -172,6 +274,10 @@ def plan_frames(
             segment_ids=list(placement.segment_ids),
             marker_names=sorted(set(inside)),
             note=placement.notes,
+            sequence_name=plan.sequence_name,
+            frame_kind="clip_sample",
+            reason="representative frame for the clip",
+            clip_duration=placement.sequence_duration,
         ))
     return frames
 
@@ -184,12 +290,18 @@ def export_frames(
     width: int = DEFAULT_WIDTH,
     out_dir: Optional[Path] = None,
     write_manifest: bool = True,
+    frames: Optional[Sequence[ReviewFrame]] = None,
 ) -> ReviewSet:
-    """Extract one frame per clip and write the manifest.
+    """Extract the planned frames and write the manifest.
 
     Frames that cannot be extracted are dropped from the set with a warning
     rather than failing the export -- one unreadable source in a long cut
     should not cost the whole review.
+
+    ``frames`` overrides the default one-per-clip plan. That is the seam the
+    critic uses: ``editing.critic.frames`` decides *which* moments deserve a
+    look and attaches the context, and this function stays the single place
+    that talks to FFmpeg and writes the manifest.
     """
     directory = Path(out_dir) if out_dir is not None else (
         config.review_dir / _slugify(plan.sequence_name)
@@ -201,15 +313,20 @@ def export_frames(
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         cut_duration=plan.total_duration,
     )
-    planned = plan_frames(plan, position=position)
+    planned = (
+        list(frames) if frames is not None
+        else plan_frames(plan, position=position)
+    )
     if not planned:
         review.warnings.append("The plan contains no clips, so there is "
                                "nothing to review.")
         return review
 
     for index, frame in enumerate(planned):
+        if not frame.sequence_name:
+            frame.sequence_name = plan.sequence_name
         target = directory / (
-            f"{index:03d}_{frame.keep_reason}_{frame.sequence_time:08.2f}.jpg"
+            f"{index:03d}_{frame.frame_kind}_{frame.sequence_time:08.2f}.jpg"
         )
         try:
             written = ff.extract_frame(

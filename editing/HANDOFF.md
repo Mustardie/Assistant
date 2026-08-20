@@ -1,13 +1,13 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Written 2026-08-20.
+Context for continuing this work in a new chat. Updated 2026-08-20 (Session 4).
 
 ---
 
 ## Where the work lives
 
-**Good branch: `claude/editing-brain-v1-structure-7p33pm`** — head `1066d33`.
-This has all three sessions and 562 passing tests.
+**Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
+This has all four sessions and 678 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -28,7 +28,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in three sessions
+## What was built, in four sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -39,7 +39,17 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
                                                     ↓
                      rough cut: selected ranges → scratch sequence plan
                                                     ↓
-              offline dry-run → (explicit command only) execute → review frames
+              offline dry-run → (explicit command only) execute
+                                                    ↓
+             review frames chosen by coverage rule, with their full context
+                                                    ↓
+                    Qwen3-VL critic (one frame per call) → findings
+                                                    ↓
+        revision recommendations — safe ones carry draft operations, the rest
+        stay recommendations with the reason they could not be automated
+                                                    ↓
+              offline dry-run → (explicit --yes only) apply to the same
+                                scratch sequence, under an op allowlist
 ```
 
 ### Session 1 — structure layer (`aa29677`)
@@ -69,6 +79,29 @@ transcript API, so `caps` *measures* what the running build exposes.
 - `editing/roughcut/` — range selection, sequence layout maths, conversion to
   catalog ops, four execution modes, review frame export
 
+### Session 4 — critic + one revision pass
+
+- `editing/critic/` — the whole pass:
+  - `schema.py` — `CriticFinding`, `RevisionRecommendation`, `RevisionPlan`
+  - `frames.py` — coverage rules and context enrichment (pure)
+  - `prompt.py` — what the critic is asked
+  - `critic.py` — the model call, the coercion, `MockCritic`
+  - `revise.py` — findings → revisions; **the safety rules live here**
+  - `plan.py` — accepted revisions → one ordered operation plan
+  - `execute.py` — three modes, the allowlist, the guards
+  - `report.py` — the human-readable output
+- `editing/roughcut/review.py` — `ReviewFrame` extended with context fields;
+  `export_frames(frames=...)` is the seam the critic plans through
+- `editing/roughcut/schema.py` — `ClipPlacement.sequence_to_source`, the
+  inverse the review pass needs
+- `editing/config.py` — `critic_dir`
+- `editing/pipeline.py` — `critique`, `revise`, `run_revisions`, and the
+  load/write pairs for each artefact
+- `editing/cli.py` — `review` became a subcommand group
+  (`export-frames | critique | plan | dry-run | execute --yes | report |
+  show-issues`); a bare `review` still means `export-frames`
+- `tests/editing/test_editing_critic.py` — 116 tests
+
 ---
 
 ## Design decisions worth not re-litigating
@@ -91,48 +124,115 @@ Premiere is touched. That is what makes the plan dry-runnable.
 
 **Speed ops run back-to-front with ripple.** Rippling shifts later clips, so
 working backwards means each clip is still where the plan says. Markers and
-zooms come after all retiming.
+zooms come after all retiming. Revision trims follow the same rule.
 
 **Execution has four guards, each refusing rather than warning:** no default
 runs anything; a dry run must pass in the *same* call; the target must
 *structurally* create and activate its own sequence (checked, not trusted from
 a flag); a refusal is a result with a reason.
 
+### New in Session 4
+
+**A finding is not a fix.** `CriticFinding` (what the model saw) and
+`RevisionRecommendation` (what the system proposes) are separate records, and
+the conversion is a set of explicit rules in `revise.py`. This is what makes
+"unsafe findings stay recommendations" enforceable rather than aspirational.
+
+**Confidence gates action; severity does not.** 0.60 to change the edit at all,
+0.70 for timing, 0.80 to cut footage. Severity only decides how loudly it is
+reported and whether it earns a marker.
+
+**A fix may only act on a premise the plan confirms.** `reduce_zoom` needs a
+zoom in the plan at that moment; `trim_dead_air` needs an audio event;
+`extend_hold` needs source headroom. Without it the fix is refused with
+`not_verifiable`. **A critic hallucinating a zoom must not be able to make the
+system edit one that never existed** — this is the single most important rule
+in the session and it has a test named after it.
+
+**Amounts are fixed, not suggested.** 106% for a reduced zoom, ≤0.5s for a hold
+extension, ≤1.0s for a trim, never leaving a clip under 1.0s. "Make it a bit
+less" from a VLM is not a number.
+
+**One frame per model call.** A small VLM shown six stills attributes a problem
+in frame four to frame one. A finding at the wrong moment is worse than none.
+
+**The revision allowlist is the whole guarantee.** A rough cut proves safety by
+creating its own sequence; a revision cannot, because it edits one that already
+exists. Instead: the first op must be `sequence.activate` naming the rough
+cut's sequence, and every op must be one of six
+(`sequence.activate`, `property.reset`, `animate`, `clip.trim`, `marker.add`,
+`marker.remove`). Nothing on that list can reach another sequence or the disk.
+A test asserts the set of ops the code can emit equals the allowlist.
+
+**The rough cut's report is never overwritten.** Critic output lives in
+`data/editing/critic/`. A second opinion that destroyed its own baseline would
+be worthless.
+
+**Review-frame dedupe is per-clip, never across a cut.** The two edge probes
+either side of a cut are always closer together than the collapse threshold, so
+a global dedupe silently drops *every* incoming-cut frame in the review. This
+was a real bug found by running the CLI on real footage, and
+`test_both_sides_of_a_cut_are_sampled` is what stops it coming back.
+
+**The revision report leads with what it could not fix.** The automatic fixes
+are bounded and reversible by construction; the deferred findings are where the
+real problems are. Burying them under a list of successes is how a report stops
+being read.
+
 ---
 
 ## Current state
 
-- **562 tests**, ~5s, needing no FFmpeg, GPU, model server or Premiere
-- `tests/premiere/` has 30 pre-existing failures, unchanged from before this
-  work — they are not from these sessions
-- `editing/README.md` is the full user documentation (~1100 lines)
+- **678 editing tests**, ~9s, needing no FFmpeg, GPU, model server or Premiere
+- `tests/premiere/` passes too (953 across both suites). The 30 failures noted
+  in the previous handoff no longer reproduce.
+- 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
+  client) are pre-existing and unrelated to this work.
+- `editing/README.md` is the full user documentation (~1400 lines); sections 9
+  and 10 cover the critic pass.
+
+**Note on running the tests here:** pytest's default temp root
+(`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
+every test errors in setup. Pass `--basetemp` at a writable path:
+
+```
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt
+```
 
 ---
 
 ## The honest gaps
 
-1. **Only markers convert to Premiere ops in the *draft* plan.** The rough cut
-   converts more (append, speed, zooms, markers) but still not text, colour,
-   transitions or audio — each reported per category with its reason.
-2. **Speed ripple is assumed, not verified against real Premiere.** The dry run
-   validates operation *shape*, not runtime behaviour. Check the first executed
-   cut against `roughcut placements`.
-3. **Single video track.** Everything assembles onto V1.
-4. **Audio is carried, not mixed.** No ducking, levelling or music bed.
-5. **Punch-ins are blind to composition.** Refusal rules cover UIs, low health,
-   protected and short clips — not where the subject sits in frame.
-6. **No critic pass.** Review frames are exported and manifested; nothing looks
-   at them yet.
-7. **Never tested on real footage.** Everything above is verified against
-   synthetic fixtures and the mock backend.
+1. **Never tested with a real Qwen3-VL critic.** The whole pass has been run end
+   to end on real footage with real FFmpeg, but only with `MockCritic`, which
+   reads frame metadata rather than pictures. **The critic prompt has never been
+   seen by a model.** This is the highest-value next action.
+2. **Marker positions after a timing change are computed, not observed.**
+   Premiere sequence markers do not ripple with clips. New markers this pass
+   places are corrected offline; pre-existing rough-cut markers after a trim are
+   counted and warned about, not moved. `--no-timing` avoids it entirely.
+3. **Speed ripple is still assumed, not verified** (Session 3's gap, unchanged).
+4. **Only markers convert in the Session 2 *draft* plan.** The rough cut and the
+   revision pass convert more; text, colour, transitions and audio still do not.
+5. **Single video track.** Everything assembles onto V1.
+6. **Audio is carried, not mixed.** No ducking, levelling or music bed.
+7. **Punch-ins are blind to composition** at planning time. The critic can now
+   catch a bad one *after the fact*, which is the mitigation, not a fix.
+8. **The pass is one iteration.** Re-critiquing after applying revisions needs
+   frames re-exported from an updated cut, which is not automated.
+9. **Text fixes move a placeholder marker, not text.** No graphic exists.
 
 ---
 
 ## Natural next steps
 
-- **Test on real clips** (see README §Quick start). This is the highest-value
-  next action and has not happened.
-- **Critic pass** — feed review frames back to Qwen3-VL, judge the cut, revise.
+- **Run the critic against a real Qwen3-VL server** on a cut built from real
+  footage, and read the findings. Expect the prompt to need tuning — the issue
+  guide and the "most frames are fine" instruction are the two levers.
+- **Measure the accept/defer ratio on real output.** If nearly everything
+  defers, the thresholds are too tight; if a lot converts, look hard at whether
+  the premise checks are actually catching hallucinated zooms.
+- **A second critic iteration**, driven off a re-export after revisions apply.
 - **Sequence-aware conversion** — once footage is on a timeline, the
   currently-unconvertible categories become reachable.
 - **Audio mixing** — turn the ducking/music placeholders into real operations.
@@ -144,10 +244,9 @@ a flag); a refusal is a result with a reason.
 ```cmd
 cd /d E:\Assistant
 git checkout claude/editing-brain-v1-structure-7p33pm
-git pull
 
-python -m pytest tests/editing -q      REM expect 562 passed
-python -m editing.cli doctor           REM what is actually available
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt   REM expect 678 passed
+python -m editing.cli doctor                             REM what is available
 ```
 
 Put 3–4 short clips (1–3 min each) in one folder, then:
@@ -164,9 +263,24 @@ REM Stage 3 — rough cut
 python -m editing.cli roughcut build
 python -m editing.cli roughcut dry-run
 python -m editing.cli roughcut execute --yes
-python -m editing.cli review
+
+REM Stage 4 — the critic pass
+python -m editing.cli review export-frames
+python -m editing.cli review export-frames --list    REM see the choice first
+python -m editing.cli review critique --backend mock REM plumbing check
+python -m editing.cli review critique                REM the real critic
+python -m editing.cli review show-issues --severity medium
+python -m editing.cli review plan
+python -m editing.cli review report
+python -m editing.cli review dry-run
+python -m editing.cli review execute --yes
 ```
 
-`--backend mock` marks every event `mock: true`, so mock output can never be
-mistaken for real analysis. FFmpeg is required for audio and review frames;
-without it the audio layer degrades to transcript markers only and says so.
+`--backend mock` marks every event and every finding `mock: true`, so mock
+output can never be mistaken for real analysis. FFmpeg is required for audio and
+review frames; without it the audio layer degrades to transcript markers only
+and says so.
+
+If a revision pass looks too aggressive, the two dials are
+`review plan --no-timing` (no trims or extensions at all) and
+`review plan --min-confidence 0.8`.
