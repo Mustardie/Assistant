@@ -1290,11 +1290,18 @@ class Pipeline:
         root: Optional[str] = None,
         probe_durations: bool = True,
         reuse: bool = True,
+        previous=None,
         save: bool = True,
     ) -> AssetLibrary:
-        """Scan the asset folders into an index."""
-        previous = None
-        if reuse:
+        """Scan the asset folders into an index.
+
+        ``previous`` seeds the scan with an earlier index so unchanged files
+        keep their measured durations without paying for ffprobe again. An
+        automated run passes the *shared* index here, because its own output
+        directory is per-run and would otherwise re-probe the whole library
+        every time.
+        """
+        if previous is None and reuse:
             try:
                 previous = self.load_asset_library(root=root)
             except EditingError:

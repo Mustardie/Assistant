@@ -22,6 +22,9 @@ Commands, in the order a session normally uses them::
     assets      init | index | list | show | validate | report | match |
                 plan | dry-run | execute --yes | show-missing | show-deferred
                 -- a local sound/graphic library, and placing from it
+    auto        run | status | list-runs | resume | report | show-gates |
+                execute-stage <stage> --yes | clean | explain-failure
+                -- the whole pipeline, checkpointed, with gated execution
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -52,6 +55,11 @@ from editing.critic.revise import RevisionOptions
 from editing.roughcut import review as review_module
 from editing.roughcut.build import RoughCutOptions
 from editing.assets import report as assets_report
+from editing.auto import gates as auto_gates
+from editing.auto import report as auto_report
+from editing.auto import store as auto_store
+from editing.auto.runner import AutoRunner
+from editing.auto.schema import AutoRunConfig
 from editing.assets.compile import AssetOptions
 from editing.assets.place import PlacementLimits
 from editing.style import presets as style_presets, report as layers_report
@@ -1575,6 +1583,245 @@ def _print_asset_plan(plan, *, limit: int = 20) -> None:
         print(f"  ! {warning}")
 
 
+def _auto_runner(args) -> AutoRunner:
+    """An orchestrator wired to the same config every other command uses."""
+    config, sampling, audio = load_config(
+        sampling=_sampling_from(args),
+        audio=_audio_from(args),
+        output_dir=Path(args.output_dir) if getattr(args, "output_dir", None)
+        else None,
+        vision_backend=("mock" if getattr(args, "mock", False)
+                        else getattr(args, "backend", None)),
+        vision_model=getattr(args, "model", None),
+        vision_base_url=getattr(args, "base_url", None),
+        use_premiere=(False if getattr(args, "no_premiere", False) else None),
+    )
+    return AutoRunner(
+        config, sampling=sampling, audio=audio, say=_reporter(args)
+    )
+
+
+def _auto_config(args) -> AutoRunConfig:
+    return AutoRunConfig(
+        footage_folder=str(args.folder or ""),
+        style=args.style,
+        name=args.name,
+        asset_library=str(getattr(args, "asset_library", "") or ""),
+        mock=getattr(args, "mock", False),
+        no_premiere=getattr(args, "no_premiere", False),
+        markers_only=getattr(args, "markers_only", False),
+        max_windows=getattr(args, "max_windows", None),
+        recursive=not getattr(args, "no_recursive", False),
+        keep_frames=getattr(args, "keep_frames", False),
+        use_motion=not getattr(args, "no_motion", False),
+        skip_review=getattr(args, "skip_review", False),
+        skip_assets=getattr(args, "skip_assets", False),
+    )
+
+
+def cmd_auto(args) -> int:
+    """The whole pipeline: plan everything, execute nothing without --yes."""
+    runner = _auto_runner(args)
+    command = args.auto_command
+
+    # -- run --------------------------------------------------------------
+    if command == "run":
+        if not args.folder:
+            raise EditingError(
+                "auto run needs a footage folder",
+                hint="python -m editing.cli auto run --folder <folder> "
+                     "--style <preset>",
+            )
+        state = runner.start(
+            _auto_config(args), force_new_run=args.force_new_run
+        )
+        _note(f"Run {state.run_id}")
+        state = runner.run(state)
+
+        if args.json:
+            _emit({"success": state.status != "failed", **state.to_dict()})
+            return EXIT_OK if state.status != "failed" else EXIT_ERROR
+        print(auto_report.render_status(state))
+        print(f"\n  Report: {auto_store.report_paths(runner.config, state.run_id)[1]}")
+        _print_next(state)
+        return EXIT_OK if state.status != "failed" else EXIT_ERROR
+
+    # -- resume -----------------------------------------------------------
+    if command == "resume":
+        state = runner.resolve(args.run)
+        if args.style and args.style != state.config.style:
+            # Restyling in place. The style is one of the config fields the
+            # layer and asset stages fingerprint, so changing it here
+            # invalidates exactly those checkpoints and leaves the analysis
+            # alone -- no flag to remember, and no new run folder.
+            from dataclasses import replace as _replace
+
+            _note(f"Restyling {state.config.style} -> {args.style}")
+            state.config = _replace(state.config, style=args.style)
+            auto_store.write_config(runner.config, state.run_id, state.config)
+        _note(f"Resuming {state.run_id}")
+        state = runner.resume(state, refresh=args.refresh or ())
+
+        if args.json:
+            _emit({"success": state.status != "failed", **state.to_dict()})
+            return EXIT_OK if state.status != "failed" else EXIT_ERROR
+        print(auto_report.render_status(state))
+        _print_next(state)
+        return EXIT_OK if state.status != "failed" else EXIT_ERROR
+
+    # -- status -----------------------------------------------------------
+    if command == "status":
+        state = runner.resolve(args.run)
+        if args.json:
+            _emit({"success": True, **state.to_dict()})
+            return EXIT_OK
+        print(auto_report.render_status(state))
+        return EXIT_OK
+
+    # -- list-runs --------------------------------------------------------
+    if command == "list-runs":
+        runs = auto_store.list_runs(runner.config, limit=args.limit)
+        if args.json:
+            _emit({"success": True, "count": len(runs), "runs": runs})
+            return EXIT_OK
+        if not runs:
+            print("No automated runs yet. Start one with:")
+            print("  python -m editing.cli auto run --folder <folder> "
+                  "--style <preset>")
+            return EXIT_OK
+        print(f"{len(runs)} run(s), newest first:\n")
+        for entry in runs:
+            modes = " mock" if entry.get("mock") else ""
+            print(f"  {entry['run_id']:<40} {entry.get('status', '?'):<9}"
+                  f"{modes}")
+            print(f"      style {entry.get('style', '?')}   "
+                  f"passed {entry.get('passed', 0)}  "
+                  f"failed {entry.get('failed', 0)}  "
+                  f"blocked {entry.get('blocked', 0)}  "
+                  f"executed {entry.get('gates_executed', 0)}")
+            if entry.get("folder"):
+                print(f"      {entry['folder']}")
+        return EXIT_OK
+
+    # -- report -----------------------------------------------------------
+    if command == "report":
+        state = runner.resolve(args.run)
+        state.gates = auto_gates.compute_gates(runner.config, state)
+        report = auto_report.build_report(runner.config, state)
+        if args.json:
+            _emit({"success": True, **report.to_dict()})
+            return EXIT_OK
+        print(auto_report.render(state, report))
+        return EXIT_OK
+
+    # -- show-gates -------------------------------------------------------
+    if command == "show-gates":
+        state = runner.resolve(args.run)
+        gates = auto_gates.compute_gates(runner.config, state)
+        state.gates = gates
+        auto_store.save(runner.config, state)
+
+        if args.json:
+            _emit({"success": True, "run_id": state.run_id,
+                   "gates": [gate.to_dict() for gate in gates]})
+            return EXIT_OK
+        print(f"Execution gates for {state.run_id}\n")
+        print("  Nothing below has run unless it says EXECUTED. Each gate is")
+        print("  a separate decision and needs its own --yes.\n")
+        for gate in gates:
+            print(gate.render())
+            print()
+        return EXIT_OK
+
+    # -- execute-stage ----------------------------------------------------
+    if command == "execute-stage":
+        state = runner.resolve(args.run)
+        result = auto_gates.execute(
+            runner.config, state, args.stage,
+            yes=args.yes,
+            allow_active_sequence=args.allow_active_sequence,
+            say=_reporter(args),
+        )
+        if args.json:
+            _emit(result)
+            return EXIT_OK if result.get("success") else EXIT_ERROR
+
+        print(f"Execute {args.stage} ({state.run_id})")
+        if result.get("refused_reason"):
+            print(f"  REFUSED  : {result['refused_reason']}")
+        else:
+            print(f"  sequence : {result.get('sequence')}")
+            print(f"  executed : {result.get('executed')}")
+            print(f"  operations: {result.get('operations_succeeded')}/"
+                  f"{result.get('operations_attempted')}")
+            if result.get("error"):
+                print(f"  error    : {result['error'].get('error')}")
+        if result.get("next_command"):
+            print(f"  next     : {result['next_command']}")
+        return EXIT_OK if result.get("success") else EXIT_ERROR
+
+    # -- explain-failure --------------------------------------------------
+    if command == "explain-failure":
+        state = runner.resolve(args.run)
+        if args.json:
+            failed = state.of_status("failed")
+            blocked = state.of_status("blocked")
+            _emit({
+                "success": True, "run_id": state.run_id,
+                "status": state.status,
+                "failed": [r.to_dict() for r in failed],
+                "blocked": [r.to_dict() for r in blocked],
+            })
+            return EXIT_OK
+        print(auto_report.render_failure(state))
+        return EXIT_OK
+
+    # -- clean ------------------------------------------------------------
+    if command == "clean":
+        result = auto_store.clean(
+            runner.config, run_id=args.run,
+            failed_only=not args.all, dry_run=not args.yes,
+        )
+        if args.json:
+            _emit({"success": True, **result})
+            return EXIT_OK
+        if result["dry_run"]:
+            print("Dry run -- nothing was deleted. Add --yes to remove.\n")
+        for entry in result["removed"]:
+            verb = "would remove" if result["dry_run"] else "removed"
+            print(f"  {verb} {entry['run_id']}  ({entry['status']})")
+        for entry in result["kept"]:
+            print(f"  kept    {entry['run_id']}  -- {entry['reason']}")
+        if not result["removed"] and not result["kept"]:
+            print("  Nothing to clean.")
+        return EXIT_OK
+
+    raise EditingError("Unknown auto command")
+
+
+def _print_next(state) -> None:
+    """The two or three lines a person needs after a run."""
+    failure = state.first_failure()
+    if failure is not None and failure.failure is not None:
+        print()
+        print(failure.failure.render())
+        return
+
+    ready = [gate for gate in state.gates if gate.ready]
+    blocked = [gate for gate in state.gates if not gate.ready
+               and not gate.executed]
+    print()
+    if ready:
+        print(f"  {len(ready)} gate(s) ready to execute. Each needs its own "
+              "--yes:")
+        for gate in ready:
+            print(f"    {gate.command}")
+    elif blocked:
+        print(f"  No gate is ready yet. Why: {blocked[0].blocked_reason[:150]}")
+    print(f"  Full report: python -m editing.cli auto report "
+          f"--run {state.run_id}")
+
+
 def _print_roughcut(plan, *, limit: int = 30) -> None:
     stats = plan.stats()
     print(f"Rough cut: {plan.sequence_name}")
@@ -2012,7 +2259,15 @@ def build_parser() -> argparse.ArgumentParser:
                     "over it, and which edits would be worth making. Proposes "
                     "only: it never applies an edit.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Typical first run:\n"
+        epilog="Everything at once, planning only:\n"
+               "  python -m editing.cli auto run --folder D:/Footage/ep12 "
+               "--style cinematic_minecraft\n"
+               "  python -m editing.cli auto show-gates\n"
+               "  python -m editing.cli auto execute-stage roughcut --yes\n"
+               "\nOr try it with no GPU, no model server and no Premiere:\n"
+               "  python -m editing.cli auto run --folder D:/Footage/ep12 "
+               "--mock --no-premiere\n"
+               "\nStage by stage:\n"
                "  python -m editing.cli doctor\n"
                "  python -m editing.cli discover --folder D:/Footage/ep12\n"
                "  python -m editing.cli transcript status\n"
@@ -2593,6 +2848,124 @@ def build_parser() -> argparse.ArgumentParser:
     as_deferred.add_argument("--limit", type=int, default=60)
     _add_common(as_deferred)
     as_deferred.set_defaults(func=cmd_assets)
+
+    # -- auto -----------------------------------------------------------
+    auto = subparsers.add_parser(
+        "auto",
+        help="run the whole pipeline with checkpoints and gated execution")
+    auto_subs = auto.add_subparsers(dest="auto_command", required=True)
+
+    def _add_run_ref(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--run", help="run id (default: the most recent run)")
+
+    au_run = auto_subs.add_parser(
+        "run", help="plan the whole edit. Executes nothing.")
+    au_run.add_argument("--folder", help="footage folder", required=False)
+    au_run.add_argument("--style", default=style_presets.DEFAULT_PRESET,
+                        choices=style_presets.names())
+    au_run.add_argument("--name", default="structure")
+    au_run.add_argument("--asset-library",
+                        help="asset library root (default <model dir>/assets)")
+    au_run.add_argument("--mock", action="store_true",
+                        help="mock the vision model and the critic: no GPU, "
+                             "no model server")
+    au_run.add_argument("--markers-only", action="store_true",
+                        help="style and asset passes record every choice "
+                             "instead of drawing or playing it")
+    au_run.add_argument("--skip-review", action="store_true",
+                        help="skip the critic pass entirely")
+    au_run.add_argument("--skip-assets", action="store_true",
+                        help="skip the asset pass entirely")
+    au_run.add_argument("--force-new-run", action="store_true",
+                        help="start a fresh run even if one already exists "
+                             "for this footage and style")
+    au_run.add_argument("--max-windows", type=int,
+                        help="cap analysis windows per file")
+    au_run.add_argument("--no-recursive", action="store_true")
+    au_run.add_argument("--no-motion", action="store_true")
+    au_run.add_argument("--keep-frames", action="store_true")
+    au_run.add_argument("--limit", type=int, default=40)
+    _add_model(au_run)
+    _add_common(au_run)
+    au_run.set_defaults(func=cmd_auto)
+
+    au_resume = auto_subs.add_parser(
+        "resume", help="continue a run, retrying failed and blocked stages")
+    _add_run_ref(au_resume)
+    au_resume.add_argument(
+        "--style", choices=style_presets.names(),
+        help="restyle this run in place: rebuilds the style and asset passes "
+             "and reuses the analysis")
+    au_resume.add_argument(
+        "--refresh", action="append",
+        help="re-run this stage and everything after it, ignoring checkpoints")
+    au_resume.add_argument("--limit", type=int, default=40)
+    _add_model(au_resume)
+    _add_common(au_resume)
+    au_resume.set_defaults(func=cmd_auto)
+
+    au_status = auto_subs.add_parser(
+        "status", help="one line per stage, and where the run stands")
+    _add_run_ref(au_status)
+    au_status.add_argument("--limit", type=int, default=40)
+    _add_common(au_status)
+    au_status.set_defaults(func=cmd_auto)
+
+    au_list = auto_subs.add_parser(
+        "list-runs", help="recent runs, newest first")
+    au_list.add_argument("--limit", type=int, default=25)
+    _add_common(au_list)
+    au_list.set_defaults(func=cmd_auto)
+
+    au_rep = auto_subs.add_parser(
+        "report", help="the full run report, including what it did not do")
+    _add_run_ref(au_rep)
+    au_rep.add_argument("--limit", type=int, default=40)
+    _add_common(au_rep)
+    au_rep.set_defaults(func=cmd_auto)
+
+    au_gates = auto_subs.add_parser(
+        "show-gates", help="what could be executed, and what is blocking it")
+    _add_run_ref(au_gates)
+    au_gates.add_argument("--limit", type=int, default=40)
+    _add_common(au_gates)
+    au_gates.set_defaults(func=cmd_auto)
+
+    au_exec = auto_subs.add_parser(
+        "execute-stage",
+        help="execute exactly one gated stage against Premiere -- needs --yes")
+    au_exec.add_argument("stage", choices=auto_gates.gate_names())
+    _add_run_ref(au_exec)
+    au_exec.add_argument("--yes", action="store_true",
+                         help="required: confirms you have read the dry run")
+    au_exec.add_argument(
+        "--allow-active-sequence", action="store_true",
+        help="permit editing a sequence this system cannot prove is the "
+             "rough cut's scratch one. Off by default.")
+    au_exec.add_argument("--limit", type=int, default=40)
+    _add_common(au_exec)
+    au_exec.set_defaults(func=cmd_auto)
+
+    au_why = auto_subs.add_parser(
+        "explain-failure",
+        help="every failed and blocked stage, with the command for each")
+    _add_run_ref(au_why)
+    au_why.add_argument("--limit", type=int, default=40)
+    _add_common(au_why)
+    au_why.set_defaults(func=cmd_auto)
+
+    au_clean = auto_subs.add_parser(
+        "clean", help="remove incomplete runs. Dry run unless --yes.")
+    _add_run_ref(au_clean)
+    au_clean.add_argument("--all", action="store_true",
+                          help="also remove completed runs and runs that have "
+                               "executed against Premiere")
+    au_clean.add_argument("--yes", action="store_true",
+                          help="required: actually delete")
+    au_clean.add_argument("--limit", type=int, default=40)
+    _add_common(au_clean)
+    au_clean.set_defaults(func=cmd_auto)
 
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")

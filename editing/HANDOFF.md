@@ -1,13 +1,28 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-20 (Session 6).
+Context for continuing this work in a new chat. Updated 2026-08-20 (Session 7).
+
+---
+
+## Start here
+
+```cmd
+cd /d E:\Assistant
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 992 passed
+
+REM the whole pipeline, planning only, with nothing installed:
+python -m editing.cli auto run --folder D:\Footage\test --mock --no-premiere
+python -m editing.cli auto report
+```
+
+Everything below is detail behind that.
 
 ---
 
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all six sessions and 924 passing editing tests.
+This has all seven sessions and 992 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -28,7 +43,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in six sessions
+## What was built, in seven sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -39,162 +54,142 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
                                                     ↓
                      rough cut: selected ranges → scratch sequence plan
                                                     ↓
-              offline dry-run → (explicit command only) execute
-                                                    ↓
-             review frames chosen by coverage rule, with their full context
-                                                    ↓
-                    Qwen3-VL critic (one frame per call) → findings
-                                                    ↓
-        revision recommendations — safe ones carry draft operations, the rest
-        stay recommendations with the reason they could not be automated
-                                                    ↓
-              offline dry-run → (--yes only) applied to the same sequence
+             review frames → Qwen3-VL critic → revision recommendations
                                                     ↓
         style preset → seven layers: captions, emphasis, audio placeholders,
         title/chapter cards, structure and polish markers
                                                     ↓
-     dedupe → per-minute density ceilings → additive-only operations → dry-run
-                                → (--yes only) applied, changing no timing
-                                                    ↓
-       local asset library (indexed, with optional sidecar metadata) matched
-       against every placeholder → mixing safety rules → real SFX, music beds,
+       local asset library matched per placeholder → real SFX, music beds,
        ambience and graphics on their own tracks
                                                     ↓
-              offline dry-run → (--yes only) placed, never on V1/A1
+   every pass: offline dry run → (explicit per-stage --yes) applied to the
+                                 same scratch sequence
+                                                    ↓
+      Session 7 wraps all of it: one command, sixteen checkpointed stages,
+      four named execution gates, resumable, with a report that says what it
+      did not do
 ```
 
-### Sessions 1–3 (`aa29677` … `1066d33`)
+| Session | Package | What it added |
+|---|---|---|
+| 1 | `discovery`, `transcripts/`, `visual/`, `align`, `cache` | the structure timeline |
+| 2 | `audio/`, `recommend/` | audio events, six recommendation layers, a safety pass |
+| 3 | `roughcut/` | selection, layout maths, catalog ops, four execution modes |
+| 4 | `critic/` | coverage frames, the Qwen3-VL critic, one revision pass |
+| 5 | `style/` | four presets, seven layers, density ceilings, additive-only |
+| 6 | `assets/` | local library, sidecars, matching, real SFX/music/graphics |
+| 7 | `auto/` | orchestration, checkpoints, resume, gated execution, reports |
 
-- `editing/discovery.py`, `premiere_link.py`, `transcripts/`, `visual/`,
-  `align.py`, `cache.py` — the structure layer
-- `editing/audio/`, `editing/recommend/` — audio events and six
-  recommendation layers with a safety pass
-- `editing/roughcut/` — selection, layout maths, catalog ops, four execution
-  modes, review frames
+### Session 7 — the auto pipeline
 
-### Session 4 — critic + one revision pass
+- `editing/auto/`
+  - `schema.py` — `AutoRunConfig`, `AutoStage`, `AutoStageResult`,
+    `AutoCheckpoint`, `AutoRunState`, `AutoExecutionGate`, `AutoFailure`,
+    `AutoRunReport`, and the operation risk table
+  - `store.py` — the run folder, run IDs, atomic state, listing, cleaning
+  - `stages.py` — the pipeline as a table, plus one runner per stage
+  - `runner.py` — ordering, checkpoint validation, resume
+  - `gates.py` — what may be executed, why not, and executing exactly one thing
+  - `report.py` — the JSON and human-readable run reports
+- `editing/pipeline.py` — `index_assets(previous=...)` so a per-run scan
+  reuses the shared index instead of re-probing every file
+- `editing/cli.py` — `auto run|status|list-runs|resume|report|show-gates|
+  execute-stage --yes|clean|explain-failure`
+- `tests/editing/test_editing_auto.py` — 68 tests
 
-- `editing/critic/` — coverage frames, the Qwen3-VL critic, findings →
-  revisions, the revision plan, three execution modes with an op allowlist
-
-### Session 5 — style presets + layered execution
-
-- `editing/style/` — four presets, seven layers, density enforcement, an
-  additive-only allowlist (no `clip.*` at all)
-
-### Session 6 — asset library + real placement
-
-- `editing/assets/`
-  - `schema.py` — `AssetItem`, `AssetTag`, `AssetLibrary`, `AssetMatch`,
-    `AssetPlacement`, `AssetPlacementPlan`
-  - `library.py` — the folder layout, `init` (folders + README + example
-    sidecar), category inference, the skip list
-  - `indexer.py` — scanning, fingerprinting, probing, filename/folder inference
-  - `sidecar.py` — `<filename>.asset.json`, parsed so bad JSON never raises
-  - `match.py` — the whole matching policy as data, every rejection kept
-  - `place.py` — a chosen asset → operations, under the mixing rules
-  - `compile.py` — the pass, and the five possible outcomes
-  - `execute.py` — three modes, the allowlist, the track and import guards
-  - `report.py` — the shopping list, the refusals, and what was placed
-- `editing/config.py` — `asset_library_dir`
-- `editing/pipeline.py` — `init_assets`, `index_assets`, `asset_plan`,
-  `run_assets`, load/write pairs
-- `editing/cli.py` — `assets init|index|list|show|validate|report|match|plan|
-  dry-run|execute --yes|show-missing|show-deferred`
-- `tests/editing/test_editing_assets.py` — 120 tests
-
-**No new Premiere primitives were needed.** Everything the asset pass does uses
-ops that already existed: `clip.overwrite`, `graphic.image`, `audio.gain`,
-`audio.fade`, `audio.duck`, `track.add`, `project.import`.
+**No new Premiere primitives.** Session 7 executes nothing itself; it delegates
+to the four existing executors, each of which keeps its own guards.
 
 ---
 
 ## Design decisions worth not re-litigating
 
 **Inferred audio is capped at 0.45 confidence**, and the cap survives all the
-way into asset ranking: a guessed SFX placeholder scores below a measured one.
+way into asset ranking.
 
 **Nothing is ever deleted, only marked.** The Session 2 safety pass, the
 Session 4 critic, the Session 5 compiler and the Session 6 placer all record
 what they refused and why. Four passes, one rule.
 
-**Execution guards, in all four passes:** no default runs anything; a dry run
-must pass in the *same* call; the target must be provably the scratch sequence;
-a refusal is a returned result with a reason.
+**Execution guards, everywhere:** no default runs anything; a dry run must pass
+in the *same* call; the target must be provably the scratch sequence; a refusal
+is a returned result with a reason.
 
-### From Session 4
+### From Sessions 4–6
 
 **A finding is not a fix**, and **a fix may only act on a premise the plan
 confirms** — a critic hallucinating a zoom cannot make the system edit one.
 
-### From Session 5
-
-**Ceilings only ever subtract.** A style can make the edit quieter than the
+**Ceilings only ever subtract.** A style makes the edit quieter than the
 evidence justifies, never busier.
 
-**The style pass is additive only** — no `clip.*` operation at all, so nothing
-ripples and nothing it plans can describe a frame that moved.
+**The style pass is additive only** (no `clip.*` at all). The asset pass adds
+exactly one `clip.*` — `clip.overwrite`, which does not ripple — and never
+touches V1 or A1.
 
-**"N per minute" means two different things** above and below one: a rolling
-window count, or a whole-cut budget plus derived spacing.
+**Bad silence is better than random annoying SFX.** Five outcomes per asset
+placeholder, four of which place nothing.
 
-### From Session 6
+### From Session 7
 
-**Bad silence is better than random annoying SFX.** Every rule is written to
-make refusing cheap. Five outcomes per placeholder, four of which place
-nothing, each naming the rule that stopped it. On most libraries most of a plan
-is markers — that is the design working, and the marker list doubles as a
-shopping list.
+**Planning and execution are separate verbs.** `auto run` builds every plan and
+validates it offline. It never touches Premiere. There is deliberately no
+`--execute-everything`: the four passes carry different risk and one switch
+would mean approving the riskiest by approving the safest.
 
-**An empty library is a valid input.** Zero files produces a complete,
-dry-run-valid plan of markers. Nobody has a tagged sound library on day one.
+**A checkpoint is a claim, verified before it is trusted.** Artifacts must
+still exist, still match their fingerprints, and still have been built from the
+same configuration. Changing `--style` therefore rebuilds the style and asset
+passes and leaves the analysis alone, with no flag to remember.
 
-**Unreadable metadata is a flag, not a failure, and never "safe".** A file
-whose sidecar will not parse is indexed, marked `needs_review`, and held out of
-automatic placement — because metadata we could not read is not the same as
-metadata that said yes. Individual bad *fields* are dropped with a note while
-the rest of the document is kept.
+**A failure is a record with a command attached.** Every stopping point carries
+what failed, why, whether the run can resume, and the exact next thing to type.
 
-**`clip.overwrite`, never `clip.insert`.** Insert ripples; overwrite does not.
-That is what lets this pass place clips without moving anything Sessions 3–5
-computed.
+**Not every stage is critical.** The review pass needs FFmpeg and a model
+server. When either is missing those stages block, the run continues to style
+and assets, and the report says what was lost.
 
-**Never V1 or A1**, checked structurally on every operation. Assets land on
-tracks the plan adds, so the pass is undone by deleting those tracks and the
-markers. V1/A1 are rejected even as *configuration*.
+**Each run is hermetic, except the cache.** Per-run `artifacts/` so two runs
+cannot collide; shared `cache/` because paying for hundreds of model calls
+twice is the worst thing this could do to an afternoon.
 
-**Two clips never overlap on one track** — correctness rather than taste, since
-`clip.overwrite` destroys what is under it. Two beds on A3 was the realistic
-case and it would have looked fine in the plan.
+**A dry run must never write the execution report.** They were the same
+file: a `resume` after an execution overwrote `executed: true` with
+`false`, the later passes then believed the sequence had never been built,
+and every downstream gate was permanently blocked with no way to clear it.
+`test_a_resume_never_erases_the_record_of_an_execution` pins it.
 
-**Rotation is not rationing.** Reusing an asset costs something only while a
-suitable alternative is unused; measured against the *viable* candidates, not
-the whole category. Measuring it against the category meant an unused impact
-sound made repeating the only whoosh look expensive.
+**A dry-run stage must write nothing at all.** The first fix above made it
+re-save the *plan* instead, which changed that file's fingerprint and so
+invalidated the **build** stage's checkpoint -- every resume then rebuilt the
+rough cut, the revisions, the layers and the asset plan for no reason. The
+build stages validate and save once; the dry-run stages re-validate and
+persist nothing.
 
-**Ducking is the Session 5 unlock.** `audio.duck` needed a bed clip and there
-was none; placing one makes it real, using the exact speech ranges Session 5
-already computed and stored in its `duck_narration` placeholder.
+**Staleness is read from the plan, not compared by timestamp.** An earlier
+version compared build time against execution time, both recorded to the
+second, so a plan rebuilt in the same second looked fresh when it was not.
 
 ---
 
 ## Current state
 
-- **924 editing tests**, ~10s, needing no FFmpeg, GPU, model server, Premiere
+- **992 editing tests**, ~60s, needing no FFmpeg, GPU, model server, Premiere
   or real media
-- `tests/premiere/` passes too (1200 across both suites)
+- `tests/premiere/` passes too (1269 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
   client) are pre-existing and unrelated
-- `editing/README.md` is the full user documentation (~2130 lines); sections 13
-  and 14 cover the asset system
+- `editing/README.md` is the full user documentation (~2370 lines); §0 covers
+  auto mode
 
 **Note on running the tests here:** pytest's default temp root
 (`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
-every test errors in setup. Pass `--basetemp` at a writable path:
+every test errors in setup. Pass `--basetemp` at a writable path.
 
-```
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt
-```
+**Verified on real footage**: `auto run` completes all sixteen stages on three
+real MP4s with real FFmpeg, in mock mode, in about a minute. The full gate
+chain (execute rough cut → resume → execute layers) is verified against a fake
+engine.
 
 ---
 
@@ -202,98 +197,89 @@ python -m pytest tests/editing -q --basetemp=%TEMP%\pt
 
 1. **Never tested with a real Qwen3-VL critic.** The critic prompt has never
    been seen by a model. Still the highest-value next action.
-2. **Never executed against real Premiere.** Every plan in Sessions 3–6
-   dry-runs clean; the only thing that has run against the real host is the
-   Premiere self-test. The first real `execute --yes` will find things the
-   validator cannot.
-3. **Asset matching is tags and folders, not listening.** No audio content
-   analysis at all. A badly named file matches badly; the fix is a sidecar.
-4. **Loudness and BPM are never measured** — sidecar-only. Levels come from a
-   small table of category defaults, which are opinions.
-5. **Beds are tiled, not crossfaded.** Seams are audible if a file does not
-   loop cleanly, and only the filename or sidecar says whether it does.
-6. **Asset tracks are assumed, not discovered** (A2/A3/V3). The plan cannot
-   read the sequence's real track layout offline.
-7. **Nothing is ever removed.** Re-running the asset pass places assets again
-   rather than replacing the previous run's.
-8. **`.mogrt` is matched and never placed** — needs a registered template and
-   a parameter mapping.
-9. **`text.create` uses the rasterised path**, so captions are PNG overlays and
-   are not editable in Premiere after placement.
-10. **Style numbers and mixing limits are opinions**, meant to be edited.
-11. **Marker positions after a Session 4 timing change are computed, not
-    observed**; **speed ripple is still assumed** (Session 3's gap).
+2. **Never executed against real Premiere.** Every plan dry-runs clean; the
+   only thing that has run against the real host is the Premiere self-test.
+   The first real `--yes` will find things the validator cannot.
+3. **Asset matching is tags and folders, not listening.** Loudness and BPM are
+   sidecar-only.
+4. **Beds are tiled, not crossfaded.** Seams are audible if a file does not
+   loop cleanly.
+5. **Asset tracks are assumed (A2/A3/V3)**, not discovered.
+6. **Nothing is ever removed.** Re-running a pass places its work again.
+7. **`.mogrt` is matched and never placed**; `text.create` uses the rasterised
+   path, so captions are not editable in Premiere afterwards.
+8. **Style numbers and mixing limits are opinions**, meant to be edited.
+9. **Marker positions after a Session 4 timing change are computed, not
+   observed**; **speed ripple is still assumed** (Session 3's gap).
+10. **Checkpoints fingerprint size and mtime, not content.**
 
 ---
 
 ## Natural next steps
 
-- **Run the critic against a real Qwen3-VL server**, then read the findings.
-- **Execute against real Premiere, in stages.** The safest ladder is:
-  `layers build --style minimal_clean --markers-only` (draws nothing), then
-  `assets plan --markers-only` (places nothing), then a real style, then real
-  assets. Each step is one `--yes` and each is undone by deleting a track.
-- **Put a real sound library together** and read `assets show-missing` — it is
-  written to be a shopping list.
-- **Loudness measurement.** `loudness_db` exists on every asset and is only
-  ever populated by hand; an ffmpeg `ebur128` pass would make levels measured
-  rather than assumed, and the schema is already shaped for it.
-- **Track discovery**, so A2/A3/V3 are read from the sequence rather than
-  assumed.
+The system is now usable enough that the next steps are about *reality*, not
+features.
+
+- **Run the critic against a real Qwen3-VL server.** `auto run --folder <f>`
+  without `--mock`, then read `auto report`. Expect the prompt to need tuning;
+  the issue guide and the "most frames are fine" instruction are the levers.
+- **Execute against real Premiere, up the ladder.** Each rung is one `--yes`
+  and each is undone by deleting a track:
+  1. `auto run --style minimal_clean --markers-only` — draws and plays nothing
+  2. `auto execute-stage roughcut --yes` — the only rung that builds a sequence
+  3. `auto resume` then `auto execute-stage layers --yes`
+  4. `auto execute-stage assets --yes`
+- **Then loosen one thing at a time**: a style that draws text, then a real
+  asset library.
+- **Loudness measurement** (`ffmpeg ebur128`) so levels are measured rather
+  than assumed. The schema is already shaped for it.
+- **Track discovery**, so A2/A3/V3 are read from the sequence.
 
 ---
 
-## Testing on real footage — the short version
+## Command reference
+
+Auto mode, in the order you would use it:
 
 ```cmd
-cd /d E:\Assistant
-git checkout claude/editing-brain-v1-structure-7p33pm
-
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt   REM expect 924 passed
-python -m editing.cli doctor
+python -m editing.cli auto run --folder D:\Footage\test --style cinematic_minecraft
+python -m editing.cli auto status
+python -m editing.cli auto report
+python -m editing.cli auto show-gates
+python -m editing.cli auto execute-stage roughcut --yes
+python -m editing.cli auto resume
+python -m editing.cli auto execute-stage layers --yes
+python -m editing.cli auto execute-stage assets --yes
 ```
 
-Put 3–4 short clips (1–3 min each) in one folder, then:
+Useful flags on `auto run`:
+
+| Flag | Effect |
+|---|---|
+| `--mock` | deterministic vision and critic; no GPU, no server |
+| `--no-premiere` | never talk to Premiere; every gate stays shut |
+| `--markers-only` | style and asset passes record instead of drawing/playing |
+| `--skip-review` / `--skip-assets` | skip a whole pass |
+| `--asset-library <path>` | a library other than `<model dir>/assets` |
+| `--max-windows N` | cap analysis windows per file |
+| `--force-new-run` | a fresh run even if one exists for this footage+style |
+
+When something stops:
 
 ```cmd
-REM Stages 1-3: structure, recommendations, rough cut
-python -m editing.cli run --folder D:\Footage\test --recommend --no-premiere
-python -m editing.cli roughcut build
-python -m editing.cli roughcut dry-run
-python -m editing.cli roughcut execute --yes
-
-REM Stage 4: the critic pass
-python -m editing.cli review export-frames
-python -m editing.cli review critique
-python -m editing.cli review plan
-python -m editing.cli review dry-run
-python -m editing.cli review execute --yes
-
-REM Stage 5: the styled, layered edit
-python -m editing.cli style list
-python -m editing.cli layers build --style cinematic_minecraft
-python -m editing.cli layers show-density
-python -m editing.cli layers dry-run
-python -m editing.cli layers execute --yes
-
-REM Stage 6: real sounds and graphics
-python -m editing.cli assets init
-REM ... copy your own music/SFX/PNGs into the folders it made ...
-python -m editing.cli assets index
-python -m editing.cli assets report            REM what you can and cannot serve
-python -m editing.cli assets validate          REM anything broken?
-python -m editing.cli assets plan
-python -m editing.cli assets show-missing      REM the shopping list
-python -m editing.cli assets show-deferred     REM what it refused, and why
-python -m editing.cli assets dry-run
-python -m editing.cli assets execute --yes
+python -m editing.cli auto explain-failure
+python -m editing.cli auto resume
+python -m editing.cli auto resume --style fast_funny      REM restyle in place
+python -m editing.cli auto resume --refresh layers_build
+python -m editing.cli auto clean --run <run_id> --yes
 ```
 
-`assets plan --markers-only` matches everything and places nothing — the best
-way to read what the pass *wants* to do before letting it do any of it.
-`assets match <kind>` prints the full scoring for every candidate, which is the
-tool for "why did it pick that?" and "why not mine?".
+`resume --style` is the cheap way to compare presets: the style is one of the
+fields the layer and asset stages fingerprint, so exactly those rebuild and the
+analysis is reused. A fresh `auto run --style <other>` is a separate run with
+its own checkpoints, which is what you want when you need two styles side by
+side.
 
-If a pass is too busy, the dials in order of bluntness are `--markers-only`,
-`--min-score 0.7`, `--max-sfx-per-minute 2`, `--min-sfx-gap 6`, or a tighter
-style preset.
+The stage-by-stage commands from Sessions 1–6 all still work unchanged, and
+`auto` is a thin layer over them — anything it does can be done by hand, and
+the failure messages say which command to run.

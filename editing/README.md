@@ -1,4 +1,4 @@
-# Editing Brain V1 — Structure, Recommendations, Rough Cut, Critic, Style, Assets
+# Editing Brain V1
 
 Turns a folder of Minecraft footage into a machine-readable timeline of **what
 happens on screen**, **what is being said**, and **what is heard** — proposes
@@ -6,6 +6,15 @@ the edits worth making, with the evidence for each one — assembles them into a
 real Premiere rough cut, looks at that cut and improves it once, layers a
 chosen editing style over it, and fills that style's placeholders from a local
 library of your own music, effects and graphics.
+
+**Start here:** one command plans the whole thing.
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 --style cinematic_minecraft
+```
+
+It executes nothing. See [§0 Auto mode](#0-auto-mode) — the rest of this
+document is the stage-by-stage detail behind it.
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -60,6 +69,228 @@ mistakes an automatic assembly makes — a zoom that crops the HUD, a caption ov
 the action, a beat cut a moment early. It is not trying to converge on a
 finished edit, and most of what it finds it deliberately hands back to you
 rather than fixing.
+
+---
+
+## 0. Auto mode
+
+Six sessions produced about forty commands. `auto` is the thing that remembers
+which order they go in.
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 --style cinematic_minecraft
+```
+
+That runs sixteen stages — discovery, transcripts, audio, vision, timeline,
+recommendations, rough cut, critic, style layers, asset placement — and writes
+a plan and an offline dry run for each of the four things that could touch
+Premiere.
+
+**It executes nothing.** Not by accident, and not by default. Execution is four
+separate decisions:
+
+```bash
+python -m editing.cli auto show-gates
+python -m editing.cli auto execute-stage roughcut --yes
+python -m editing.cli auto resume                    # rebuild now the sequence exists
+python -m editing.cli auto execute-stage layers   --yes
+python -m editing.cli auto execute-stage assets   --yes
+```
+
+There is deliberately no `--execute-everything`. The four passes carry
+genuinely different risk — the rough cut builds a sequence, the revision pass
+can ripple timing, the style pass is additive, the asset pass places clips —
+and one switch for all of them would mean approving the riskiest by approving
+the safest.
+
+### Try it with nothing installed
+
+No GPU, no model server, no Premiere:
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 --mock --no-premiere
+```
+
+`--mock` swaps in the deterministic vision and critic stand-ins; `--no-premiere`
+makes every gate permanently shut, so the run *cannot* execute anything even by
+accident. This is the mode for finding out whether the pipeline works on your
+footage before committing an afternoon to it.
+
+### What a run looks like
+
+```
+  + doctor                 passed   ffmpeg=True, ffprobe=True
+  + discover               passed   files=3, total_seconds=120.0
+  + analyze                passed   segments=12, covered_seconds=120.0
+  + recommend              passed   total=33, accepted=30
+  + roughcut_build         passed   clips=9, cut_duration=99.0
+  + roughcut_dry_run       passed   dry_run_passed=True, operations=40
+  + review_export_frames   passed   frames=29
+  + review_critique        passed   mock=True, findings=9
+  + review_plan            passed   revisions=9, accepted=0
+  + review_dry_run         passed   operations=4
+  + layers_build           passed   planned=36, deferred=13
+  + layers_dry_run         passed   operations=29
+  + assets_index           passed   total=0
+  + assets_plan            passed   placeholders=11, placed=0, missing=11
+  + assets_dry_run         passed   operations=12
+  + report                 passed
+```
+
+### The run folder
+
+Every run gets its own directory under `data/editing/auto/runs/<run_id>/`:
+
+```
+config.json      exactly what the run was invoked with
+state.json       every stage result and gate, rewritten after each stage
+checkpoints/     one file per completed stage, with artifact fingerprints
+artifacts/       the run's own output_dir -- timelines, plans, reports
+reports/         report.json and report.txt
+logs/            run.log
+```
+
+The run ID is `<timestamp>-<folder hash>-<style>`, so runs sort by time, group
+by footage, and are told apart by style.
+
+**Each run is hermetic.** `artifacts/` is that run's `output_dir`, so two runs
+over the same footage with different styles cannot overwrite each other's
+plans, and deleting a run folder removes everything it produced and nothing it
+did not.
+
+The one deliberate exception is the **analysis cache**, which stays shared at
+`data/editing/cache`. Making it per-run would mean paying hundreds of model
+calls again on every run.
+
+### Checkpoints and resume
+
+A stage is skipped only when its checkpoint can be *proved* still valid:
+
+- the artifacts it named still exist,
+- their fingerprints still match, and
+- the config fields that stage depends on have not changed.
+
+Deleting a timeline by hand re-runs the analysis. A checkpoint that will not
+parse re-runs its stage.
+
+```bash
+python -m editing.cli auto resume                          # continue
+python -m editing.cli auto resume --style fast_funny       # restyle in place
+python -m editing.cli auto resume --refresh roughcut_build # and everything after it
+python -m editing.cli auto status
+python -m editing.cli auto list-runs
+```
+
+**Restyling is cheap.** `auto resume --style <preset>` changes the style on the
+existing run: the style is one of the fields the layer and asset stages
+fingerprint, so exactly those checkpoints go stale and the analysis is reused.
+
+`auto run --style <other>` instead starts a *new* run — the style is part of
+the run ID — so it re-runs every stage. That is usually still fast, because the
+expensive part (frame extraction, model calls, probes) comes from the **shared
+cache** rather than from the run's own checkpoints, but `resume --style` is the
+cheaper and more direct way to compare two styles over one analysis.
+
+`resume` retries failed **and blocked** stages, because the usual reason to
+type it is that you just installed the missing thing.
+
+### Failure output
+
+Every stopping point carries what failed, why, whether the run can resume, and
+the command to try next:
+
+```
+Stage discover found no footage
+  why    : there are no video files in 'D:/Footage/ep12'.
+  resume : yes
+  next   : python -m editing.cli discover --folder <folder>
+  log    : .../logs/run.log
+  report : .../reports/report.txt
+```
+
+A traceback reaching you is a bug in this package.
+
+**Not every stage is critical.** The review pass needs FFmpeg and a model
+server, and neither is guaranteed. When one is missing those stages go
+`blocked` with a reason, the run *continues* to the style and asset passes, and
+the report says what was lost. A missing critic costs you the critic, not the
+run.
+
+### Gates
+
+```bash
+python -m editing.cli auto show-gates
+```
+
+```
+- roughcut   Build the rough cut sequence in Premiere
+    plan       : .../artifacts/roughcut/structure.json
+    dry run    : passed
+    sequence   : Nova Rough Cut
+    operations : 40
+    riskiest   : clip.remove -- deletes a clip
+    on scratch : True
+    run        : python -m editing.cli auto execute-stage roughcut --run <id> --yes
+```
+
+Every gate reports the **riskiest operation it would perform**, because that is
+the question a person actually has before typing `--yes`.
+
+A gate refuses when: the dry run has not passed in this run, the plan is
+missing or empty, the target is not provably a scratch sequence, the run was
+created with `--no-premiere`, Premiere is unreachable, the stage was already
+executed, or `--yes` was omitted.
+
+**The rough cut comes first, and the others wait for it.** The style, review and
+asset plans each record whether the sequence exists in Premiere. Until the
+rough cut is executed they say "no" and their gates stay shut, naming the
+command that opens them. After it is executed those plans are marked stale, and
+one `auto resume` rebuilds them:
+
+```
+execute roughcut  ->  31 operations
+auto resume       ->  layers and assets gates open
+execute layers    ->  16 operations
+```
+
+### Recovering from common failures
+
+| What you see | What to do |
+|---|---|
+| `discover found no footage` | check the folder path; `auto resume` after fixing |
+| `could not reach the vision model` | start the server, or re-run with `--mock` |
+| `could not analyse the footage` (FFmpeg) | install FFmpeg, put it on PATH, `auto resume` |
+| `review_*` blocked | optional pass; the run continued without it |
+| `there is no asset library at ...` | `assets init`, add files, `auto resume` |
+| `Premiere Bridge is unreachable` | start Premiere, open the Nova panel, re-run the gate |
+| `this plan was built before the rough cut was executed` | `auto resume` |
+| `corrupted state.json` | `auto clean --run <id> --yes`, then start again |
+
+`auto explain-failure` prints every failed and blocked stage with the command
+for each.
+
+### Cleaning up
+
+```bash
+python -m editing.cli auto clean            # dry run: shows what it would remove
+python -m editing.cli auto clean --yes      # remove incomplete runs
+python -m editing.cli auto clean --all --yes  # completed ones too
+```
+
+Completed runs, and runs that have executed anything against Premiere, are kept
+unless you pass `--all` — the irreversible mistake this guards against is
+clearing a run's artifacts while a sequence built from them is still open.
+
+### What auto mode does not do
+
+- **It makes no editing decisions of its own.** Every stage is a thin adapter
+  over the pass that already existed; the value is ordering, checkpointing and
+  failure messages.
+- **It never executes anything without a per-stage `--yes`.**
+- **It does not re-run the critic in a loop.** One pass, as designed.
+- **It does not know your Premiere track layout.** The asset pass assumes
+  V1/A1 belong to the rough cut.
+- **It cannot undo an execution.** Delete the added tracks and markers by hand.
 
 ---
 
@@ -1737,6 +1968,9 @@ data/editing/
 ├── assets/structure.placement.json ← every placeholder resolved, with reasons
 ├── assets/structure.placement.txt  ← the human-readable asset report
 ├── assets/structure.placement-execution.json
+└── auto/runs/<run_id>/            ← one self-contained folder per auto run
+    ├── config.json  state.json
+    ├── checkpoints/  artifacts/  reports/  logs/
 ├── frames/                         extracted JPEGs (deleted unless --keep-frames)
 └── cache/
     ├── probe/       ffprobe results
@@ -1799,7 +2033,7 @@ that window.
 ## 17. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 924 tests, ~10s
+python -m pytest tests/editing -q        # 992 tests, ~60s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -1822,6 +2056,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_critic.py` | frame coverage, critic coercion, **the finding/fix line**, revision guards |
 | `test_editing_style.py` | preset validation, **density ceilings**, caption selection, emphasis safety, layer guards |
 | `test_editing_assets.py` | indexing, sidecars, matching, **mixing safety**, track and import guards |
+| `test_editing_auto.py` | run state, stage ordering, **checkpoint validation**, resume, execution gates |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
 
 Tests worth knowing about, because they pin the promises this layer makes:
@@ -1885,6 +2120,18 @@ Tests worth knowing about, because they pin the promises this layer makes:
 - `test_the_only_asset_of_its_kind_may_repeat` — rotation is not rationing
 - `test_a_name_that_says_what_it_is_matches_without_a_probe` — the case that
   silently placed nothing on a machine with no FFmpeg
+- `test_a_mock_run_completes_with_nothing_installed` — no FFmpeg, no GPU, no
+  model server, no Premiere, no assets, end to end
+- `test_a_deleted_artifact_invalidates_its_checkpoint` and
+  `test_a_changed_artifact_invalidates_its_checkpoint` — "it passed once" is
+  not a reason to skip a stage
+- `test_a_resume_never_erases_the_record_of_an_execution` — a dry run and a
+  real execution wrote the same file, so every resume after an execution
+  permanently blocked every later gate
+- `test_a_gate_is_never_executed_twice` — running a gate again would place a
+  second copy of everything
+- `test_the_later_gates_open_once_the_rough_cut_exists` — the execute, resume,
+  execute chain
 
 ---
 
@@ -2046,6 +2293,16 @@ exactly how much of a pass is placeholder rather than edit — usually most of i
 changes, deaths and stated objectives. A section boundary a human would feel —
 a change of goal, a shift in tone — is invisible to it unless the narration
 says so out loud.
+
+**Auto mode adds no editing behaviour.** It is ordering, checkpointing and
+failure messages over the six passes that already existed. If a pass makes a
+bad choice by hand it makes the same bad choice under `auto`.
+
+**A run's checkpoints trust file fingerprints, not content.** Size and mtime,
+not a hash — enough to catch a deleted, truncated or rebuilt artifact between
+two stages of one run, which is the whole set of things that actually happens.
+An artifact edited in place to the same byte length within the same second
+would be reused.
 
 **Asset matching is tags and folders, not listening.** Nothing here analyses
 audio content: an "impact" is a file in `sfx/` whose name or sidecar says
