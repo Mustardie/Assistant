@@ -25,6 +25,9 @@ Commands, in the order a session normally uses them::
     auto        run | status | list-runs | resume | report | show-gates |
                 execute-stage <stage> --yes | clean | explain-failure
                 -- the whole pipeline, checkpointed, with gated execution
+    episode     build-memory | plan-retention | report | show-beats |
+                show-risks | show-hooks | show-open-loops | show-callbacks |
+                export   -- the story the footage tells, and where it sags
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -58,6 +61,8 @@ from editing.assets import report as assets_report
 from editing.auto import gates as auto_gates
 from editing.auto import report as auto_report
 from editing.auto import store as auto_store
+from editing.episode import report as episode_report
+from editing.episode import schema as episode_schema
 from editing.auto.runner import AutoRunner
 from editing.auto.schema import AutoRunConfig
 from editing.assets.compile import AssetOptions
@@ -1616,6 +1621,7 @@ def _auto_config(args) -> AutoRunConfig:
         use_motion=not getattr(args, "no_motion", False),
         skip_review=getattr(args, "skip_review", False),
         skip_assets=getattr(args, "skip_assets", False),
+        skip_episode=getattr(args, "skip_episode", False),
     )
 
 
@@ -1849,6 +1855,172 @@ def _print_roughcut(plan, *, limit: int = 30) -> None:
         print("\n  Warnings:")
         for warning in plan.warnings:
             print(f"    ! {warning}")
+
+
+def cmd_episode(args) -> int:
+    """Build and inspect the episode memory and the retention plan.
+
+    Nine subcommands, none of which touches Premiere. This layer plans; it
+    executes nothing, so there is no ``dry-run`` and no ``--yes`` here.
+    """
+    pipeline = _pipeline(args)
+    command = args.episode_command
+    name = getattr(args, "name", "structure")
+
+    if command == "build-memory":
+        memory = pipeline.episode_memory(
+            name=name,
+            use_roughcut=not getattr(args, "no_roughcut", False),
+            save=not getattr(args, "no_save", False),
+        )
+        if args.json:
+            _emit({"success": True, **memory.to_dict()})
+            return EXIT_OK
+        print(episode_report.render_memory(memory, limit=args.limit))
+        return EXIT_OK
+
+    if command == "plan-retention":
+        memory = pipeline.load_episode_memory(name=name)
+        plan = pipeline.retention_plan(
+            name=name, memory=memory, hook_limit=args.hooks,
+            save=not getattr(args, "no_save", False),
+        )
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        print(episode_report.render_plan(plan, memory=memory, limit=args.limit))
+        return EXIT_OK
+
+    if command == "report":
+        memory = pipeline.load_episode_memory(name=name)
+        plan = _retention_or_none(pipeline, name)
+        if args.json:
+            _emit({
+                "success": True,
+                "memory": memory.to_dict(),
+                "retention": plan.to_dict() if plan else None,
+            })
+            return EXIT_OK
+        print(episode_report.render_memory(memory, limit=args.limit))
+        if plan is None:
+            _note("No retention plan yet. Run `episode plan-retention`.")
+            return EXIT_OK
+        print()
+        print(episode_report.render_plan(plan, memory=memory, limit=args.limit))
+        return EXIT_OK
+
+    if command == "show-beats":
+        memory = pipeline.load_episode_memory(name=name)
+        if args.json:
+            _emit({
+                "success": True,
+                "timebase": memory.timebase,
+                "beats": [
+                    beat.to_dict() for beat in memory.beats
+                    if not args.kind or beat.kind == args.kind
+                ],
+            })
+            return EXIT_OK
+        print(episode_report.render_beats(
+            memory, kind=args.kind or "", limit=args.limit))
+        return EXIT_OK
+
+    if command == "show-risks":
+        plan = pipeline.load_retention_plan(name=name)
+        if args.json:
+            _emit({
+                "success": True,
+                "basis": episode_schema.NOT_ANALYTICS,
+                "risks": [
+                    zone.to_dict() for zone in plan.risks
+                    if not args.severity or zone.severity == args.severity
+                ],
+            })
+            return EXIT_OK
+        print(episode_report.render_risks(
+            plan, severity=args.severity or "", limit=args.limit))
+        return EXIT_OK
+
+    if command == "show-hooks":
+        plan = pipeline.load_retention_plan(name=name)
+        if args.json:
+            _emit({
+                "success": True,
+                "hooks": [hook.to_dict() for hook in plan.top_hooks(args.limit)],
+            })
+            return EXIT_OK
+        print(episode_report.render_hooks(plan, limit=args.limit))
+        return EXIT_OK
+
+    if command == "show-open-loops":
+        memory = pipeline.load_episode_memory(name=name)
+        loops = [
+            loop for loop in memory.open_loops
+            if not args.unresolved or not loop.resolved
+        ]
+        if args.json:
+            _emit({"success": True,
+                   "open_loops": [loop.to_dict() for loop in loops]})
+            return EXIT_OK
+        print(episode_report.render_open_loops(
+            memory, unresolved_only=args.unresolved, limit=args.limit))
+        return EXIT_OK
+
+    if command == "show-callbacks":
+        memory = pipeline.load_episode_memory(name=name)
+        if args.json:
+            _emit({
+                "success": True,
+                "callbacks": [item.to_dict() for item in memory.callbacks],
+            })
+            return EXIT_OK
+        print(episode_report.render_callbacks(memory, limit=args.limit))
+        return EXIT_OK
+
+    if command == "export":
+        memory = pipeline.load_episode_memory(name=name)
+        plan = _retention_or_none(pipeline, name)
+        payload = {
+            "memory": memory.to_dict(),
+            "retention": plan.to_dict() if plan else None,
+        }
+        if args.suggestions_for:
+            if plan is None:
+                raise EditingError(
+                    "No retention plan to take suggestions from",
+                    hint="Run `python -m editing.cli episode plan-retention` "
+                         "first.",
+                )
+            wanted = plan.suggestions_for(args.suggestions_for)
+            if args.safe_only:
+                wanted = [item for item in wanted if item.auto_safe]
+            payload = {
+                "basis": episode_schema.NOT_ANALYTICS,
+                "timebase": plan.timebase,
+                "sequence_name": plan.sequence_name,
+                "downstream": args.suggestions_for,
+                "safe_only": bool(args.safe_only),
+                "suggestions": [item.to_dict() for item in wanted],
+            }
+        target = Path(args.out)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        if args.json:
+            _emit({"success": True, "path": str(target)})
+            return EXIT_OK
+        print(f"Wrote {target}")
+        return EXIT_OK
+
+    raise EditingError("Unknown episode command")
+
+
+def _retention_or_none(pipeline: Pipeline, name: str):
+    try:
+        return pipeline.load_retention_plan(name=name)
+    except EditingError:
+        return None
 
 
 def cmd_timeline(args) -> int:
@@ -2875,6 +3047,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "instead of drawing or playing it")
     au_run.add_argument("--skip-review", action="store_true",
                         help="skip the critic pass entirely")
+    au_run.add_argument("--skip-episode", action="store_true",
+                        help="skip the episode memory and retention planner")
     au_run.add_argument("--skip-assets", action="store_true",
                         help="skip the asset pass entirely")
     au_run.add_argument("--force-new-run", action="store_true",
@@ -2966,6 +3140,99 @@ def build_parser() -> argparse.ArgumentParser:
     au_clean.add_argument("--limit", type=int, default=40)
     _add_common(au_clean)
     au_clean.set_defaults(func=cmd_auto)
+
+    # -- episode ---------------------------------------------------------
+    episode = subparsers.add_parser(
+        "episode",
+        help="episode memory and the retention planner (plans only, never "
+             "executes)",
+    )
+    episode_subs = episode.add_subparsers(
+        dest="episode_command", required=True)
+
+    def _add_episode_common(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--name", default="structure", help="which timeline to read")
+        parser.add_argument(
+            "--limit", type=int, default=40,
+            help="how many items to print")
+        _add_common(parser)
+
+    ep_mem = episode_subs.add_parser(
+        "build-memory",
+        help="read the story off the timeline: beats, objectives, loops, "
+             "callbacks",
+    )
+    ep_mem.add_argument(
+        "--no-roughcut", action="store_true",
+        help="ignore any rough cut and use the raw timeline ordering (the "
+             "times are then synthetic, not sequence time)")
+    ep_mem.add_argument(
+        "--no-save", action="store_true", help="print without writing files")
+    _add_episode_common(ep_mem)
+
+    ep_plan = episode_subs.add_parser(
+        "plan-retention",
+        help="risks, hook candidates, a peak, an ending and the suggestions",
+    )
+    ep_plan.add_argument(
+        "--hooks", type=int, default=5,
+        help="how many hook candidates to keep")
+    ep_plan.add_argument(
+        "--no-save", action="store_true", help="print without writing files")
+    _add_episode_common(ep_plan)
+
+    ep_report = episode_subs.add_parser(
+        "report", help="the memory and the retention plan, in full")
+    _add_episode_common(ep_report)
+
+    ep_beats = episode_subs.add_parser(
+        "show-beats", help="every detected story beat")
+    ep_beats.add_argument(
+        "--kind", default="", help="only beats of this kind")
+    _add_episode_common(ep_beats)
+
+    ep_risks = episode_subs.add_parser(
+        "show-risks", help="the retention risk zones, worst first")
+    ep_risks.add_argument(
+        "--severity", default="", choices=["", "low", "medium", "high"],
+        help="only risks at this severity")
+    _add_episode_common(ep_risks)
+
+    ep_hooks = episode_subs.add_parser(
+        "show-hooks", help="candidate openings, with their scores broken out")
+    _add_episode_common(ep_hooks)
+
+    ep_loops = episode_subs.add_parser(
+        "show-open-loops", help="questions the episode raises, and their fate")
+    ep_loops.add_argument(
+        "--unresolved", action="store_true",
+        help="only the ones nothing answers")
+    _add_episode_common(ep_loops)
+
+    ep_calls = episode_subs.add_parser(
+        "show-callbacks", help="places the episode refers back to itself")
+    _add_episode_common(ep_calls)
+
+    ep_export = episode_subs.add_parser(
+        "export", help="write the episode artifacts, or one stage's suggestions")
+    ep_export.add_argument("out", help="where to write the JSON")
+    ep_export.add_argument(
+        "--suggestions-for", default="",
+        choices=["", "roughcut", "style", "assets", "human"],
+        help="export only the suggestions one downstream pass could act on")
+    ep_export.add_argument(
+        "--safe-only", action="store_true",
+        help="with --suggestions-for, only the ones safe to apply")
+    _add_episode_common(ep_export)
+    ep_export.set_defaults(func=cmd_episode)
+
+    # Not ``parser`` as the loop variable: this function returns a local of
+    # that name, and rebinding it here handed the caller a subparser.
+    for episode_parser in (ep_mem, ep_plan, ep_report, ep_beats, ep_risks,
+                           ep_hooks, ep_loops, ep_calls):
+        episode_parser.set_defaults(func=cmd_episode)
+
 
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")

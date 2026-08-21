@@ -413,6 +413,16 @@ class EditingConfig:
         return self.output_dir / "critic"
 
     @property
+    def episode_dir(self) -> Path:
+        """Episode memory, retention plans and their reports.
+
+        Its own directory for the same reason ``critic_dir`` and ``layers_dir``
+        are: an episode memory is an observation about a cut, and re-planning
+        must never be able to overwrite the cut -- or the memory -- it reads.
+        """
+        return self.output_dir / "episode"
+
+    @property
     def frames_dir(self) -> Path:
         return self.output_dir / "frames"
 
@@ -426,7 +436,7 @@ class EditingConfig:
             self.visual_dir, self.timelines_dir, self.frames_dir,
             self.audio_dir, self.recommendations_dir, self.plans_dir,
             self.roughcut_dir, self.review_dir, self.critic_dir,
-            self.layers_dir, self.asset_library_dir,
+            self.layers_dir, self.asset_library_dir, self.episode_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

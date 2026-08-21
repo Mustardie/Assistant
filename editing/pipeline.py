@@ -35,6 +35,10 @@ from editing.critic.schema import (
     CriticReport, RevisionPlan, RevisionSet,
 )
 from editing.discovery import discover
+from editing.episode import memory as episode_memory_module
+from editing.episode import plan as episode_plan_module
+from editing.episode import report as episode_report
+from editing.episode.schema import EpisodeMemory, EpisodeRetentionPlan
 from editing.errors import EditingError, FootageError
 from editing.fingerprint import fingerprint
 from editing.premiere_link import ProjectSnapshot
@@ -1538,6 +1542,231 @@ class Pipeline:
         return ExecutionReport.from_dict(
             json.loads(target.read_text(encoding="utf-8"))
         )
+
+    # ------------------------------------------------------------------
+    # Episode memory and retention plan (Session 8)
+    # ------------------------------------------------------------------
+    #
+    # Neither of these touches Premiere, and neither has a dry run or an
+    # execute, because there is nothing to execute: the layer produces records
+    # a later pass may read. That is why there is no ``run_episode``.
+
+    def episode_memory(
+        self,
+        *,
+        name: str = "structure",
+        timeline: Optional[StructureTimeline] = None,
+        roughcut: Optional[RoughCutPlan] = None,
+        recommendations: Optional[RecommendationSet] = None,
+        layers=None,
+        asset_plan=None,
+        use_roughcut: bool = True,
+        save: bool = True,
+    ) -> EpisodeMemory:
+        """Read one episode off the timeline and, when there is one, the cut.
+
+        Every optional input is loaded opportunistically and its absence is
+        recorded rather than worked around: a memory built without a rough cut
+        is in a different timebase from one built with, and a caller that
+        cannot tell which would put markers in the wrong places.
+        """
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if roughcut is None and use_roughcut:
+            roughcut = self._rough_cut_or_none(name)
+        if recommendations is None:
+            recommendations = self._recommendations_or_none(name)
+        if layers is None:
+            layers = self._layers_or_none(name)
+        if asset_plan is None:
+            asset_plan = self._asset_plan_or_none(name)
+
+        memory = episode_memory_module.build(
+            timeline,
+            roughcut=roughcut,
+            recommendations=recommendations,
+            layers=layers,
+            asset_plan=asset_plan,
+            name=name,
+        )
+        stats = memory.stats()
+        objective = memory.main_objective
+        self.say(
+            f"Episode memory for '{name}': {stats['beats']} beat(s) "
+            f"({stats['labelled_beats']} named), {stats['open_loops']} open "
+            f"loop(s) of which {stats['resolved_loops']} resolve, "
+            f"{stats['callbacks']} callback opportunity(ies)."
+        )
+        self.say(
+            "  objective: "
+            + (f"{objective.text[:60]} ({objective.status})" if objective
+               else "none stated or inferable")
+        )
+        self.say(f"  timebase : {memory.timebase}")
+        for warning in memory.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_episode_memory(memory, name=name)
+            self.write_episode_report(memory, name=name)
+        return memory
+
+    def _rough_cut_or_none(self, name: str) -> Optional[RoughCutPlan]:
+        try:
+            return self.load_rough_cut(name=name)
+        except EditingError:
+            return None
+
+    def _layers_or_none(self, name: str):
+        try:
+            return self.load_layers(name=name)
+        except EditingError:
+            return None
+
+    def _asset_plan_or_none(self, name: str):
+        try:
+            return self.load_asset_plan(name=name)
+        except EditingError:
+            return None
+
+    def write_episode_memory(
+        self, memory: EpisodeMemory, *, name: str = "structure"
+    ) -> Path:
+        self.config.episode_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.episode_dir / f"{name}.memory.json"
+        target.write_text(
+            json.dumps(memory.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_episode_memory(self, *, name: str = "structure") -> EpisodeMemory:
+        target = self.config.episode_dir / f"{name}.memory.json"
+        if not target.exists():
+            raise EditingError(
+                f"No episode memory named '{name}' has been built yet",
+                hint="Run `python -m editing.cli episode build-memory` first.",
+            )
+        return EpisodeMemory.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def write_episode_report(
+        self, memory: EpisodeMemory, *, name: str = "structure",
+        limit: int = 60,
+    ) -> Path:
+        self.config.episode_dir.mkdir(parents=True, exist_ok=True)
+        return episode_report.write(
+            self.config.episode_dir / f"{name}.memory.txt",
+            episode_report.render_memory(memory, limit=limit),
+        )
+
+    def retention_plan(
+        self,
+        *,
+        name: str = "structure",
+        memory: Optional[EpisodeMemory] = None,
+        timeline: Optional[StructureTimeline] = None,
+        roughcut: Optional[RoughCutPlan] = None,
+        hook_limit: int = 5,
+        save: bool = True,
+    ) -> EpisodeRetentionPlan:
+        """Risks, hooks, a peak, an ending and the suggestions that follow.
+
+        The timeline is reloaded even when a memory is passed in, because the
+        risk detectors read the slots underneath the beats -- measured silence,
+        motion and what was said across a cut do not survive the merge into a
+        beat list.
+        """
+        if memory is None:
+            memory = self.load_episode_memory(name=name)
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if roughcut is None and memory.timebase == "roughcut":
+            roughcut = self._rough_cut_or_none(name)
+
+        plan = episode_plan_module.build(
+            memory, timeline=timeline, roughcut=roughcut, hook_limit=hook_limit,
+        )
+        stats = plan.stats()
+        self.say(
+            f"Retention plan for '{name}': {stats['risks']} risk zone(s) "
+            f"({stats['high_severity']} high), {stats['hooks']} hook "
+            f"candidate(s), {stats['suggestions']} suggestion(s)."
+        )
+        self.say(
+            f"  {stats['auto_safe']} suggestion(s) are safe to apply; "
+            f"{stats['marker_only']} are markers for a person."
+        )
+        self.say(
+            "  climax: "
+            + (f"{plan.climax.start:.1f}s" if plan.climax
+               else "no single moment stands out")
+        )
+        for warning in plan.warnings:
+            self.say(f"  ! {warning}")
+
+        if save:
+            self.write_retention_plan(plan, name=name)
+            self.write_retention_report(plan, memory=memory, name=name)
+        return plan
+
+    def write_retention_plan(
+        self, plan: EpisodeRetentionPlan, *, name: str = "structure"
+    ) -> Path:
+        self.config.episode_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.episode_dir / f"{name}.retention.json"
+        target.write_text(
+            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_retention_plan(
+        self, *, name: str = "structure"
+    ) -> EpisodeRetentionPlan:
+        target = self.config.episode_dir / f"{name}.retention.json"
+        if not target.exists():
+            raise EditingError(
+                f"No retention plan named '{name}' has been built yet",
+                hint="Run `python -m editing.cli episode plan-retention` "
+                     "first.",
+            )
+        return EpisodeRetentionPlan.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def write_retention_report(
+        self,
+        plan: EpisodeRetentionPlan,
+        *,
+        memory: Optional[EpisodeMemory] = None,
+        name: str = "structure",
+        limit: int = 60,
+    ) -> Path:
+        self.config.episode_dir.mkdir(parents=True, exist_ok=True)
+        return episode_report.write(
+            self.config.episode_dir / f"{name}.retention.txt",
+            episode_report.render_plan(plan, memory=memory, limit=limit),
+        )
+
+    def retention_suggestions_for(
+        self, stage: str, *, name: str = "structure",
+        plan: Optional[EpisodeRetentionPlan] = None,
+        safe_only: bool = False,
+    ) -> list:
+        """The seam Sessions 3, 5 and 6 will read.
+
+        A filter over records with no Premiere operations in them, on purpose:
+        a later pass decides what an operation looks like, this one only says
+        what it wants. Nothing consumes it yet -- the seam exists so the next
+        session does not have to reshape this artifact to use it.
+        """
+        if plan is None:
+            plan = self.load_retention_plan(name=name)
+        wanted = plan.suggestions_for(stage)
+        return [item for item in wanted if item.auto_safe] if safe_only \
+            else wanted
 
     # ------------------------------------------------------------------
     # Whole run

@@ -81,8 +81,9 @@ which order they go in.
 python -m editing.cli auto run --folder D:/Footage/ep12 --style cinematic_minecraft
 ```
 
-That runs sixteen stages — discovery, transcripts, audio, vision, timeline,
-recommendations, rough cut, critic, style layers, asset placement — and writes
+That runs eighteen stages — discovery, transcripts, audio, vision, timeline,
+recommendations, rough cut, critic, style layers, asset placement, episode
+memory, retention plan — and writes
 a plan and an offline dry run for each of the four things that could touch
 Premiere.
 
@@ -1938,7 +1939,194 @@ python -m editing.cli assets plan --markers-only
 
 ---
 
-## 15. Where outputs go
+## 15. Episode memory and the retention planner
+
+Everything up to here thinks in clips, segments and moments. This layer thinks
+in one **episode**: a thing with an objective, a middle that can sag, a question
+the viewer is waiting to have answered, and an ending that either pays off or
+does not.
+
+It executes nothing. There is no dry run and no `--yes`, because there is
+nothing to run — it produces two artifacts and a list of suggestions a later
+pass can read.
+
+```bash
+python -m editing.cli episode build-memory
+python -m editing.cli episode plan-retention
+python -m editing.cli episode show-hooks
+python -m editing.cli episode show-risks
+python -m editing.cli episode report
+```
+
+`auto run` builds both automatically, as two non-critical stages after the
+asset pass. `--skip-episode` turns them off.
+
+### What it can and cannot know
+
+**It cannot know retention.** It has never seen an audience, a retention graph
+or a single view, and it is not connected to anything that has. Every "risk"
+below is a *creative* risk read off edit evidence — a three-minute grind, a goal
+nobody states, a question asked eight minutes before it is answered. Those are
+real things worth flagging and they are not predictions of a curve.
+
+That is enforced rather than promised:
+
+* Every report prints the same fixed disclaimer, a constant rather than prose
+  written per renderer, so it cannot soften into a claim over time.
+* A test scans every generated string in a full plan for phrases like
+  "guarantee", "viewers will" and "watch time". It has to stay at zero.
+* Confidence never means "how likely is this true about the audience". It means
+  **how many independent channels agreed**, and nothing else.
+
+### The confidence rule
+
+This is the spine of the layer, so it is worth stating precisely.
+
+| Channels agreeing | Ceiling |
+|---|---|
+| none | 0.25 |
+| one (e.g. a keyword) | 0.45 |
+| two | 0.70 |
+| three | 0.88 |
+
+A finding cannot affect an edit below **0.55**. So a keyword-only finding is
+*structurally* incapable of driving one — not by policy, by arithmetic. And
+three agreeing channels still cap below 0.9, because nothing here is ever
+certain.
+
+The three channels are what the vision model saw, what was said, and what was
+measured in the audio. A Session 2 recommendation is deliberately **not** a
+fourth: it was itself derived from those three, so counting it would let one
+observation vote twice. It adds a small bonus and never raises the ceiling.
+
+### Two artifacts, not one
+
+**`EpisodeMemory` — what happened.** Beats, objectives, places, people,
+recurring motifs, setups, payoffs, callbacks, open loops, and the measured
+interest curve.
+
+**`EpisodeRetentionPlan` — what to do about it.** Risk zones, hook candidates, a
+climax, an ending, a midpoint reset, and the suggestions.
+
+The split is deliberate: memory is an observation and survives a restyle, the
+plan is an opinion about the observation. Re-planning must never be able to
+rewrite what was observed, and you should be able to disagree with a suggestion
+without the story underneath it moving.
+
+### Which clock the numbers are in
+
+`timebase` is on both artifacts and it matters more than it looks:
+
+`roughcut`
+: Sequence time on the scratch sequence. A later pass can use these numbers
+  directly.
+
+`timeline`
+: A synthetic ordering — every segment of every asset, laid end to end in
+  discovery order. Useful for reasoning about story before a cut exists, and
+  **wrong** to send to Premiere, because no sequence looks like this. A consumer
+  has to go through `segment_ids`.
+
+Conflating them would put captions in the wrong places on a real edit, so it is
+a field rather than a convention. `episode build-memory --no-roughcut` forces
+the second.
+
+### Beats
+
+Eighteen kinds: `setup`, `objective_stated`, `plan_explained`, `travel`,
+`preparation`, `grind`, `discovery`, `danger`, `failure`, `recovery`,
+`escalation`, `joke`, `callback`, `payoff`, `reveal`, `climax`, `resolution`,
+`outro` — plus `unknown`.
+
+Four rules shape the detector:
+
+* **Never on keywords alone.** A cue phrase scores like anything else, but a
+  transcript-only beat has one channel and is capped below the edit threshold.
+* **Do not over-label.** A stretch whose best kind scores under the floor stays
+  `unknown` and is kept. Labelling everything makes the list as useless as a
+  search that matches every document.
+* **Preserve uncertainty.** Every beat carries the runner-up kind and the score
+  table, so "danger 0.51 / joke 0.49" stays legible as a close call.
+* **Merge, do not fragment.** Four consecutive twenty-second mining windows are
+  one grind, not four.
+
+Cue phrases are matched **longest first**, and a match claims its characters, so
+no stretch of text can score two families. That is the structural fix for the
+Session 5 bug where "run" appeared in two lists and double-scored.
+
+### Open loops
+
+A question the episode raises, and whether it ever answers it. Three outcomes,
+kept distinct:
+
+`resolved`
+: A later moment shares a *salient* word with the question and reads as a
+  payoff.
+
+`possibly_resolved`
+: A topical link exists but is weak. Flagged for a person.
+
+`open`
+: Nothing matched — which is a finding, not a failure. An unanswered question is
+  one of the most useful things this layer can tell you.
+
+Resolution is **topical, not positional**. A payoff later in the episode does
+not close an earlier loop unless the two are about the same thing, and "the same
+thing" means a shared word that identifies a thread rather than a word that
+appears in every sentence.
+
+### Risk zones
+
+Thirteen detectors: `weak_hook`, `no_clear_objective`, `boring_repetition`,
+`overlong_explanation`, `dead_air`, `low_visual_change`, `confusing_transition`,
+`no_stakes`, `payoff_delayed`, `unresolved_setup`, `mid_video_slump`,
+`anticlimax`, `unclear_ending`.
+
+A detector that cannot see stays quiet. Motion probing off means every motion
+score is `0.0`, and a low-visual-change detector that did not check would fire
+on the whole episode — so it checks, and the plan's warnings say it did not run.
+
+### What may be applied without a person
+
+**A marker is always safe.** The worst case of a wrong marker is a marker in the
+wrong place.
+
+**A change to timing is safe only where the evidence was measured.** In practice
+that means dead air and nothing else: silence is a number, boredom is a
+judgement. A `speed_up_grind` suggestion is never automatic at any confidence,
+because the risk behind it was inferred.
+
+Every suggestion carries a `marker_fallback` — including the safe ones — because
+refusing to act is only useful if something still lands on the timeline for the
+person who has to decide.
+
+### The seam for later sessions
+
+Nothing consumes these suggestions yet. The seam exists so the next session does
+not have to reshape the artifact to use it:
+
+```bash
+python -m editing.cli episode export for_style.json \
+    --suggestions-for style --safe-only
+```
+
+```python
+pipeline.retention_suggestions_for("roughcut", safe_only=True)
+```
+
+A `RetentionSuggestion` carries **no Premiere operation** and never will. It
+names a range, a type, a reason, evidence, a confidence and which pass would
+have to build the operation. Sessions 3, 5 and 6 already know how to turn intent
+into operations; duplicating that here would mean two places that can put a
+caption on a timeline.
+
+Routing: `keep_setup`, `shorten_boring` and `speed_up_grind` go to the rough cut;
+the captions, cards and markers go to the style pass; `add_music_rise_marker` and
+`hold_silence_for_comedy` go to assets; `needs_human_review` goes to nobody.
+
+---
+
+## 16. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
@@ -1968,6 +2156,10 @@ data/editing/
 ├── assets/structure.placement.json ← every placeholder resolved, with reasons
 ├── assets/structure.placement.txt  ← the human-readable asset report
 ├── assets/structure.placement-execution.json
+├── episode/structure.memory.json   ← the story: beats, loops, callbacks
+├── episode/structure.memory.txt    ← the human-readable episode report
+├── episode/structure.retention.json ← risks, hooks, the peak, suggestions
+├── episode/structure.retention.txt ← the human-readable retention report
 └── auto/runs/<run_id>/            ← one self-contained folder per auto run
     ├── config.json  state.json
     ├── checkpoints/  artifacts/  reports/  logs/
@@ -1994,7 +2186,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 16. Caching
+## 17. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -2030,10 +2222,10 @@ that window.
 
 ---
 
-## 17. Tests
+## 18. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 992 tests, ~60s
+python -m pytest tests/editing -q        # 1133 tests, ~70s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -2057,6 +2249,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_style.py` | preset validation, **density ceilings**, caption selection, emphasis safety, layer guards |
 | `test_editing_assets.py` | indexing, sidecars, matching, **mixing safety**, track and import guards |
 | `test_editing_auto.py` | run state, stage ordering, **checkpoint validation**, resume, execution gates |
+| `test_editing_episode.py` | beats, open loops, risk zones, hooks, **the confidence cap**, no fake analytics |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
 
 Tests worth knowing about, because they pin the promises this layer makes:
@@ -2071,6 +2264,14 @@ Tests worth knowing about, because they pin the promises this layer makes:
   — asserted at both the plan and the CLI boundary
 - `test_premiere_mapping_is_read_only` — every op this layer issues is
   non-mutating in the catalog
+- `test_one_channel_can_never_reach_the_edit_threshold` — the episode layer's
+  "do not depend only on keywords" rule, as arithmetic rather than a habit
+- `test_no_generated_string_claims_to_know_what_viewers_will_do` — scanned over
+  every field of a full retention plan, not spot-checked
+- `test_a_timing_fix_is_never_safe_on_an_inferred_risk` — silence is measured,
+  boredom is a judgement, and only one of them may shorten a clip
+- `test_the_plan_reports_the_memorys_climax_rather_than_its_own` — two
+  artifacts, one verdict
 - `test_audio_events_survive_the_export_round_trip` — the deliverable carries
   the audio channel, not just computes with it
 - `test_dead_air_is_never_usable_however_good_the_picture` — audio can veto a
@@ -2136,6 +2337,20 @@ Tests worth knowing about, because they pin the promises this layer makes:
 ---
 
 ## Current limitations
+
+**The episode layer has never been checked against a real edit.** Its beats,
+risks and hooks are plausible on generated footage and on hand-built fixtures.
+Nobody has yet taken a finished video, read the retention plan, and said whether
+it was right. Until that happens the numbers in it are calibrated against
+intuition, not against outcomes.
+
+**Nothing consumes the retention suggestions yet.** The seam is built and
+tested; Sessions 3, 5 and 6 do not read it. A suggestion today is something you
+read, not something that changes a cut.
+
+**Character names are the weakest thing here.** They come from capitalised words
+in one channel, so every one caps below the edit threshold and arrives flagged
+for review. A name is a name because a person says so, and nothing has asked one.
 
 **Premiere transcripts.** Adobe exposes no documented API. The XMP route works
 where Premiere has run speech analysis and stored word markers; some builds and
