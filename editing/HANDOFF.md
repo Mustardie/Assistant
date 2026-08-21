@@ -1,6 +1,6 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-21 (Session 8).
+Context for continuing this work in a new chat. Updated 2026-08-21 (Session 9).
 
 ---
 
@@ -8,11 +8,15 @@ Context for continuing this work in a new chat. Updated 2026-08-21 (Session 8).
 
 ```cmd
 cd /d E:\Assistant
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1133 passed
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1228 passed
 
 REM the whole pipeline, planning only, with nothing installed:
 python -m editing.cli auto run --folder D:\Footage\test --mock --no-premiere
 python -m editing.cli auto report
+
+REM then tell it what you think of the result:
+python -m editing.cli feedback start
+python -m editing.cli feedback queue --limit 20
 ```
 
 Everything below is detail behind that.
@@ -22,7 +26,7 @@ Everything below is detail behind that.
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all eight sessions and 1133 passing editing tests.
+This has all nine sessions and 1228 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -43,7 +47,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in eight sessions
+## What was built, in nine sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -72,6 +76,11 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
      Session 8 reads the whole thing as one episode: beats, objectives, open
      loops, callbacks → risk zones, hook candidates, a peak, an ending →
      suggestions a later pass can consume. Executes nothing.
+                                                    ↓
+     Session 9 turns all of that around and asks *you*: a ranked review queue
+     over every decision → ratings, reasons, corrections, appended to a log
+     that is never rewritten → preference signals, training signals, exports.
+     Trains nothing.
 ```
 
 | Session | Package | What it added |
@@ -84,6 +93,7 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
 | 6 | `assets/` | local library, sidecars, matching, real SFX/music/graphics |
 | 7 | `auto/` | orchestration, checkpoints, resume, gated execution, reports |
 | 8 | `episode/` | story beats, open loops, retention risks, hooks, suggestions |
+| 9 | `feedback/` | the review queue, the append-only log, preference and training signals |
 
 ### Session 7 — the auto pipeline
 
@@ -135,6 +145,37 @@ to the four existing executors, each of which keeps its own guards.
 
 **Executes nothing.** No dry run, no `--yes`, no gate — there is nothing to run.
 It produces records; a later session decides what an operation looks like.
+
+### Session 9 -- the feedback collector and the human review loop
+
+- `editing/feedback/`
+  - `schema.py` -- the eleven record types, the 33 ratings with their
+    polarities, the fourteen reason categories, `NOT_MEASURED`
+  - `store.py` -- the session folder, and the append-only log
+  - `targets.py` -- the `Artifacts` bundle, and resolving one ID to the record
+    it names across every collection
+  - `queue.py` -- eight generators, dedupe, collapse, group, and the selection
+    that decides what a person is actually asked
+  - `collect.py` -- what one identifier on the command line refers to, and
+    turning a rating, note or correction into an appended item
+  - `signals.py` -- 30-odd rules reading feedback as `(dimension, direction)`
+    preferences, with disagreement counted
+  - `training.py` -- one signal per rating, usable or explicitly not, with the
+    reason on both sides
+  - `export.py` -- jsonl / json / csv, each with a manifest
+  - `report.py` -- `summary.json`, `report.md`, and five CLI views
+- `editing/config.py` -- `feedback_dir`
+- `editing/pipeline.py` -- `feedback_artifacts`, `feedback_start`,
+  `feedback_queue`, `feedback_items`, `feedback_signals`, `feedback_summary`,
+  `feedback_export`, `feedback_estimate`
+- `editing/cli.py` -- `feedback start|queue|show|rate|note|correct|list|
+  report|export|stats`
+- `editing/auto/` -- three more stages, opt-in behind `--feedback`, plus a
+  `WORTH A HUMAN LOOK` section in every run report whether or not they ran
+- `tests/editing/test_editing_feedback.py` -- 84 tests, plus 11 in the auto suite
+
+**Trains nothing, applies nothing, executes nothing.** It reads JSON other
+passes wrote and appends what a person said about it.
 
 ---
 
@@ -239,26 +280,99 @@ payoff for the "got it" inside it. That is the structural version of the Session
 is 0.0; the low-visual-change detector checks `has_motion` first rather than
 firing on the whole episode.
 
+### From Session 9
+
+**The feedback log is the only artifact in the system that cannot be
+regenerated.** Everything else under `data/editing/` is derived from the
+footage and can be rebuilt by re-running a pass; a person's afternoon of review
+cannot. That single asymmetry is the reason for every other rule in the layer:
+the log is opened in append mode in exactly one function, changing your mind
+appends a superseding item rather than editing one, `summary.json` and
+`report.md` are derived and disposable, and starting a session over one that
+holds feedback is refused even with `--force`.
+
+**A rating is only worth keeping if you can find the thing it was about.** So
+a `FeedbackTarget` names a record, and `resolve` searches every collection for
+one ID -- a reviewer who copied an ID out of the queue should not also have to
+say which pass produced it. Three states stay distinguishable on purpose:
+never looked, looked and did not find, and never had an ID. Session 10 will
+want to drop the second and keep the third.
+
+**A question has to carry what the system decided.** Feedback given without
+seeing that is feedback about the video; with it, it is feedback about the
+decision, and only the second can supervise anything. That is why a rating
+collected outside the queue on a bare time range comes out marked *unusable for
+training* with that as the reason -- it is a real opinion and not a label.
+
+**The queue is a selection problem, not a listing problem.** A pure top-N
+ranking fails three ways and each has a rule: reserved slots stop the style
+layer flooding it, a ~15% positive-sample share stops a review made entirely of
+complaints, and collapse-plus-group stops one moment being asked about six
+times. The numbers are opinions and are meant to be edited.
+
+**"Might be wrong" and "looks right" are exclusive.** An early version flagged
+a confidently placed sound effect as both `risky_automatic` and
+`positive_sample`, which is two contradictory reasons to be asked about and
+made `--no-positive` silently meaningless. Doubt wins, in `_settle_flags`. The
+same bug taught the second half: `risky_automatic` had meant "decided
+automatically", which is *every* styled item and *every* placed sound, so the
+flag was universal and carried no information. It now means decided
+automatically **and** carrying a named risk or a low confidence.
+
+**A preference about timing is never automatically safe.** Session 8's
+marker-versus-timing split, from the other side. A wrong preference about
+caption tone costs a caption nobody liked; a wrong preference about pace costs
+footage. `cut_pace` can reach any confidence and still returns false, with the
+reason recorded -- and a signal that *would* qualify says instead that nothing
+reads preference signals yet, because "the evidence supports this" and "you may
+act on it" are different sentences.
+
+**Disagreement is counted, not filtered.** A dimension you have gone both ways
+on produces one signal in the majority direction with `contradictions` and a
+lowered `agreement`, never a tidy consensus that was never there. Ties are
+broken by summed confidence and then recency; an earlier version broke them
+alphabetically, which made "more" beat "less" every time two ratings disagreed
+-- a coin toss dressed up as a finding.
+
+**An unusable training signal is emitted, with its reason.** Dropping it would
+hide what the collector is losing. "3 x the rating was 'unsure'" and "2 x the
+target could not be joined to a record" is the difference between fixing this
+layer and guessing at it.
+
+**Feedback is the only opt-*in* pass in `auto`.** Every other stage produces a
+file; this one starts a review a person then has to finish, and creating one
+nobody asked for would leave a trail of abandoned sessions. So the run report
+*estimates* how much is worth reviewing -- one cheap pass over artifacts
+already on disk -- and prints the command, rather than starting anything.
+
+**`feedback_start` is idempotent rather than resumable.** It is not resumable
+(the queue should reflect a resumed run), so a resume reaches it again -- and
+opening a second session would split one review across two logs that, being
+append-only, could never be merged. It reuses the run's existing session
+instead.
+
 ---
 
 ## Current state
 
-- **1133 editing tests**, ~60s, needing no FFmpeg, GPU, model server, Premiere
+- **1228 editing tests**, ~100s, needing no FFmpeg, GPU, model server, Premiere
   or real media
-- `tests/premiere/` passes too (1410 across both suites)
+- `tests/premiere/` passes too (277 there, 1505 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
   client) are pre-existing and unrelated
-- `editing/README.md` is the full user documentation (~2370 lines); §0 covers
-  auto mode
+- `editing/README.md` is the full user documentation (~2950 lines); §0 covers
+  auto mode and §16 covers the feedback collector
 
 **Note on running the tests here:** pytest's default temp root
 (`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
 every test errors in setup. Pass `--basetemp` at a writable path.
 
-**Verified on real footage**: `auto run` completes all eighteen stages on three
-real MP4s with real FFmpeg, in mock mode, in about a minute. The full gate
-chain (execute rough cut → resume → execute layers) is verified against a fake
-engine.
+**Verified on real footage**: `auto run` completes all stages on three real
+MP4s with real FFmpeg, in mock mode, in about a minute. The full gate chain
+(execute rough cut → resume → execute layers) is verified against a fake
+engine. Session 9 was verified end to end through the CLI against hand-built
+artifacts -- start, queue, show, rate, note, correct, list, stats, report and
+both export formats -- but **not** yet against a real review of real footage.
 
 ---
 
@@ -290,6 +404,20 @@ engine.
 13. **Character names are guesses** from capitalised words in one channel. They
     cap below the edit threshold and arrive flagged, which is the honest
     handling, not a fix.
+14. **Nothing learns from the feedback.** Session 9 collects, links and exports
+    it; no pass reads a preference signal and nothing has been trained. That is
+    Session 10's job and is the point of the whole layer.
+15. **Nobody has done a real review yet.** The queue's priorities -- the
+    reserved-slot counts, the positive-sample share, the 0.50 uncertainty line,
+    the flag boosts -- are calibrated against intuition. Twenty real reviews
+    would say whether it puts the right things first. This is now the highest-
+    value next action after the critic.
+16. **Preference extraction is keyword-assisted.** Telling "the danger caption
+    was bad" from "captions are bad" reads the item's label for words like
+    `danger_text` and `whoosh`. The general rules are structural; the specific
+    ones are heuristics, marked as such.
+17. **A preference signal is one person's**, and `scope` only distinguishes one
+    session from several. There is no notion of multiple reviewers.
 
 ---
 
@@ -320,6 +448,16 @@ features.
   `episode report` on footage whose finished edit you know, and see whether the
   risk zones match the places you actually trimmed. That is the only way to
   find out whether the thresholds mean anything.
+- **Do one real review, all the way through.** `auto run --feedback`, then
+  answer all twenty questions honestly and read `report.md`. Two things come
+  out of it that nothing else can produce: whether the queue asks about the
+  right things, and the first real material for Session 10. Expect the queue's
+  numbers to need tuning -- `RESERVED`, `POSITIVE_RATIO` and
+  `UNCERTAIN_AT_OR_BELOW` in `feedback/queue.py` are the levers.
+- **Then build the dataset (Session 10).** The seam is
+  `feedback export --include training` and `pipeline.feedback_signals`. Read
+  the `why_not` fields first: they say what this collector is losing, and
+  fixing the collector is cheaper than working around it downstream.
 
 ---
 
@@ -346,6 +484,7 @@ Useful flags on `auto run`:
 | `--no-premiere` | never talk to Premiere; every gate stays shut |
 | `--markers-only` | style and asset passes record instead of drawing/playing |
 | `--skip-review` / `--skip-assets` / `--skip-episode` | skip a whole pass |
+| `--feedback` | also open a review session and build its queue (opt-in) |
 | `--asset-library <path>` | a library other than `<model dir>/assets` |
 | `--max-windows N` | cap analysis windows per file |
 | `--force-new-run` | a fresh run even if one exists for this footage+style |
@@ -378,6 +517,27 @@ python -m editing.cli episode export for_style.json --suggestions-for style
 ```
 
 `auto run` builds both as stages 16 and 17; `--skip-episode` turns them off.
+
+Human review, which trains nothing:
+
+```cmd
+python -m editing.cli feedback start --run <run_id> --title "ep12 first pass"
+python -m editing.cli feedback queue --limit 20
+python -m editing.cli feedback show <prompt_id>
+python -m editing.cli feedback rate <prompt_id> good --reason pacing --note "clean"
+python -m editing.cli feedback rate li_danger bad --reason boring --correction "cut this shorter"
+python -m editing.cli feedback note li_danger "sits over the hotbar"
+python -m editing.cli feedback correct p_0 "move it later" --seconds 2
+python -m editing.cli feedback list --follow-up
+python -m editing.cli feedback stats --preferences
+python -m editing.cli feedback report
+python -m editing.cli feedback export dataset.jsonl
+```
+
+The first argument to `rate` is a prompt ID, any record ID from any artifact, a
+range like `120-155`, or `whole`. Sessions live in
+`data/editing/feedback/sessions/<id>/`, and `feedback.jsonl` there is the only
+file in the whole system that is never rewritten.
 
 The stage-by-stage commands from Sessions 1–6 all still work unchanged, and
 `auto` is a thin layer over them — anything it does can be done by hand, and

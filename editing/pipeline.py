@@ -40,6 +40,18 @@ from editing.episode import plan as episode_plan_module
 from editing.episode import report as episode_report
 from editing.episode.schema import EpisodeMemory, EpisodeRetentionPlan
 from editing.errors import EditingError, FootageError
+from editing.feedback import collect as feedback_collect
+from editing.feedback import export as feedback_export
+from editing.feedback import queue as feedback_queue_module
+from editing.feedback import report as feedback_report
+from editing.feedback import signals as feedback_signals
+from editing.feedback import store as feedback_store
+from editing.feedback import targets as feedback_targets
+from editing.feedback import training as feedback_training
+from editing.feedback.schema import (
+    FeedbackItem, FeedbackSession, PreferenceSignal, ReviewQueue,
+    TrainingSignal,
+)
 from editing.fingerprint import fingerprint
 from editing.premiere_link import ProjectSnapshot
 from editing.recommend import report as report_module
@@ -1767,6 +1779,269 @@ class Pipeline:
         wanted = plan.suggestions_for(stage)
         return [item for item in wanted if item.auto_safe] if safe_only \
             else wanted
+
+    # ------------------------------------------------------------------
+    # Feedback collection and the human review loop (Session 9)
+    # ------------------------------------------------------------------
+    #
+    # Nothing here executes anything, and nothing here trains anything. It
+    # reads the artifacts the earlier passes wrote, asks a person about the
+    # decisions in them, and appends what they said to a log that is never
+    # rewritten. The only thing this layer produces that a later session will
+    # consume is ``exports/`` -- everything else is for the person reviewing.
+
+    def feedback_artifacts(
+        self, *, name: str = "structure", run_id: str = "", style: str = "",
+    ) -> feedback_targets.Artifacts:
+        """Load whatever the earlier passes left, and record what is missing.
+
+        Every load is opportunistic. Reviewing a rough cut before the critic
+        has ever run is a reasonable thing to want, so an absent artifact is
+        recorded in ``sources`` rather than raised -- the queue then says which
+        passes it could not ask about, instead of implying they were fine.
+        """
+        artifacts = feedback_targets.Artifacts(
+            name=name,
+            style=style,
+            run_id=run_id,
+            artifact_root=str(self.config.output_dir),
+        )
+        for field_name, loader in (
+            ("timeline", lambda: self.load_timeline(name=name)),
+            ("recommendations", lambda: self.load_recommendations(name=name)),
+            ("roughcut", lambda: self.load_rough_cut(name=name)),
+            ("critique", lambda: self.load_critique(name=name)),
+            ("revisions", lambda: self.load_revisions(name=name)),
+            ("layers", lambda: self.load_layers(name=name)),
+            ("asset_plan", lambda: self.load_asset_plan(name=name)),
+            ("memory", lambda: self.load_episode_memory(name=name)),
+            ("retention", lambda: self.load_retention_plan(name=name)),
+        ):
+            try:
+                setattr(artifacts, field_name, loader())
+            except EditingError:
+                continue          # absent, and ``sources`` will say so
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                # Present but unreadable is a different problem from absent,
+                # and the reviewer needs to know which one they have.
+                artifacts.warnings.append(
+                    f"{field_name} exists but could not be read: {error}"
+                )
+        if not artifacts.style and artifacts.layers is not None:
+            artifacts.style = getattr(artifacts.layers, "style", "")
+        return artifacts
+
+    def feedback_start(
+        self,
+        *,
+        name: str = "structure",
+        run_id: str = "",
+        session_id: str = "",
+        title: str = "",
+        notes: str = "",
+        limit: int = feedback_queue_module.DEFAULT_LIMIT,
+        build_queue: bool = True,
+        force: bool = False,
+        artifacts: Optional[feedback_targets.Artifacts] = None,
+    ) -> tuple[FeedbackSession, Optional[ReviewQueue]]:
+        """Open a review session and, unless told not to, build its queue."""
+        if artifacts is None:
+            artifacts = self.feedback_artifacts(name=name, run_id=run_id)
+        session = feedback_collect.start_session(
+            self.config, artifacts, run_id=run_id, session_id=session_id,
+            title=title, notes=notes, force=force,
+        )
+        self.say(f"Feedback session {session.session_id} started.")
+        self.say(f"  reviewing : {session.sequence_name or '(no rough cut)'} "
+                 f"({session.duration:.0f}s, timebase {session.timebase})")
+        for warning in session.warnings:
+            self.say(f"  ! {warning}")
+
+        queue = None
+        if build_queue:
+            queue = self.feedback_queue(
+                session=session, artifacts=artifacts, limit=limit)
+        self.say(
+            "  saved to  : "
+            f"{feedback_store.session_dir(self.config, session.session_id)}"
+        )
+        return session, queue
+
+    def feedback_queue(
+        self,
+        *,
+        session: Optional[FeedbackSession] = None,
+        session_id: str = "",
+        name: str = "structure",
+        artifacts: Optional[feedback_targets.Artifacts] = None,
+        limit: int = feedback_queue_module.DEFAULT_LIMIT,
+        categories: Sequence[str] = (),
+        sources: Sequence[str] = (),
+        include_positive: bool = True,
+        save: bool = True,
+    ) -> ReviewQueue:
+        """Build the review queue and mark what already has feedback.
+
+        Regenerating a queue is always allowed -- it holds no feedback -- and
+        the previous one is kept beside it, because a rating references a
+        prompt ID and that question has to stay readable afterwards.
+        """
+        if session is None:
+            session = feedback_store.resolve_session(self.config, session_id)
+        if artifacts is None:
+            artifacts = self.feedback_artifacts(
+                name=session.name or name, run_id=session.run_id,
+                style=session.style,
+            )
+        queue = feedback_queue_module.build(
+            artifacts,
+            session_id=session.session_id,
+            run_id=session.run_id,
+            limit=limit,
+            categories=categories,
+            sources=sources,
+            include_positive=include_positive,
+        )
+        feedback_collect.mark_answered(
+            queue,
+            feedback_store.read_current(self.config, session.session_id),
+        )
+        stats = queue.stats()
+        self.say(
+            f"Review queue: {stats['prompts']} question(s) from "
+            f"{stats['candidates']} candidate(s), in {stats['groups']} group(s)."
+        )
+        for warning in queue.warnings:
+            self.say(f"  ! {warning}")
+        if save:
+            feedback_store.write_queue(self.config, session.session_id, queue)
+        return queue
+
+    def feedback_session(
+        self, session_id: str = "", *, run_id: str = ""
+    ) -> FeedbackSession:
+        return feedback_store.resolve_session(
+            self.config, session_id, run_id=run_id)
+
+    def feedback_items(
+        self, session: FeedbackSession, *, current_only: bool = True
+    ) -> list[FeedbackItem]:
+        return (
+            feedback_store.read_current(self.config, session.session_id)
+            if current_only
+            else feedback_store.read_all(self.config, session.session_id)
+        )
+
+    def feedback_signals(
+        self, session: FeedbackSession, *, current_only: bool = True
+    ) -> tuple[list[PreferenceSignal], list[TrainingSignal]]:
+        """Preference and training signals for one session.
+
+        Derived on every call rather than stored, so they can never disagree
+        with the log they came from. Neither is applied to anything.
+        """
+        items = self.feedback_items(session, current_only=current_only)
+        preferences = feedback_signals.extract(items, style=session.style)
+        queue = feedback_store.queue_or_none(self.config, session.session_id)
+        prompts = {
+            prompt.prompt_id: prompt
+            for prompt in (queue.prompts if queue else ())
+        }
+        # A prompt may have been superseded by a later queue; look those up
+        # individually so an answered question is never lost to a regenerate.
+        for item in items:
+            if item.prompt_id and item.prompt_id not in prompts:
+                found = feedback_store.find_prompt(
+                    self.config, session.session_id, item.prompt_id)
+                if found is not None:
+                    prompts[item.prompt_id] = found
+        training = feedback_training.extract(
+            items, prompts=prompts, timebase=session.timebase)
+        return preferences, training
+
+    def feedback_summary(
+        self, session: FeedbackSession, *, save: bool = True
+    ) -> dict:
+        """The whole picture of a session, as data. Regenerated every time."""
+        history = feedback_store.read_all(self.config, session.session_id)
+        current = feedback_store.current_of(history)
+        preferences, training = self.feedback_signals(session)
+        summary = feedback_report.build_summary(
+            session,
+            history=history,
+            current=current,
+            preferences=preferences,
+            training=training,
+            queue=feedback_store.queue_or_none(
+                self.config, session.session_id),
+            problems=feedback_store.read_problems(
+                self.config, session.session_id),
+        )
+        if save:
+            feedback_collect.refresh_counts(self.config, session)
+            summary["session"] = session.to_dict()
+            feedback_store.write_summary(
+                self.config, session.session_id, summary)
+            feedback_store.write_report(
+                self.config, session.session_id,
+                feedback_report.render_report(summary),
+            )
+        return summary
+
+    def feedback_export(
+        self,
+        session: FeedbackSession,
+        *,
+        parts: Sequence[str] = ("feedback", "preferences", "training"),
+        fmt: str = "jsonl",
+        out: Optional[str] = None,
+        current_only: bool = True,
+        training_only: bool = False,
+    ) -> tuple[Path, object]:
+        """Write an export and its manifest. Never overwrites an earlier one."""
+        items = self.feedback_items(session, current_only=current_only)
+        if training_only:
+            items = [item for item in items if item.usable_for_training]
+        preferences, training = self.feedback_signals(
+            session, current_only=current_only)
+        body, record = feedback_export.build(
+            parts=parts,
+            fmt=fmt,
+            items=items,
+            preferences=preferences,
+            training=training,
+            queue=feedback_store.queue_or_none(
+                self.config, session.session_id),
+            session=session.to_dict(),
+            filters={
+                "current_only": bool(current_only),
+                "training_only": bool(training_only),
+            },
+        )
+        # The session always keeps its own copy and manifest, so an export
+        # written somewhere else is still recorded where the review lives.
+        kept, record = feedback_store.write_export(
+            self.config, session.session_id, body=body, record=record,
+            filename=feedback_export.default_filename(
+                record.format, record.parts),
+        )
+        target = kept
+        if out:
+            target = Path(out)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+            record.path = str(target)
+        self.say(f"Exported {record.total_rows} row(s) to {target}")
+        return target, record
+
+    def feedback_estimate(self, *, name: str = "structure") -> dict:
+        """How much would be worth reviewing, without starting a session.
+
+        The auto report calls this so it can say "34 things are worth looking
+        at" without creating a review nobody asked for.
+        """
+        return feedback_queue_module.estimate(
+            self.feedback_artifacts(name=name))
 
     # ------------------------------------------------------------------
     # Whole run

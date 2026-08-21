@@ -28,6 +28,9 @@ Commands, in the order a session normally uses them::
     episode     build-memory | plan-retention | report | show-beats |
                 show-risks | show-hooks | show-open-loops | show-callbacks |
                 export   -- the story the footage tells, and where it sags
+    feedback    start | queue | show | rate | note | correct | list |
+                report | export | stats   -- structured human review of an
+                edit, appended to a log that is never rewritten
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -63,6 +66,11 @@ from editing.auto import report as auto_report
 from editing.auto import store as auto_store
 from editing.episode import report as episode_report
 from editing.episode import schema as episode_schema
+from editing.feedback import collect as feedback_collect
+from editing.feedback import queue as feedback_queue_module
+from editing.feedback import report as feedback_report
+from editing.feedback import schema as feedback_schema
+from editing.feedback import store as feedback_store
 from editing.auto.runner import AutoRunner
 from editing.auto.schema import AutoRunConfig
 from editing.assets.compile import AssetOptions
@@ -149,6 +157,35 @@ def _pipeline(args) -> Pipeline:
     )
     return build_pipeline(
         config, sampling, audio,
+        say=_reporter(args),
+        use_cache=not getattr(args, "no_cache", False),
+    )
+
+
+def _feedback_pipeline(args) -> Pipeline:
+    """The pipeline a ``feedback`` command should use.
+
+    ``--run <id>`` scopes it to that run's own artifacts, because each auto run
+    is hermetic and its review belongs beside the plans it is about. Without a
+    run, the shared output directory is reviewed, which is what the
+    stage-by-stage commands write to.
+    """
+    pipeline = _pipeline(args)
+    run_id = getattr(args, "run", "") or ""
+    if not run_id:
+        return pipeline
+
+    directory = auto_store.run_dir(pipeline.config, run_id)
+    if not directory.exists():
+        raise EditingError(
+            f"No auto run called '{run_id}'",
+            hint="List them with `python -m editing.cli auto list-runs`, or "
+                 "drop --run to review the shared output directory.",
+            detail={"path": str(directory)},
+        )
+    return build_pipeline(
+        auto_store.run_config(pipeline.config, run_id),
+        _sampling_from(args), _audio_from(args),
         say=_reporter(args),
         use_cache=not getattr(args, "no_cache", False),
     )
@@ -1622,6 +1659,7 @@ def _auto_config(args) -> AutoRunConfig:
         skip_review=getattr(args, "skip_review", False),
         skip_assets=getattr(args, "skip_assets", False),
         skip_episode=getattr(args, "skip_episode", False),
+        feedback=getattr(args, "feedback", False),
     )
 
 
@@ -2014,6 +2052,303 @@ def cmd_episode(args) -> int:
         return EXIT_OK
 
     raise EditingError("Unknown episode command")
+
+
+def cmd_feedback(args) -> int:
+    """Collect structured human review of an edit.
+
+    Ten subcommands, none of which touches Premiere, trains anything, or
+    rewrites a single line of an existing log. Everything that records
+    something appends; everything else reads or derives.
+    """
+    pipeline = _feedback_pipeline(args)
+    command = args.feedback_command
+    name = getattr(args, "name", "structure")
+    session_id = getattr(args, "session", "") or ""
+
+    if command == "start":
+        session, queue = pipeline.feedback_start(
+            name=name,
+            run_id=getattr(args, "run", "") or "",
+            session_id=getattr(args, "id", "") or "",
+            title=getattr(args, "title", "") or "",
+            notes=getattr(args, "notes", "") or "",
+            limit=args.limit,
+            build_queue=not getattr(args, "no_queue", False),
+            force=getattr(args, "force", False),
+        )
+        if args.json:
+            _emit({
+                "success": True,
+                "session": session.to_dict(),
+                "queue": queue.to_dict() if queue else None,
+            })
+            return EXIT_OK
+        print(f"Feedback session: {session.session_id}")
+        print(f"  folder: "
+              f"{feedback_store.session_dir(pipeline.config, session.session_id)}")
+        if queue is not None:
+            print()
+            print(feedback_report.render_queue(queue, limit=args.limit))
+            print()
+            print("Rate the first one with:")
+            first = queue.prompts[0] if queue.prompts else None
+            if first is not None:
+                print(f"  python -m editing.cli feedback rate "
+                      f"{first.prompt_id} good --reason {first.category}")
+        return EXIT_OK
+
+    if command == "queue":
+        session = pipeline.feedback_session(
+            session_id, run_id=getattr(args, "run", "") or "")
+        saved = feedback_store.queue_or_none(
+            pipeline.config, session.session_id)
+        # A different --limit means a different *queue*, not a different slice
+        # of one: the selection is what makes a short queue worth reading, so
+        # asking for twelve questions has to re-select rather than print twelve
+        # of the twenty that were chosen for a bigger budget.
+        wants_rebuild = (
+            getattr(args, "regenerate", False)
+            or saved is None
+            or saved.limit != args.limit
+            or bool(_split(getattr(args, "category", "")))
+            or bool(_split(getattr(args, "source", "")))
+            or getattr(args, "no_positive", False)
+        )
+        if wants_rebuild:
+            queue = pipeline.feedback_queue(
+                session=session,
+                limit=args.limit,
+                categories=_split(getattr(args, "category", "")),
+                sources=_split(getattr(args, "source", "")),
+                include_positive=not getattr(args, "no_positive", False),
+            )
+        else:
+            queue = saved
+            feedback_collect.mark_answered(
+                queue, pipeline.feedback_items(session))
+        if getattr(args, "unanswered", False):
+            queue.prompts = [p for p in queue.prompts if not p.answered]
+        if args.json:
+            _emit({"success": True, **queue.to_dict()})
+            return EXIT_OK
+        print(feedback_report.render_queue(queue, limit=args.limit))
+        return EXIT_OK
+
+    if command == "show":
+        session = pipeline.feedback_session(session_id)
+        history = feedback_store.read_all(pipeline.config, session.session_id)
+        prompt = feedback_store.find_prompt(
+            pipeline.config, session.session_id, args.id)
+        if prompt is not None:
+            about = [
+                item for item in history
+                if item.prompt_id == prompt.prompt_id
+                or item.target.key() == prompt.target.key()
+            ]
+            if args.json:
+                _emit({
+                    "success": True,
+                    "prompt": prompt.to_dict(),
+                    "feedback": [item.to_dict() for item in about],
+                })
+                return EXIT_OK
+            print(feedback_report.render_prompt(prompt, history=about))
+            return EXIT_OK
+
+        item = feedback_store.find_item(history, args.id)
+        if item is None:
+            raise EditingError(
+                f"Nothing in session '{session.session_id}' is called "
+                f"'{args.id}'",
+                hint="Pass a prompt ID from `feedback queue` or a feedback ID "
+                     "from `feedback list`.",
+            )
+        related = feedback_store.history_of(history, item.target.key())
+        if args.json:
+            _emit({
+                "success": True,
+                "feedback": item.to_dict(),
+                "history": [entry.to_dict() for entry in related],
+            })
+            return EXIT_OK
+        print(feedback_report.render_item(item, history=related))
+        return EXIT_OK
+
+    if command in ("rate", "note", "correct"):
+        session = pipeline.feedback_session(
+            session_id, run_id=getattr(args, "run", "") or "")
+        artifacts = pipeline.feedback_artifacts(
+            name=session.name or name, run_id=session.run_id,
+            style=session.style,
+        )
+        strict = not getattr(args, "allow_unknown", False)
+
+        if command == "rate":
+            item = feedback_collect.rate(
+                pipeline.config, session, artifacts, args.id, args.rating,
+                reasons=_split(getattr(args, "reason", "")),
+                note=getattr(args, "note", "") or "",
+                correction=getattr(args, "correction", "") or "",
+                correction_action=getattr(args, "action", "") or "",
+                correction_seconds=getattr(args, "seconds", None),
+                priority=getattr(args, "priority", None),
+                confidence=getattr(args, "confidence", None),
+                target_type=getattr(args, "target_type", "") or "",
+                usable_for_training=(
+                    False if getattr(args, "no_training", False) else None),
+                needs_follow_up=getattr(args, "follow_up", False),
+                strict=strict,
+            )
+        elif command == "note":
+            item = feedback_collect.add_note(
+                pipeline.config, session, artifacts, args.id, args.text,
+                reasons=_split(getattr(args, "reason", "")),
+                target_type=getattr(args, "target_type", "") or "",
+                strict=strict,
+            )
+        else:
+            item = feedback_collect.add_correction(
+                pipeline.config, session, artifacts, args.id, args.text,
+                action=getattr(args, "action", "") or "",
+                seconds=getattr(args, "seconds", None),
+                start=getattr(args, "start", 0.0) or 0.0,
+                end=getattr(args, "end", 0.0) or 0.0,
+                target_type=getattr(args, "target_type", "") or "",
+                strict=strict,
+            )
+
+        feedback_collect.refresh_counts(pipeline.config, session)
+        if args.json:
+            _emit({"success": True, **item.to_dict()})
+            return EXIT_OK
+        print(f"Recorded {item.feedback_id}")
+        print(f"  {item.summary}")
+        if item.supersedes:
+            print(f"  replaces {item.supersedes} (both stay in the log)")
+        if not item.usable_for_training:
+            print(f"  not training material: {item.training_note}")
+        if item.needs_follow_up:
+            print(f"  needs follow-up: {item.follow_up_note}")
+        return EXIT_OK
+
+    if command == "list":
+        if getattr(args, "sessions", False):
+            sessions = feedback_store.list_sessions(
+                pipeline.config, limit=args.limit)
+            if args.json:
+                _emit({
+                    "success": True,
+                    "sessions": [item.to_dict() for item in sessions],
+                })
+                return EXIT_OK
+            print(feedback_report.render_sessions(sessions))
+            return EXIT_OK
+
+        session = pipeline.feedback_session(session_id)
+        items = pipeline.feedback_items(
+            session, current_only=not getattr(args, "history", False))
+        items = feedback_collect.filtered(
+            items,
+            ratings=_split(getattr(args, "rating", "")),
+            categories=_split(getattr(args, "category", "")),
+            target_types=_split(getattr(args, "target_type", "")),
+            needs_follow_up=getattr(args, "follow_up", False),
+            training_only=getattr(args, "training_only", False),
+        )
+        if args.json:
+            _emit({
+                "success": True,
+                "session_id": session.session_id,
+                "feedback": [item.to_dict() for item in items],
+            })
+            return EXIT_OK
+        print(feedback_report.render_list(items, limit=args.limit))
+        return EXIT_OK
+
+    if command == "report":
+        session = pipeline.feedback_session(
+            session_id, run_id=getattr(args, "run", "") or "")
+        summary = pipeline.feedback_summary(
+            session, save=not getattr(args, "no_save", False))
+        if args.json:
+            _emit({"success": True, **summary})
+            return EXIT_OK
+        print(feedback_report.render_report(summary, limit=args.limit))
+        if not getattr(args, "no_save", False):
+            _note(f"Wrote "
+                  f"{feedback_store.report_path(pipeline.config, session.session_id)}")
+        return EXIT_OK
+
+    if command == "stats":
+        session = pipeline.feedback_session(session_id)
+        summary = pipeline.feedback_summary(session, save=False)
+        if args.json:
+            _emit({
+                "success": True,
+                "session_id": session.session_id,
+                "counts": summary.get("counts", {}),
+                "coverage": summary.get("coverage", {}),
+                "preferences": {
+                    key: value
+                    for key, value in summary.get("preferences", {}).items()
+                    if key != "items"
+                },
+                "training": {
+                    key: value
+                    for key, value in summary.get("training", {}).items()
+                    if key != "items"
+                },
+                "basis": feedback_schema.NOT_MEASURED,
+            })
+            return EXIT_OK
+        print(feedback_report.render_stats(summary))
+        if getattr(args, "preferences", False):
+            print()
+            signals, _training = pipeline.feedback_signals(session)
+            print(feedback_report.render_preferences(signals, limit=args.limit))
+        return EXIT_OK
+
+    if command == "export":
+        session = pipeline.feedback_session(
+            session_id, run_id=getattr(args, "run", "") or "")
+        parts = _split(getattr(args, "include", "")) or [
+            "feedback", "preferences", "training"]
+        target, record = pipeline.feedback_export(
+            session,
+            parts=parts,
+            fmt=args.format,
+            out=getattr(args, "out", "") or None,
+            current_only=not getattr(args, "history", False),
+            training_only=getattr(args, "training_only", False),
+        )
+        if args.json:
+            _emit({"success": True, "path": str(target), **record.to_dict()})
+            return EXIT_OK
+        print(f"Wrote {target}")
+        print(f"  {record.total_rows} row(s): "
+              + ", ".join(f"{key} {value}"
+                          for key, value in record.counts.items() if value))
+        print(f"  checksum {record.checksum}")
+        if record.notes:
+            print(f"  note: {record.notes}")
+        return EXIT_OK
+
+    raise EditingError("Unknown feedback command")
+
+
+def _split(value) -> list:
+    """``--reason pacing,story`` or a repeated flag, as a flat list."""
+    if not value:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    out = []
+    for item in items:
+        for piece in str(item).replace(";", ",").split(","):
+            piece = piece.strip()
+            if piece and piece not in out:
+                out.append(piece)
+    return out
 
 
 def _retention_or_none(pipeline: Pipeline, name: str):
@@ -3049,6 +3384,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="skip the critic pass entirely")
     au_run.add_argument("--skip-episode", action="store_true",
                         help="skip the episode memory and retention planner")
+    au_run.add_argument(
+        "--feedback", action="store_true",
+        help="open a review session and build its queue at the end of the run "
+             "(off by default: it starts a review a person has to finish)")
     au_run.add_argument("--skip-assets", action="store_true",
                         help="skip the asset pass entirely")
     au_run.add_argument("--force-new-run", action="store_true",
@@ -3233,6 +3572,197 @@ def build_parser() -> argparse.ArgumentParser:
                            ep_hooks, ep_loops, ep_calls):
         episode_parser.set_defaults(func=cmd_episode)
 
+
+    # -- feedback ---------------------------------------------------------
+    feedback = subparsers.add_parser(
+        "feedback",
+        help="structured human review of an edit (collects only: it trains "
+             "nothing and executes nothing)",
+    )
+    feedback_subs = feedback.add_subparsers(
+        dest="feedback_command", required=True)
+
+    def _add_feedback_common(parser: argparse.ArgumentParser) -> None:
+        # On every subcommand rather than only the ones that create things:
+        # an auto run's review lives inside that run's artifacts, so reading it
+        # back needs the same scoping that writing it did.
+        if not any(action.dest == "run" for action in parser._actions):
+            parser.add_argument(
+                "--run", default="",
+                help="scope to one auto run's artifacts and its review")
+        parser.add_argument(
+            "--session", default="",
+            help="which feedback session (default: the most recent)")
+        parser.add_argument(
+            "--limit", type=int, default=feedback_queue_module.DEFAULT_LIMIT,
+            help="how many items to print")
+        _add_common(parser)
+
+    def _add_target_flags(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--target-type", default="", choices=[""] + list(
+                feedback_schema.TARGET_TYPES),
+            help="narrow the ID search to one kind of record")
+        parser.add_argument(
+            "--allow-unknown", action="store_true",
+            help="keep the feedback even when the ID matches no record; it is "
+                 "flagged unresolved rather than refused")
+
+    fb_start = feedback_subs.add_parser(
+        "start",
+        help="open a review session over the current artifacts and build its "
+             "queue",
+    )
+    fb_start.add_argument("--run", default="",
+                          help="the auto run this review is about")
+    fb_start.add_argument("--name", default="structure",
+                          help="which timeline to review")
+    fb_start.add_argument("--id", default="",
+                          help="session ID to use (default: generated)")
+    fb_start.add_argument("--title", default="",
+                          help="what this sitting is about")
+    fb_start.add_argument("--notes", default="")
+    fb_start.add_argument("--no-queue", action="store_true",
+                          help="open the session without building a queue")
+    fb_start.add_argument(
+        "--force", action="store_true",
+        help="reuse an existing session folder, but only while it is empty; "
+             "feedback is never overwritten")
+    _add_feedback_common(fb_start)
+
+    fb_queue = feedback_subs.add_parser(
+        "queue", help="what is worth reviewing, ranked and grouped")
+    fb_queue.add_argument("--run", default="")
+    fb_queue.add_argument("--name", default="structure")
+    fb_queue.add_argument(
+        "--category", default=None, action="append",
+        help="only questions in this reason category (repeatable)")
+    fb_queue.add_argument(
+        "--source", default=None, action="append",
+        help="only questions from this pass: "
+             + ", ".join(feedback_schema.PROMPT_SOURCES))
+    fb_queue.add_argument("--regenerate", action="store_true",
+                          help="rebuild the queue rather than reading it back")
+    fb_queue.add_argument("--unanswered", action="store_true",
+                          help="hide questions that already have feedback")
+    fb_queue.add_argument("--no-positive", action="store_true",
+                          help="leave out the sample of good decisions")
+    _add_feedback_common(fb_queue)
+
+    fb_show = feedback_subs.add_parser(
+        "show", help="one queue question, or one recorded rating, in full")
+    fb_show.add_argument("id", help="a prompt ID or a feedback ID")
+    _add_feedback_common(fb_show)
+
+    fb_rate = feedback_subs.add_parser(
+        "rate", help="record a rating against a decision")
+    fb_rate.add_argument(
+        "id",
+        help="a prompt ID, a record ID, a range like 120-155, or 'whole'")
+    fb_rate.add_argument("rating", help="one of: " + ", ".join(
+        feedback_schema.RATINGS))
+    fb_rate.add_argument(
+        "--reason", default=None, action="append",
+        help="a reason category (repeatable): "
+             + ", ".join(feedback_schema.REASON_CATEGORIES))
+    fb_rate.add_argument("--note", default="", help="anything worth saying")
+    fb_rate.add_argument("--correction", default="",
+                         help="what you would have done instead")
+    fb_rate.add_argument(
+        "--action", default="", choices=[""] + list(
+            feedback_schema.CORRECTION_ACTIONS),
+        help="the correction's action, if the text should not be guessed from")
+    fb_rate.add_argument("--seconds", type=float, default=None,
+                         help="how much, for a correction that has a size")
+    fb_rate.add_argument("--priority", type=float, default=None,
+                         help="how much this matters to you, 0-1")
+    fb_rate.add_argument("--confidence", type=float, default=None,
+                         help="how sure you are, 0-1 (default 0.7)")
+    fb_rate.add_argument("--no-training", action="store_true",
+                         help="keep this out of any future training data")
+    fb_rate.add_argument("--follow-up", action="store_true",
+                         help="mark it as needing another look")
+    fb_rate.add_argument("--run", default="")
+    _add_target_flags(fb_rate)
+    _add_feedback_common(fb_rate)
+
+    fb_note = feedback_subs.add_parser(
+        "note", help="attach an observation with no verdict")
+    fb_note.add_argument("id")
+    fb_note.add_argument("text")
+    fb_note.add_argument("--reason", default=None, action="append")
+    fb_note.add_argument("--run", default="")
+    _add_target_flags(fb_note)
+    _add_feedback_common(fb_note)
+
+    fb_correct = feedback_subs.add_parser(
+        "correct", help="say what you would have done instead")
+    fb_correct.add_argument("id")
+    fb_correct.add_argument("text", help='for example: "cut this shorter"')
+    fb_correct.add_argument(
+        "--action", default="", choices=[""] + list(
+            feedback_schema.CORRECTION_ACTIONS))
+    fb_correct.add_argument("--seconds", type=float, default=None,
+                            help="how much, signed")
+    fb_correct.add_argument("--start", type=float, default=0.0)
+    fb_correct.add_argument("--end", type=float, default=0.0)
+    fb_correct.add_argument("--run", default="")
+    _add_target_flags(fb_correct)
+    _add_feedback_common(fb_correct)
+
+    fb_list = feedback_subs.add_parser(
+        "list", help="what has been said, or which sessions exist")
+    fb_list.add_argument("--sessions", action="store_true",
+                         help="list sessions instead of feedback")
+    fb_list.add_argument("--history", action="store_true",
+                         help="include superseded ratings")
+    fb_list.add_argument("--rating", default=None, action="append")
+    fb_list.add_argument("--category", default=None, action="append")
+    fb_list.add_argument("--target-type", default=None, action="append")
+    fb_list.add_argument("--follow-up", action="store_true",
+                         help="only the ones still needing something")
+    fb_list.add_argument("--training-only", action="store_true",
+                         help="only the ones usable as training material")
+    _add_feedback_common(fb_list)
+
+    fb_report = feedback_subs.add_parser(
+        "report", help="the session report: limits, what was said, signals")
+    fb_report.add_argument("--run", default="")
+    fb_report.add_argument("--no-save", action="store_true",
+                           help="print without writing summary.json/report.md")
+    _add_feedback_common(fb_report)
+
+    fb_stats = feedback_subs.add_parser(
+        "stats", help="the numbers, without the prose")
+    fb_stats.add_argument("--preferences", action="store_true",
+                          help="also print the preference signals")
+    _add_feedback_common(fb_stats)
+
+    fb_export = feedback_subs.add_parser(
+        "export", help="write the feedback out for a dataset builder")
+    fb_export.add_argument("out", nargs="?", default="",
+                           help="where to write it (default: inside the "
+                                "session's exports/ folder)")
+    fb_export.add_argument(
+        "--format", default="jsonl",
+        choices=list(feedback_schema.EXPORT_FORMATS),
+        help="jsonl for a dataset builder, json for a person, csv for a "
+             "spreadsheet (lossy)")
+    fb_export.add_argument(
+        "--include", default=None, action="append",
+        help="which parts (repeatable): "
+             + ", ".join(feedback_schema.EXPORT_PARTS))
+    fb_export.add_argument("--history", action="store_true",
+                           help="include superseded ratings")
+    fb_export.add_argument("--training-only", action="store_true",
+                           help="only ratings usable as training material")
+    fb_export.add_argument("--run", default="")
+    _add_feedback_common(fb_export)
+
+    for feedback_parser in (fb_start, fb_queue, fb_show, fb_rate, fb_note,
+                            fb_correct, fb_list, fb_report, fb_stats,
+                            fb_export):
+        feedback_parser.set_defaults(func=cmd_feedback)
 
     # -- show / export --------------------------------------------------
     show = subparsers.add_parser("show", help="print a built timeline")
