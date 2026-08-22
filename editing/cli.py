@@ -6,6 +6,8 @@ Commands, in the order a session normally uses them::
 
     discover    find footage and map it to the open Premiere project
     transcript  status | pull | import   -- Premiere Speech to Text, or a file
+    transcribe  file | folder | status | show | export | clear-cache
+                -- local faster-whisper speech to text, no cloud, no upload
     analyze     run Qwen3-VL over sampled windows
     timeline    combine events and transcripts into the structure timeline
     show        print a built timeline (table or JSON)
@@ -77,6 +79,9 @@ from editing.assets.compile import AssetOptions
 from editing.assets.place import PlacementLimits
 from editing.style import presets as style_presets, report as layers_report
 from editing.style.compile import CompileOptions
+from editing.transcribe import formats as transcribe_formats
+from editing.transcribe import schema as transcribe_schema
+from editing.transcribe import store as transcribe_store
 from editing.transcripts import premiere_source
 from editing.visual import qwen
 
@@ -1660,6 +1665,10 @@ def _auto_config(args) -> AutoRunConfig:
         skip_assets=getattr(args, "skip_assets", False),
         skip_episode=getattr(args, "skip_episode", False),
         feedback=getattr(args, "feedback", False),
+        transcribe=getattr(args, "transcribe", False),
+        transcribe_model=getattr(args, "transcribe_model", "") or "",
+        transcribe_language=getattr(args, "transcribe_language", "") or "",
+        transcribe_backend=getattr(args, "transcribe_backend", "") or "",
     )
 
 
@@ -2052,6 +2061,193 @@ def cmd_episode(args) -> int:
         return EXIT_OK
 
     raise EditingError("Unknown episode command")
+
+
+def cmd_transcribe(args) -> int:
+    """Produce transcripts locally with faster-whisper.
+
+    Six subcommands. Nothing here touches Premiere, and nothing leaves the
+    machine -- the model runs locally through CTranslate2.
+    """
+    pipeline = _pipeline(args)
+    command = args.transcribe_command
+
+    settings = pipeline.transcription_config(
+        backend=getattr(args, "backend_name", None),
+        model=getattr(args, "model_size", None),
+        device=getattr(args, "device", None),
+        compute_type=getattr(args, "compute_type", None),
+        language=getattr(args, "language", None),
+        beam_size=getattr(args, "beam_size", None),
+        vad_filter=(False if getattr(args, "no_vad", False) else None),
+        word_timestamps=_word_timestamps_from(args),
+        initial_prompt=getattr(args, "prompt", None),
+        use_cache=(False if getattr(args, "no_cache", False) else None),
+    )
+
+    if command == "status":
+        health = pipeline.transcribe_status(settings)
+        jobs = pipeline.transcription_jobs(limit=args.limit)
+        if args.json:
+            _emit({
+                "success": True,
+                "health": health,
+                "settings": settings.to_dict(),
+                "jobs": [job.to_dict() for job in jobs],
+            })
+            return EXIT_OK
+        print(_render_transcribe_status(health, settings, jobs))
+        return EXIT_OK
+
+    if command == "file":
+        job = pipeline.transcribe_file(
+            args.path,
+            settings=settings,
+            force=getattr(args, "force", False),
+            extract_audio=getattr(args, "extract_audio", False),
+            publish=not getattr(args, "no_publish", False),
+        )
+        if args.json:
+            _emit({"success": True, **job.to_dict()})
+            return EXIT_OK
+        if job.result is not None:
+            print(transcribe_formats.render_report(job.result, limit=args.limit))
+            print()
+        print(f"Job {job.job_id} [{job.status}] -> {job.output_dir}")
+        return EXIT_OK
+
+    if command == "folder":
+        batch = pipeline.transcribe_folder(
+            args.path,
+            settings=settings,
+            recursive=not getattr(args, "no_recursive", False),
+            force=getattr(args, "force", False),
+            extract_audio=getattr(args, "extract_audio", False),
+            skip_existing=not getattr(args, "redo_existing", False),
+            publish=not getattr(args, "no_publish", False),
+            limit=getattr(args, "max_files", 0) or 0,
+        )
+        if args.json:
+            _emit({"success": True, **batch.to_dict()})
+            return EXIT_OK
+        print(_render_batch(batch, limit=args.limit))
+        # A batch with failures still exits 0: the useful outcome is the files
+        # that worked, and the summary names the ones that did not.
+        return EXIT_OK
+
+    if command == "show":
+        job = pipeline.transcription_job(args.job_id)
+        result = pipeline.transcription_result(args.job_id)
+        if args.json:
+            _emit({"success": True, "job": job.to_dict(),
+                   **result.to_dict()})
+            return EXIT_OK
+        print(transcribe_formats.render_report(result, limit=args.limit))
+        return EXIT_OK
+
+    if command == "export":
+        target = pipeline.export_transcription(
+            args.job_id, args.out, fmt=args.format)
+        if args.json:
+            _emit({"success": True, "path": str(target),
+                   "format": args.format})
+            return EXIT_OK
+        print(f"Wrote {target}")
+        return EXIT_OK
+
+    if command == "clear-cache":
+        if not getattr(args, "yes", False):
+            raise EditingError(
+                "Clearing the transcription cache needs --yes",
+                hint="Every cached transcript would have to be produced again, "
+                     "which on a folder of episodes is hours. Re-run with "
+                     "`transcribe clear-cache --yes` if that is what you want.",
+            )
+        removed = pipeline.clear_transcription_cache()
+        if args.json:
+            _emit({"success": True, "removed": removed})
+            return EXIT_OK
+        print(f"Removed {removed} cached transcription(s).")
+        print("Durable transcripts in transcripts/<asset_id>.json are "
+              "untouched.")
+        return EXIT_OK
+
+    raise EditingError("Unknown transcribe command")
+
+
+def _word_timestamps_from(args):
+    """``--word-timestamps`` / ``--no-word-timestamps``, or leave the default."""
+    if getattr(args, "no_word_timestamps", False):
+        return False
+    if getattr(args, "word_timestamps", False):
+        return True
+    return None
+
+
+def _render_transcribe_status(health: dict, settings, jobs) -> str:
+    lines = ["=" * 78, "TRANSCRIPTION", "=" * 78, ""]
+    ready = health.get("ready")
+    lines.append(f"  backend   : {health.get('backend')} "
+                 f"{'[ready]' if ready else '[NOT INSTALLED]'}")
+    lines.append(f"  model     : {settings.model}")
+    lines.append(f"  device    : {settings.device} "
+                 f"-> {health.get('resolved_device', '?')}"
+                 f"   (cuda available: {health.get('cuda')})")
+    lines.append(f"  language  : {settings.language or 'auto-detect'}")
+    lines.append(f"  words     : {settings.word_timestamps}"
+                 f"   vad: {settings.vad_filter}")
+    lines.append("")
+    if not ready:
+        lines.append("  This cannot run yet. To install:")
+        lines.append(f"    {health.get('hint') or transcribe_schema.INSTALL_HINT}")
+        lines.append("")
+    for warning in health.get("config_warnings", []):
+        lines.append(f"  ! {warning}")
+    if health.get("config_warnings"):
+        lines.append("")
+
+    lines.append("-" * 78)
+    lines.append(f"JOBS ({len(jobs)})")
+    lines.append("-" * 78)
+    if not jobs:
+        lines.append("  Nothing transcribed yet. Try:")
+        lines.append("    python -m editing.cli transcribe file <clip.mp4>")
+    for job in jobs:
+        lines.append(f"  {job.job_id[:34]:<34} {job.line()}")
+    return "\n".join(lines)
+
+
+def _render_batch(batch, *, limit: int = 40) -> str:
+    stats = batch.stats()
+    lines = ["=" * 78, f"TRANSCRIBED -- {batch.root}", "=" * 78, ""]
+    lines.append(f"  {stats['files']} file(s): {stats['done']} done, "
+                 f"{stats['cached']} from cache, {stats['skipped']} skipped, "
+                 f"{stats['failed']} failed")
+    lines.append(f"  {stats['segments']} segment(s), {stats['words']} word(s) "
+                 f"across {stats['media_seconds']:.0f}s of media")
+    lines.append(f"  took {stats['elapsed']:.0f}s")
+    lines.append("")
+    lines.append("-" * 78)
+    for job in batch.jobs[:limit]:
+        lines.append(f"  {job.line()}")
+    if len(batch.jobs) > limit:
+        lines.append(f"  ... {len(batch.jobs) - limit} more")
+
+    if batch.failed:
+        lines.append("")
+        lines.append("-" * 78)
+        lines.append(f"FAILED ({len(batch.failed)})")
+        lines.append("-" * 78)
+        for job in batch.failed:
+            if job.failure is None:
+                continue
+            lines.append(f"  {Path(job.source_path).name}")
+            lines.append(f"    why : {job.failure.message}")
+            if job.failure.hint:
+                lines.append(f"    fix : {job.failure.hint}")
+    for warning in batch.warnings:
+        lines.append(f"  ! {warning}")
+    return "\n".join(lines)
 
 
 def cmd_feedback(args) -> int:
@@ -3385,6 +3581,21 @@ def build_parser() -> argparse.ArgumentParser:
     au_run.add_argument("--skip-episode", action="store_true",
                         help="skip the episode memory and retention planner")
     au_run.add_argument(
+        "--transcribe", action="store_true",
+        help="produce transcripts with local Whisper before analysing "
+             "(off by default: it loads a speech model)")
+    au_run.add_argument(
+        "--transcribe-model", default="",
+        help="whisper size for that stage (default small)")
+    au_run.add_argument(
+        "--transcribe-language", default="",
+        help="ISO code, e.g. en. Omit to auto-detect")
+    au_run.add_argument(
+        "--transcribe-backend", default="",
+        choices=["", "faster_whisper", "mock"],
+        help="mock fabricates transcripts and stamps every artifact as fake; "
+             "for exercising the pipeline, never for an edit")
+    au_run.add_argument(
         "--feedback", action="store_true",
         help="open a review session and build its queue at the end of the run "
              "(off by default: it starts a review a person has to finish)")
@@ -3572,6 +3783,116 @@ def build_parser() -> argparse.ArgumentParser:
                            ep_hooks, ep_loops, ep_calls):
         episode_parser.set_defaults(func=cmd_episode)
 
+
+    # -- transcribe -------------------------------------------------------
+    transcribe = subparsers.add_parser(
+        "transcribe",
+        help="local speech to text with faster-whisper (no cloud, no upload)",
+    )
+    transcribe_subs = transcribe.add_subparsers(
+        dest="transcribe_command", required=True)
+
+    def _add_whisper_args(parser: argparse.ArgumentParser) -> None:
+        group = parser.add_argument_group("whisper")
+        group.add_argument(
+            "--model", dest="model_size", default=None,
+            help="whisper size or a local model path (default small). "
+                 "Sizes: " + ", ".join(transcribe_schema.KNOWN_MODELS[:8]))
+        group.add_argument(
+            "--device", default=None,
+            choices=list(transcribe_schema.DEVICES),
+            help="auto picks CUDA when it is genuinely usable (default auto)")
+        group.add_argument(
+            "--compute-type", dest="compute_type", default=None,
+            choices=list(transcribe_schema.COMPUTE_TYPES),
+            help="auto is float16 on CUDA, int8 on CPU")
+        group.add_argument(
+            "--language", default=None,
+            help="ISO code, e.g. en. Omit to auto-detect")
+        group.add_argument(
+            "--beam-size", dest="beam_size", type=int, default=None)
+        group.add_argument(
+            "--word-timestamps", action="store_true",
+            help="per-word timing (on by default)")
+        group.add_argument(
+            "--no-word-timestamps", action="store_true",
+            help="skip per-word timing; roughly 10-15%% quicker")
+        group.add_argument(
+            "--no-vad", action="store_true",
+            help="decode silence too (Whisper hallucinates into it)")
+        group.add_argument(
+            "--prompt", default=None,
+            help="vocabulary hint, e.g. \"Minecraft, creeper, nether, "
+                 "netherite, enderman\"")
+        group.add_argument(
+            "--backend", dest="backend_name", default=None,
+            choices=list(transcribe_schema.BACKENDS),
+            help="mock fabricates text and says so; never use it for an edit")
+        group.add_argument(
+            "--extract-audio", action="store_true",
+            help="convert to WAV with FFmpeg first, instead of decoding the "
+                 "container directly")
+        group.add_argument(
+            "--force", action="store_true",
+            help="ignore the cache and re-transcribe")
+        group.add_argument(
+            "--no-publish", action="store_true",
+            help="write the job folder but do not make this the asset's "
+                 "transcript")
+
+    tr_file = transcribe_subs.add_parser(
+        "file", help="transcribe one media file")
+    tr_file.add_argument("path", help="the video or audio file")
+    _add_whisper_args(tr_file)
+    tr_file.add_argument("--limit", type=int, default=20,
+                         help="transcript lines to print")
+    _add_common(tr_file)
+
+    tr_folder = transcribe_subs.add_parser(
+        "folder", help="transcribe every media file in a folder")
+    tr_folder.add_argument("path", help="the folder of clips")
+    _add_whisper_args(tr_folder)
+    tr_folder.add_argument("--no-recursive", action="store_true")
+    tr_folder.add_argument(
+        "--redo-existing", action="store_true",
+        help="transcribe clips that already have a current transcript")
+    tr_folder.add_argument(
+        "--max-files", type=int, default=0,
+        help="stop after this many files (0 = no limit)")
+    tr_folder.add_argument("--limit", type=int, default=40,
+                           help="rows to print")
+    _add_common(tr_folder)
+
+    tr_status = transcribe_subs.add_parser(
+        "status", help="is transcription installed, and what has it produced")
+    _add_whisper_args(tr_status)
+    tr_status.add_argument("--limit", type=int, default=20)
+    _add_common(tr_status)
+
+    tr_show = transcribe_subs.add_parser(
+        "show", help="one transcription job in full")
+    tr_show.add_argument("job_id")
+    tr_show.add_argument("--limit", type=int, default=60)
+    _add_common(tr_show)
+
+    tr_export = transcribe_subs.add_parser(
+        "export", help="write a job's transcript somewhere of your choosing")
+    tr_export.add_argument("job_id")
+    tr_export.add_argument("--out", required=True, help="destination path")
+    tr_export.add_argument(
+        "--format", default="srt", choices=["srt", "vtt", "txt", "json"])
+    _add_common(tr_export)
+
+    tr_clear = transcribe_subs.add_parser(
+        "clear-cache", help="drop every cached transcription")
+    tr_clear.add_argument(
+        "--yes", action="store_true",
+        help="required: re-transcribing a folder of episodes is hours")
+    _add_common(tr_clear)
+
+    for transcribe_parser in (tr_file, tr_folder, tr_status, tr_show,
+                              tr_export, tr_clear):
+        transcribe_parser.set_defaults(func=cmd_transcribe)
 
     # -- feedback ---------------------------------------------------------
     feedback = subparsers.add_parser(

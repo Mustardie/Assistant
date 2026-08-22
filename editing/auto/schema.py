@@ -40,6 +40,7 @@ from editing.schema import _slug, as_float, as_str_list, short_hash
 STAGE_ORDER = (
     "doctor",
     "discover",
+    "transcribe",
     "analyze",
     "recommend",
     "roughcut_build",
@@ -176,6 +177,21 @@ class AutoRunConfig:
     #: the switch exists because a planning layer nobody reads is still noise
     #: in the report.
     skip_episode: bool = False
+
+    #: Produce transcripts with local Whisper before analysing. Off by
+    #: default because it loads a speech model and takes minutes per episode --
+    #: but it is the difference between a story layer that works and one that
+    #: silently has nothing to read, so the run report says when it would have
+    #: helped.
+    transcribe: bool = False
+    #: Whisper size for that stage. Empty means the configured default.
+    transcribe_model: str = ""
+    #: Which backend produces the transcripts. Empty means the configured
+    #: default (faster_whisper). ``mock`` fabricates text and stamps every
+    #: artifact as fake -- for exercising the pipeline, never for an edit.
+    transcribe_backend: str = ""
+    #: ISO language code, or empty to auto-detect.
+    transcribe_language: str = ""
 
     #: Open a feedback session and build its review queue at the end of the
     #: run. Off by default, and the *only* pass in this pipeline that defaults

@@ -71,6 +71,20 @@ STAGES = (
         manual_command="python -m editing.cli discover --folder <folder>",
     ),
     AutoStage(
+        name="transcribe",
+        summary="Local Whisper speech to text over the discovered clips",
+        requires=("discover",),
+        config_keys=("footage_folder", "transcribe_model",
+                     "transcribe_language", "transcribe_backend",
+                     "recursive"),
+        # Not resumable, and cheap anyway: the runner skips any clip that
+        # already has a current transcript, so re-reaching this stage on a
+        # resume costs a fingerprint check per file rather than a model load.
+        resumable=False,
+        critical=False,
+        manual_command="python -m editing.cli transcribe folder <folder>",
+    ),
+    AutoStage(
         name="analyze",
         summary="Transcripts, audio events, Qwen3-VL vision, combined timeline",
         requires=("discover",),
@@ -246,6 +260,12 @@ STAGES = (
 
 BY_NAME = {stage.name: stage for stage in STAGES}
 
+#: The transcription stage, on its own. Opt-in via ``--transcribe``, because
+#: it loads a speech model -- but unlike the feedback stages it produces a file
+#: the rest of the pipeline reads, so the report nags when it was skipped and
+#: nothing else supplied a transcript.
+TRANSCRIBE_STAGES = ("transcribe",)
+
 #: Stages the review pass owns. Skipped as a group by ``--skip-review``, and
 #: blocked as a group when FFmpeg or the model is unavailable.
 REVIEW_STAGES = (
@@ -386,6 +406,92 @@ def run_discover(pipeline, run, context) -> tuple:
             "names": [a.filename for a in assets][:20],
         },
         [f"{a.filename}: {a.probe_error}" for a in assets if a.probe_error],
+    )
+
+
+def run_transcribe(pipeline, run, context) -> tuple:
+    """Produce transcripts for the clips this run is about to analyse.
+
+    Non-critical on purpose. A missing speech model, or one clip that will not
+    decode, costs the story layer and not the run -- analysis, the rough cut,
+    the style pass and the asset pass all work without a word of dialogue.
+    They are just less good, and the report says so.
+    """
+    from editing.transcribe.schema import TranscriptionConfig
+
+    # ``discover`` seeds the context, but on a resume it is satisfied from a
+    # checkpoint and never runs -- so fall back to the discovery on disk, the
+    # same way ``analyze`` re-derives its own assets.
+    assets = context.get("assets")
+    if not assets:
+        try:
+            assets = pipeline.ensure_assets(
+                folder=run.footage_folder or None,
+                recursive=run.recursive,
+                use_premiere=(False if run.no_premiere else None),
+            )
+        except EditingError:
+            assets = []
+    if not assets:
+        raise StageBlocked(
+            "there is nothing to transcribe",
+            "discovery found no media files.",
+            code="no_assets",
+            next_command="python -m editing.cli discover --folder <folder>",
+        )
+
+    settings = pipeline.transcription_config(
+        model=run.transcribe_model or None,
+        language=run.transcribe_language or None,
+        backend=run.transcribe_backend or None,
+    )
+    health = pipeline.transcribe_status(settings)
+    if not health.get("ready"):
+        raise StageBlocked(
+            "could not transcribe the footage",
+            "faster-whisper is not installed, so no transcript can be made. "
+            "The run continues without one; the story and retention layers "
+            "will have nothing to read.",
+            code="whisper_missing",
+            next_command=str(health.get("hint") or "pip install faster-whisper"),
+            detail={"health": health},
+        )
+
+    try:
+        batch = pipeline.transcribe_assets(assets, settings=settings)
+    except ToolMissingError as exc:
+        raise StageBlocked(
+            "could not transcribe the footage",
+            f"{exc.message}.",
+            code="whisper_missing",
+            next_command="pip install faster-whisper, then: "
+                         "python -m editing.cli auto resume --run <run_id>",
+        ) from None
+
+    context["transcription"] = batch
+    stats = batch.stats()
+    warnings = list(batch.warnings)
+    for job in batch.failed:
+        if job.failure is not None:
+            warnings.append(
+                f"{Path(job.source_path).name}: {job.failure.message}")
+    return (
+        [str(pipeline.config.transcripts_dir)],
+        {
+            "backend": settings.backend,
+            "model": settings.model,
+            "device": health.get("resolved_device", "?"),
+            # Loud on purpose: a run whose transcripts were fabricated must
+            # never look like a run that heard the footage.
+            "mock": settings.backend == "mock",
+            "files": stats["files"],
+            "transcribed": stats["done"],
+            "cached": stats["cached"],
+            "skipped": stats["skipped"],
+            "failed": stats["failed"],
+            "words": stats["words"],
+        },
+        warnings,
     )
 
 
@@ -837,6 +943,7 @@ def run_assets_dry_run(pipeline, run, context) -> tuple:
 RUNNERS = {
     "doctor": run_doctor,
     "discover": run_discover,
+    "transcribe": run_transcribe,
     "analyze": run_analyze,
     "recommend": run_recommend,
     "roughcut_build": run_roughcut_build,

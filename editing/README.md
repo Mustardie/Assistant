@@ -17,7 +17,7 @@ It executes nothing. See [§0 Auto mode](#0-auto-mode) — the rest of this
 document is the stage-by-stage detail behind it.
 
 ```
-footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
+footage → Premiere mapping → local Whisper transcript → Qwen3-VL vision ─┐
                                                             ├→ structure timeline
                                             audio events ──┘
                                                     ↓
@@ -70,6 +70,11 @@ expressed as operations on the *placed clip*. A library with no files in it
 still produces a complete plan: every placeholder becomes a marker, and that
 list doubles as a shopping list.
 
+**It can hear the footage.** Local Whisper turns your capture into a
+transcript with word-level timing, offline, with nothing uploaded — and that
+transcript is what the story layer reads. See
+[§2.1 Making one with Whisper](#21-making-one-with-whisper).
+
 **Your review is the only thing here that cannot be regenerated.** Every other
 file under `data/editing/` is derived from the footage and can be rebuilt by
 re-running a pass. Human feedback cannot, so it is written to an append-only
@@ -93,7 +98,7 @@ which order they go in.
 python -m editing.cli auto run --folder D:/Footage/ep12 --style cinematic_minecraft
 ```
 
-That runs twenty-one stages — discovery, transcripts, audio, vision, timeline,
+That runs twenty-two stages — discovery, transcripts, audio, vision, timeline,
 recommendations, rough cut, critic, style layers, asset placement, episode
 memory, retention plan — and writes
 a plan and an offline dry run for each of the four things that could touch
@@ -134,6 +139,7 @@ footage before committing an afternoon to it.
 ```
   + doctor                 passed   ffmpeg=True, ffprobe=True
   + discover               passed   files=3, total_seconds=120.0
+  . transcribe             skipped  --transcribe was not set
   + analyze                passed   segments=12, covered_seconds=120.0
   + recommend              passed   total=33, accepted=30
   + roughcut_build         passed   clips=9, cut_duration=99.0
@@ -155,8 +161,15 @@ footage before committing an afternoon to it.
   + report                 passed
 ```
 
-The three `feedback_*` stages are the only ones in the pipeline that are
-opt-*in*. Every other pass produces a file; that one starts a review a person
+`transcribe` and the three `feedback_*` stages are the only ones in the
+pipeline that are opt-*in*. Transcription loads a speech model and takes
+minutes per episode, so it waits to be asked — but the story layer is blind
+without it, so turn it on unless you already have transcripts:
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 --transcribe
+```
+ Every other pass produces a file; that one starts a review a person
 is expected to finish, so `auto run --feedback` asks for it and the run report
 otherwise just tells you how much would be worth reviewing. See
 [§16 Feedback](#16-feedback-and-the-human-review-loop).
@@ -444,7 +457,177 @@ Premiere not running is a normal state — everything still works from disk.
 
 ## 2. Transcripts
 
-### Premiere Speech to Text
+**The transcript is the most load-bearing input in this system.** Objectives,
+open loops, callbacks, setup and payoff, and half the retention risks are all
+read off it — so footage with no transcript makes the entire story layer go
+quiet, and says so rather than guessing.
+
+There are two ways to get one: make it locally with Whisper (below), or bring
+one you already have ([§2.2](#22-bringing-a-transcript-you-already-have)).
+
+### 2.1 Making one with Whisper
+
+Local, offline, no API, no key, nothing uploaded. Needs no Premiere.
+
+```bash
+pip install faster-whisper
+python -m editing.cli transcribe file "D:/Footage/ep12/session_01.mp4"
+python -m editing.cli transcribe folder "D:/Footage/ep12"
+```
+
+```
+  file      : D:\Footage\ep12\session_01.mp4
+  backend   : faster_whisper / small  (cpu/int8)
+  language  : en (p=1.00)
+  media     : 2412.0s
+  speech    : 1533.4s (64% of runtime)
+  segments  : 412  (11 low confidence, 38 dropped)
+  words     : 4180
+  confidence: 0.81 mean
+  took      : 561.0s (4.3x realtime)  -- a 40-minute episode would take ~9 min
+```
+
+That `x realtime` figure is the one worth reading: it is measured on *your*
+machine and answers "how long will my episode take" without guesswork.
+
+#### What to use on this PC
+
+Measured here, CPU only (`torch 2.13.0+cpu`, so CUDA is unavailable):
+
+| Model | Speed | Use it when |
+|---|---|---|
+| `tiny` | ~15x realtime | you want a transcript in seconds and do not care about proper nouns |
+| `base` | ~8x realtime | quick passes while you are iterating |
+| **`small`** | **~4x realtime** | **the default. Gets "nether", "netherite", "creeper" right** |
+| `medium` | ~1.5x realtime | a final pass on an episode that matters |
+| `large-v3` | slower than realtime | not worth it on CPU |
+
+A 40-minute episode with `small` is about **9 minutes**. The first run of any
+size downloads the model once (~500 MB for `small`).
+
+**With a CUDA GPU**, expect roughly 5–10x that, and `medium` becomes the sane
+default. Auto-detection goes through `torch`, so if you have a CUDA-capable
+CTranslate2 but no CUDA build of `torch`, pass `--device cuda` explicitly.
+
+#### The flag that matters most
+
+Whisper mis-hears domain nouns constantly — "creeper" as "creature", "nether"
+as "never", "diamonds" as "dynons". A vocabulary hint fixes most of it:
+
+```bash
+python -m editing.cli transcribe folder "D:/Footage/ep12" \
+    --prompt "Minecraft, creeper, enderman, nether, netherite, redstone, diamonds"
+```
+
+Verified on this machine: `tiny` heard *"I found Dynons, actually that is
+Netherite"*; `small` with the hint got both words right.
+
+#### Everything else
+
+| Flag | Why |
+|---|---|
+| `--model small` | size, or a path to a local CTranslate2 model |
+| `--device auto\|cuda\|cpu` | `auto` picks CUDA only when it is genuinely usable |
+| `--compute-type auto` | `float16` on CUDA, `int8` on CPU |
+| `--language en` | skips detection, which occasionally guesses wrong on a quiet intro |
+| `--no-word-timestamps` | ~10–15% quicker; you lose per-word timing |
+| `--no-vad` | decodes silence too. Whisper hallucinates into silence, so leave VAD on |
+| `--extract-audio` | convert to WAV with FFmpeg first, instead of decoding the container |
+| `--force` | ignore the cache and re-transcribe |
+
+#### Where it goes
+
+```
+data/editing/transcripts/
+├── <asset_id>.json          ← the durable transcript every pass reads
+└── <job_id>/                ← the record of one transcription
+    ├── transcript.json        segments, word timings, probabilities
+    ├── transcript.srt         standard SRT
+    ├── transcript.txt         readable, with a provenance header
+    ├── metadata.json          config, timings, device, cache key
+    └── warnings.json          everything the run wanted to say
+```
+
+Two stores, and they do different jobs. The **job folder** records *how* a
+transcript was made. `<asset_id>.json` is *the transcript*, in the place
+`resolve()` looks first — writing it is the actual seam into the pipeline.
+
+`transcript.json` carries both a `segments` list (rich) and an `entries` list
+(the canonical shape), so it parses with the same normaliser every other
+transcript in the system goes through — no bridge, no special case.
+
+The job ID comes from the **cache key**, not a timestamp: transcribing the same
+file with the same settings lands in the same folder, and changing the model
+produces a different one.
+
+```bash
+python -m editing.cli transcribe status              # is it installed, what has it done
+python -m editing.cli transcribe show <job_id>
+python -m editing.cli transcribe export <job_id> --out subs.srt --format srt
+python -m editing.cli transcribe clear-cache --yes
+```
+
+#### Caching, and what invalidates it
+
+Keyed on the file's **content hash** plus every setting that changes a word:
+model, backend, language, beam size, VAD, word timestamps, compute type and the
+vocabulary prompt. `--force` bypasses it.
+
+- Re-export or re-encode the file → **misses**, correctly. You never get a
+  transcript of the old audio.
+- Change the model or the prompt → misses.
+- Change `--timeout`, or turn the cache off → **hits**. Neither changes a word,
+  and invalidating on them would throw away hours of work for nothing.
+
+A batch also **skips** any clip that already has a current transcript — so
+running it twice over a folder costs a fingerprint check per file. A *stale*
+transcript, made from audio that has since changed, never counts as present.
+
+#### Batches survive their worst file
+
+```
+  5 file(s): 3 done, 1 from cache, 0 skipped, 1 failed
+------------------------------------------------------------------------------
+FAILED (1)
+  broken.mp4
+    why : 'broken.mp4' is empty
+    fix : The file is zero bytes -- check the copy or export finished.
+```
+
+Thirty clips where two are corrupt is an ordinary afternoon. The batch never
+aborts, and every failure carries the fix.
+
+#### With auto mode
+
+```bash
+python -m editing.cli auto run --folder "D:/Footage/ep12" --transcribe --transcribe-model small
+```
+
+Opt-in, because it loads a speech model and takes minutes. The stage is
+non-critical: if faster-whisper is missing the stage blocks, the run continues,
+and analysis, the rough cut, the style pass and the asset pass all still work —
+they are just working deaf, and the report says so.
+
+Safe to leave on: a second run transcribes nothing.
+
+#### What it does not do
+
+- **No diarisation.** `speaker` is always `null`. Nothing here can tell two
+  voices apart, and inventing a label would be worse than admitting it.
+- **No translation.** It transcribes in whatever language it hears.
+- **No punctuation repair, no profanity filter, no re-timing.** Cues come out
+  exactly where the model put them.
+- **`--backend mock` fabricates text.** It exists for tests and for machines
+  with no model, and it stamps `mock: true` on the result, the JSON, the text
+  header and the transcript note. Never use it for an edit.
+- **Accuracy is Whisper's, not this layer's.** Fast excited commentary over
+  game audio is the hard case. `small` plus a vocabulary prompt is the best
+  cost/quality point measured here; the fix for a bad transcript is a bigger
+  model, not a different setting.
+
+### 2.2 Bringing a transcript you already have
+
+#### Premiere Speech to Text
 
 Premiere's transcription lives in **Text panel → Transcript tab** (newer builds
 also call this Text-Based Editing). **Adobe exposes no documented ExtendScript
@@ -477,7 +660,7 @@ python -m editing.cli transcript pull
 Where nothing is reachable, you get `found: false` and the manual export path —
 never an invented transcript.
 
-### Importing a transcript file
+#### Importing a transcript file
 
 The reliable path today. In Premiere: **Text panel → Transcript tab → … menu →
 Export**, then:
@@ -499,13 +682,13 @@ Accepted formats — all normalised into one schema:
 The extension is a hint, not the decision: a WebVTT file saved as `.txt` is
 parsed as WebVTT.
 
-### Sidecar auto-discovery
+#### Sidecar auto-discovery
 
 A transcript sitting next to the footage (`session_01.srt` beside
 `session_01.mp4`) is picked up automatically. SRT and VTT are preferred over
 plain text because they carry per-line timing.
 
-### Timing is never invented
+#### Timing is never invented
 
 A plain-text transcript with **no timestamps is refused**, with an explanation.
 Spreading untimed text evenly across the runtime would misalign every segment
@@ -2491,6 +2674,9 @@ Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 data/editing/
 ├── assets.json                     discovered footage + Premiere mapping
 ├── transcripts/<asset_id>.json     normalised transcripts (durable)
+├── transcripts/<job_id>/           ← one local Whisper transcription
+│   ├── transcript.json  transcript.srt  transcript.txt
+│   └── metadata.json    warnings.json
 ├── visual/<asset_id>.json          visual events + sampling plan + warnings
 ├── audio/<asset_id>.json           audio events + baseline + warnings
 ├── timelines/structure.json        the combined timeline
@@ -2587,7 +2773,7 @@ that window.
 ## 19. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 1228 tests, ~100s
+python -m pytest tests/editing -q        # 1318 tests, ~100s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -2600,6 +2786,7 @@ asserting on the same call shape the real component receives.
 |---|---|
 | `test_editing_schema.py` | coercion, clamping, lossless round-trips |
 | `test_editing_transcripts.py` | all five formats, word grouping, the store |
+| `test_editing_transcribe.py` | Whisper config, **the cache key**, batch resilience, SRT to spec, missing dependencies |
 | `test_editing_sampling.py` | coverage, densification, bounds, determinism |
 | `test_editing_cache.py` | key construction, hit/miss, invalidation, corruption |
 | `test_editing_analyzer.py` | messy model output, failures, cache behaviour |
@@ -2725,6 +2912,12 @@ twenty reviews and found out whether the queue puts the right things first.
 **Character names are the weakest thing here.** They come from capitalised words
 in one channel, so every one caps below the edit threshold and arrives flagged
 for review. A name is a name because a person says so, and nothing has asked one.
+
+**Transcription accuracy is Whisper's.** Fast, excited commentary over game
+audio is the hard case for any speech model. `small` plus a vocabulary prompt
+is the best cost/quality point measured on this machine, and the fix for a bad
+transcript is a bigger model rather than a different setting. There is no
+diarisation: `speaker` is always `null`.
 
 **Premiere transcripts.** Adobe exposes no documented API. The XMP route works
 where Premiere has run speech analysis and stored word markers; some builds and

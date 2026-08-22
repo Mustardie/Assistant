@@ -113,7 +113,13 @@ AUDIO_VALUE_FOR_TYPE = {
 }
 
 TRANSCRIPT_SOURCES = (
-    "premiere", "srt", "vtt", "txt", "json", "csv", "manual", "unknown",
+    "premiere", "srt", "vtt", "txt", "json", "csv", "manual",
+    # Produced locally by editing.transcribe. Kept distinct from "json"
+    # because a machine transcription and one a person exported by hand
+    # deserve different amounts of trust -- the audio layer already weights a
+    # human [laughs] marker above its own guess, and this is the same rule.
+    "whisper",
+    "unknown",
 )
 
 #: Model phrasings that mean one of the closed values above. Only genuinely

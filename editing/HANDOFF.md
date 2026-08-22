@@ -1,6 +1,6 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-21 (Session 9).
+Context for continuing this work in a new chat. Updated 2026-08-22 (Session 10A).
 
 ---
 
@@ -8,10 +8,14 @@ Context for continuing this work in a new chat. Updated 2026-08-21 (Session 9).
 
 ```cmd
 cd /d E:\Assistant
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1228 passed
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1318 passed
+
+REM hear the footage first -- the story layer is blind without this:
+pip install faster-whisper
+python -m editing.cli transcribe folder D:\Footage\test --model small
 
 REM the whole pipeline, planning only, with nothing installed:
-python -m editing.cli auto run --folder D:\Footage\test --mock --no-premiere
+python -m editing.cli auto run --folder D:\Footage\test --mock --no-premiere --transcribe
 python -m editing.cli auto report
 
 REM then tell it what you think of the result:
@@ -26,7 +30,7 @@ Everything below is detail behind that.
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all nine sessions and 1228 passing editing tests.
+This has all ten sessions and 1318 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -47,7 +51,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in nine sessions
+## What was built, in ten sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -94,6 +98,7 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
 | 7 | `auto/` | orchestration, checkpoints, resume, gated execution, reports |
 | 8 | `episode/` | story beats, open loops, retention risks, hooks, suggestions |
 | 9 | `feedback/` | the review queue, the append-only log, preference and training signals |
+| 10A | `transcribe/` | local faster-whisper, the cache, batches, the durable-transcript seam |
 
 ### Session 7 — the auto pipeline
 
@@ -176,6 +181,36 @@ It produces records; a later session decides what an operation looks like.
 
 **Trains nothing, applies nothing, executes nothing.** It reads JSON other
 passes wrote and appends what a person said about it.
+
+### Session 10A -- local Whisper transcription
+
+The first Week 1 feature: the system could *read* a transcript from five
+formats and could not *make* one, so footage with no SRT beside it left the
+whole story layer silent.
+
+- `editing/transcribe/`
+  - `schema.py` -- `TranscriptionConfig` and the seven records; the cache-key
+    subset; `as_transcript()`, the bridge to what every pass consumes
+  - `backends.py` -- faster-whisper (late import, device/compute resolution,
+    CUDA-to-CPU fallback) and the mock that stamps everything it makes
+  - `audio.py` -- media discovery, readability checks, FFmpeg extraction into
+    the cache and never beside the footage
+  - `formats.py` -- SRT to spec, VTT, readable text with provenance
+  - `store.py` -- job folders, the cache, and `publish()` -- the seam
+  - `run.py` -- one file (raises), a folder (never raises for a file)
+- `editing/schema.py` -- `whisper` added to `TRANSCRIPT_SOURCES`
+- `editing/pipeline.py` -- `transcribe_file|folder|assets`, `transcribe_status`,
+  `transcription_config|jobs|job|result`, `export_transcription`
+- `editing/cli.py` -- `transcribe file|folder|status|show|export|clear-cache`
+- `editing/auto/` -- one more stage, `transcribe`, before `analyze`, opt-in
+  behind `--transcribe`
+- `tests/editing/test_editing_transcribe.py` -- 82 tests, plus 8 in the auto
+  suite
+
+**Verified on real speech.** Piper synthesises a commentary track, Whisper
+reads it back: 100% word recovery with `tiny`, and `small` gets "nether" and
+"netherite" right. The transcript reaches the Session 8 episode layer, which
+finds the stated objective and the open loop from it.
 
 ---
 
@@ -351,13 +386,55 @@ opening a second session would split one review across two logs that, being
 append-only, could never be merged. It reuses the run's existing session
 instead.
 
+### From Session 10A
+
+**The transcript is the most load-bearing input in the system**, and it was the
+one thing nothing could produce. Everything that reasons about story reads it,
+and every one of those passes fails *quietly* without it -- a folder with no
+SRT produced a plausible-looking empty story layer rather than a complaint.
+
+**A fake transcript is worse than no transcript.** Every story finding built on
+fabricated text would look sound. So the mock backend stamps `mock=True` on the
+result, on `transcript.json`, in the `.txt` header, in the report, in the auto
+stage summary, and in the note on the durable transcript. Six places, because
+the artifact travels.
+
+**Two stores, doing different jobs.** The job folder records *how* a transcript
+was made -- config, device, probabilities, what was dropped. `<asset_id>.json`
+*is* the transcript, in the place `resolve()` looks first. Writing the second
+is the actual integration; everything else is provenance.
+
+**The cache key is the content hash, not the path.** A re-exported file misses
+correctly instead of serving a transcript of audio that no longer exists.
+Settings that change a word are in the key; `timeout` and `use_cache` are not,
+because invalidating on those would throw away hours for nothing.
+
+**Skipped and cached are different outcomes.** Cached reused a real result;
+skipped never needed one because a current transcript already existed. An early
+version pre-filtered the skipped files out entirely, and the batch then reported
+"no media files found" -- which looks exactly like discovery being broken.
+
+**Confidence is a linear remap of `avg_logprob`, not `exp()`.** Exponentiating
+is defensible and compresses everything usable into 0.6-1.0, which makes the
+number useless for the only thing it is for: ranking segments by how much to
+trust them.
+
+**The heavy import is inside the function.** `faster_whisper` at module scope
+would mean importing the CLI fails on a machine that never installed it, taking
+every other editing command down with it. A test walks the AST of every module
+in the package to keep it that way.
+
+**A batch never raises for a file.** Two corrupt clips out of thirty is an
+ordinary afternoon; the useful outcome is twenty-eight transcripts and an exact
+account of the two, each with the fix attached.
+
 ---
 
 ## Current state
 
-- **1228 editing tests**, ~100s, needing no FFmpeg, GPU, model server, Premiere
-  or real media
-- `tests/premiere/` passes too (277 there, 1505 across both suites)
+- **1318 editing tests**, ~100s, needing no FFmpeg, GPU, model server, Premiere,
+  Whisper or real media
+- `tests/premiere/` passes too (277 there, 1595 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
   client) are pre-existing and unrelated
 - `editing/README.md` is the full user documentation (~2950 lines); §0 covers
@@ -404,19 +481,27 @@ both export formats -- but **not** yet against a real review of real footage.
 13. **Character names are guesses** from capitalised words in one channel. They
     cap below the edit threshold and arrive flagged, which is the honest
     handling, not a fix.
-14. **Nothing learns from the feedback.** Session 9 collects, links and exports
+14. **Transcription accuracy is Whisper's**, and fast excited commentary over
+    game audio is its hard case. No diarisation -- `speaker` is always `null`.
+    The vocabulary prompt is the highest-value knob and is empty by default.
+15. **The episode layer's loop resolution has not been checked against a real
+    transcript.** On a synthesized episode it found the stated objective and
+    the open loop, and reported `unresolved_setup` for a question the same
+    transcript answers a minute later -- on a two-segment timeline, so this may
+    be granularity rather than a defect. Worth a real run.
+16. **Nothing learns from the feedback.** Session 9 collects, links and exports
     it; no pass reads a preference signal and nothing has been trained. That is
     Session 10's job and is the point of the whole layer.
-15. **Nobody has done a real review yet.** The queue's priorities -- the
+17. **Nobody has done a real review yet.** The queue's priorities -- the
     reserved-slot counts, the positive-sample share, the 0.50 uncertainty line,
     the flag boosts -- are calibrated against intuition. Twenty real reviews
     would say whether it puts the right things first. This is now the highest-
     value next action after the critic.
-16. **Preference extraction is keyword-assisted.** Telling "the danger caption
+18. **Preference extraction is keyword-assisted.** Telling "the danger caption
     was bad" from "captions are bad" reads the item's label for words like
     `danger_text` and `whoosh`. The general rules are structural; the specific
     ones are heuristics, marked as such.
-17. **A preference signal is one person's**, and `scope` only distinguishes one
+19. **A preference signal is one person's**, and `scope` only distinguishes one
     session from several. There is no notion of multiple reviewers.
 
 ---
@@ -426,6 +511,18 @@ both export formats -- but **not** yet against a real review of real footage.
 The system is now usable enough that the next steps are about *reality*, not
 features.
 
+- **Transcribe one real episode and read `episode report`.** This is now the
+  cheapest way to find out whether the story layer means anything, and it needs
+  no GPU and no model server:
+
+  ```cmd
+  python -m editing.cli transcribe folder D:\Footage\ep12 --model small
+  python -m editing.cli auto run --folder D:\Footage\ep12 --mock --no-premiere
+  python -m editing.cli episode report
+  ```
+
+  The audio events and the whole story read are *real* in that run; only the
+  on-screen analysis is mocked.
 - **Run the critic against a real Qwen3-VL server.** `auto run --folder <f>`
   without `--mock`, then read `auto report`. Expect the prompt to need tuning;
   the issue guide and the "most frames are fine" instruction are the levers.
@@ -484,6 +581,8 @@ Useful flags on `auto run`:
 | `--no-premiere` | never talk to Premiere; every gate stays shut |
 | `--markers-only` | style and asset passes record instead of drawing/playing |
 | `--skip-review` / `--skip-assets` / `--skip-episode` | skip a whole pass |
+| `--transcribe` | produce transcripts with local Whisper first (opt-in) |
+| `--transcribe-model` / `--transcribe-language` | Whisper size, and the language |
 | `--feedback` | also open a review session and build its queue (opt-in) |
 | `--asset-library <path>` | a library other than `<model dir>/assets` |
 | `--max-windows N` | cap analysis windows per file |
@@ -517,6 +616,22 @@ python -m editing.cli episode export for_style.json --suggestions-for style
 ```
 
 `auto run` builds both as stages 16 and 17; `--skip-episode` turns them off.
+
+Transcription, which is where a real episode now starts:
+
+```cmd
+pip install faster-whisper
+python -m editing.cli transcribe status
+python -m editing.cli transcribe folder D:\Footage\ep12 --model small ^
+    --prompt "Minecraft, creeper, nether, netherite, diamonds"
+python -m editing.cli transcribe show <job_id>
+python -m editing.cli transcribe export <job_id> --out subs.srt
+```
+
+Measured on this machine, CPU only: `tiny` ~15x realtime, `small` ~4.3x,
+so a 40-minute episode with `small` is about nine minutes. `torch` here is
+`2.13.0+cpu`, so CUDA auto-detection reports false; `--device cuda` forces it
+if CTranslate2 can use a GPU without torch.
 
 Human review, which trains nothing:
 

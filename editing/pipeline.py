@@ -73,6 +73,12 @@ from editing.roughcut.schema import ExecutionReport, RoughCutPlan
 from editing.schema import (
     AudioEvent, MediaAsset, StructureTimeline, VisualEvent,
 )
+from editing.transcribe import run as transcribe_run
+from editing.transcribe import store as transcribe_store
+from editing.transcribe.backends import check as transcribe_check
+from editing.transcribe.schema import (
+    TranscriptionBatch, TranscriptionConfig, TranscriptionJob,
+)
 from editing.transcripts import store as transcript_store
 from editing.visual.analyzer import AnalysisResult, VisualAnalyzer
 from editing.visual.qwen import build_model
@@ -242,6 +248,131 @@ class Pipeline:
             else:
                 self.say(f"  {asset.filename}: no transcript. {resolution.note}")
         return out
+
+    # ------------------------------------------------------------------
+    # Producing transcripts (Session 10A)
+    # ------------------------------------------------------------------
+    #
+    # ``transcripts()`` above *resolves* a transcript from the durable store,
+    # Premiere or a sidecar. These methods *make* one. They are separate verbs
+    # on purpose: resolution must stay cheap and side-effect free, while
+    # transcription loads a model and can take minutes.
+
+    def transcription_config(self, **overrides) -> TranscriptionConfig:
+        """Transcription settings from the environment, overridden by kwargs."""
+        base = TranscriptionConfig.from_env()
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if clean:
+            from dataclasses import replace
+            base = replace(base, **clean)
+        return base.validated()
+
+    def transcribe_status(
+        self, settings: Optional[TranscriptionConfig] = None
+    ) -> dict:
+        """Whether transcription could run right now, without loading a model."""
+        return transcribe_check(settings or self.transcription_config())
+
+    def transcribe_file(
+        self,
+        path: str,
+        *,
+        settings: Optional[TranscriptionConfig] = None,
+        asset: Optional[MediaAsset] = None,
+        force: bool = False,
+        extract_audio: bool = False,
+        publish: bool = True,
+    ) -> TranscriptionJob:
+        """Transcribe one media file and publish it for the rest of the layer."""
+        return transcribe_run.transcribe_file(
+            self.config, path,
+            settings=settings or self.transcription_config(),
+            cache=self.cache,
+            asset=asset,
+            force=force,
+            extract_audio=extract_audio,
+            publish=publish,
+            say=self.say,
+        )
+
+    def transcribe_folder(
+        self,
+        folder: str,
+        *,
+        settings: Optional[TranscriptionConfig] = None,
+        assets: Optional[Sequence[MediaAsset]] = None,
+        recursive: bool = True,
+        force: bool = False,
+        extract_audio: bool = False,
+        skip_existing: bool = True,
+        publish: bool = True,
+        limit: int = 0,
+    ) -> TranscriptionBatch:
+        """Transcribe a folder. One bad file never costs the rest of the batch."""
+        return transcribe_run.transcribe_folder(
+            self.config, folder,
+            settings=settings or self.transcription_config(),
+            cache=self.cache,
+            assets=assets,
+            recursive=recursive,
+            force=force,
+            extract_audio=extract_audio,
+            skip_existing=skip_existing,
+            publish=publish,
+            limit=limit,
+            say=self.say,
+        )
+
+    def transcribe_assets(
+        self,
+        assets: Sequence[MediaAsset],
+        *,
+        settings: Optional[TranscriptionConfig] = None,
+        force: bool = False,
+        only_missing: bool = True,
+    ) -> TranscriptionBatch:
+        """Transcribe exactly the clips a run is about to analyse.
+
+        The seam the auto pipeline uses. ``only_missing`` is what makes
+        ``--transcribe`` safe to leave on: a second run over the same footage
+        transcribes nothing and costs nothing.
+        """
+        wanted = list(assets)
+        if only_missing and not force:
+            outstanding = transcribe_run.missing_transcripts(
+                self.config, wanted)
+            if not outstanding:
+                self.say("Every clip already has a current transcript.")
+        # Every asset is passed through rather than pre-filtered, and
+        # ``skip_existing`` does the same check one layer down. That is what
+        # makes the batch summary say "3 skipped" instead of "no media files
+        # found", which is the difference between an accurate report and one
+        # that looks like discovery broke.
+        root = str(Path(assets[0].path).parent) if assets else ""
+        return self.transcribe_folder(
+            root,
+            settings=settings,
+            assets=wanted,
+            force=force,
+            skip_existing=only_missing and not force,
+        )
+
+    def transcription_jobs(self, *, limit: int = 100) -> list[TranscriptionJob]:
+        return transcribe_store.list_jobs(self.config, limit=limit)
+
+    def transcription_job(self, job_id: str) -> TranscriptionJob:
+        return transcribe_store.load_job(self.config, job_id)
+
+    def transcription_result(self, job_id: str):
+        return transcribe_store.load_result(self.config, job_id)
+
+    def export_transcription(
+        self, job_id: str, out: str, *, fmt: str = "srt"
+    ) -> Path:
+        return transcribe_store.export_job(self.config, job_id, out, fmt=fmt)
+
+    def clear_transcription_cache(self) -> int:
+        return transcribe_store.clear_cache(self.cache)
 
     def import_transcript(self, asset: MediaAsset, path: str):
         """Import one external transcript file for one asset."""

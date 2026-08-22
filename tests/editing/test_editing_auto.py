@@ -1,0 +1,1326 @@
+"""The auto pipeline: ordering, checkpoints, resume, and the execution gates.
+
+Three things carry the weight.
+
+**A run must complete with nothing installed.** No FFmpeg, no GPU, no model
+server, no Premiere, no real assets. That is not a convenience for CI -- it is
+the mode a person uses to find out whether the thing works before they commit
+an afternoon to it, so it gets asserted end to end rather than sampled.
+
+**A checkpoint is a claim, not a fact.** Every reuse test has a matching
+invalidation test: a deleted artifact, a changed artifact, a changed style.
+Skipping a stage because it "passed once" is the failure mode that would make
+this whole package produce results corresponding to nothing.
+
+**Nothing reaches Premiere without a named, individual ``--yes``.** The gate
+tests all assert against a fake engine that records whether it was called at
+all, and the answer is no for every refusal.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from editing.auto import gates as auto_gates
+from editing.auto import report as auto_report
+from editing.auto import stages as auto_stages
+from editing.auto import store
+from editing.auto.runner import AutoRunner
+from editing.auto.schema import (
+    STAGE_ORDER, AutoRunConfig, riskiest, run_id_for,
+)
+from editing.errors import EditingError
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+#: What ffprobe would have said. Local rather than shared because
+#: ``tests/`` deliberately has no ``__init__.py`` -- that is what puts the repo
+#: root on sys.path -- so test modules cannot import from each other.
+PROBE = {
+    "duration": 16.0,
+    "container": "mov,mp4,m4a",
+    "width": 1920,
+    "height": 1080,
+    "fps": 60.0,
+    "video_codec": "h264",
+    "has_audio": True,
+    "audio_codec": "aac",
+    "audio_channels": 2,
+    "size_bytes": 1024,
+}
+
+
+@pytest.fixture
+def fake_probe(monkeypatch):
+    """Patch ffprobe out everywhere discovery and the indexer reach for it."""
+    from editing import discovery
+    from editing import ffmpeg as ff
+
+    calls: list[str] = []
+
+    def probe(path, *, ffprobe="ffprobe"):
+        calls.append(str(path))
+        return dict(PROBE)
+
+    monkeypatch.setattr(ff, "probe", probe)
+    monkeypatch.setattr(discovery.ff, "probe", probe)
+    return calls
+
+
+@pytest.fixture
+def footage(tmp_path):
+    """Three files that look like video to discovery."""
+    folder = tmp_path / "clips"
+    folder.mkdir()
+    for index in range(3):
+        (folder / f"clip_{index:02d}.mp4").write_bytes(b"not a video" * 512)
+    return folder
+
+
+@pytest.fixture
+def auto_config(footage) -> AutoRunConfig:
+    return AutoRunConfig(
+        footage_folder=str(footage),
+        style="cinematic_minecraft",
+        mock=True,
+        no_premiere=True,
+    )
+
+
+@pytest.fixture
+def runner(config, footage, monkeypatch, frame_source, fake_probe, tmp_path):
+    """A runner wired so no external tool is ever reached.
+
+    ``frame_source`` and ``fake_probe`` come from the shared conftest; the
+    review pass's frame *export* is the one remaining FFmpeg edge and is
+    stubbed here.
+    """
+    from editing.roughcut import review as review_module
+
+    written = tmp_path / "frame.jpg"
+    written.write_bytes(b"\xff\xd8jpeg")
+    monkeypatch.setattr(
+        review_module.ff, "extract_frame", lambda *a, **k: written
+    )
+
+    runner = AutoRunner(config, say=lambda message: None)
+    original = runner.pipeline_for
+
+    def wired(state):
+        pipeline = original(state)
+        pipeline.analyzer = _stub_analyzer(pipeline, frame_source)
+        return pipeline
+
+    runner.pipeline_for = wired
+    return runner
+
+
+def _stub_analyzer(pipeline, frame_source):
+    """Give the analyser a frame source that never shells out."""
+    real = pipeline.analyzer
+
+    def build(**kwargs):
+        kwargs.setdefault("use_motion", False)
+        analyzer = real(**kwargs)
+        analyzer._frame_source = frame_source
+        return analyzer
+    return build
+
+
+def run_once(runner, auto_config, **kwargs):
+    state = runner.start(auto_config, **kwargs)
+    return runner.run(state)
+
+
+class FakeEngine:
+    """Records whether Premiere was ever actually asked to do anything."""
+
+    def __init__(self, *, succeed=True):
+        self.calls: list[dict] = []
+        self.succeed = succeed
+
+    def run(self, plan):
+        self.calls.append(plan)
+        if not self.succeed:
+            return {"success": False, "error": "Premiere said no",
+                    "code": "execution_failed"}
+        return {"success": True,
+                "results": [{"ok": True} for _ in plan.get("ops", [])]}
+
+
+# ---------------------------------------------------------------------------
+# Part 1/2 -- run state and IDs
+# ---------------------------------------------------------------------------
+
+def test_a_run_creates_its_folder_structure(config, auto_config):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+    directory = Path(state.run_dir)
+
+    assert directory.is_dir()
+    for name in ("checkpoints", "artifacts", "reports", "logs"):
+        assert (directory / name).is_dir()
+    assert (directory / "config.json").exists()
+    assert (directory / "state.json").exists()
+
+    saved = json.loads((directory / "config.json").read_text("utf-8"))
+    assert saved["style"] == "cinematic_minecraft"
+
+
+def test_a_run_id_is_readable_and_carries_the_style(auto_config):
+    run_id = run_id_for(auto_config)
+    parts = run_id.split("-")
+
+    assert len(parts) == 3
+    assert parts[0][:8].isdigit()                # the timestamp
+    assert parts[2] == "cinematic_minecraft"
+
+
+def test_two_footage_folders_get_different_run_ids(tmp_path, auto_config):
+    other = replace(auto_config, footage_folder=str(tmp_path / "elsewhere"))
+    assert run_id_for(auto_config) != run_id_for(other)
+
+
+def test_two_styles_over_one_folder_get_different_run_ids(auto_config):
+    other = replace(auto_config, style="fast_funny")
+    assert run_id_for(auto_config) != run_id_for(other)
+
+
+def test_a_run_is_hermetic(config, auto_config):
+    """Two runs must not be able to overwrite each other's plans."""
+    runner = AutoRunner(config)
+    first = runner.start(auto_config)
+    second = runner.start(replace(auto_config, style="fast_funny"))
+
+    assert first.artifacts_dir != second.artifacts_dir
+    assert Path(first.artifacts_dir).is_dir()
+    assert Path(second.artifacts_dir).is_dir()
+
+
+def test_a_completed_run_is_never_started_over(config, auto_config):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+    state.status = "complete"
+    store.save(config, state)
+
+    with pytest.raises(EditingError) as caught:
+        runner.start(auto_config)
+    assert "--force-new-run" in str(caught.value.hint)
+
+
+def test_an_incomplete_run_is_picked_up_rather_than_refused(config, auto_config):
+    runner = AutoRunner(config)
+    first = runner.start(auto_config)
+    again = runner.start(auto_config)
+    assert again.run_id == first.run_id
+
+
+def test_corrupted_state_refuses_rather_than_guessing(config, auto_config):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+    (Path(state.run_dir) / "state.json").write_text("{not json", "utf-8")
+
+    with pytest.raises(EditingError) as caught:
+        runner.load(state.run_id)
+    assert "corrupted" in str(caught.value).lower()
+    assert "auto clean" in str(caught.value.hint)
+
+
+def test_state_survives_a_round_trip(config, auto_config):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+    state.warnings.append("something")
+    store.save(config, state)
+
+    reloaded = runner.load(state.run_id)
+    assert reloaded.run_id == state.run_id
+    assert reloaded.config.style == "cinematic_minecraft"
+    assert "something" in reloaded.warnings
+
+
+# ---------------------------------------------------------------------------
+# Part 3 -- ordering and the stage table
+# ---------------------------------------------------------------------------
+
+def test_every_stage_declares_its_prerequisites_before_itself():
+    """The run order is the tuple order, so it has to be a valid ordering."""
+    seen: set = set()
+    for name in STAGE_ORDER:
+        stage = auto_stages.stage(name)
+        for requirement in stage.requires:
+            assert requirement in seen, (
+                f"{name} requires {requirement}, which comes later"
+            )
+        seen.add(name)
+
+
+def test_the_stage_table_and_the_runner_table_agree():
+    runnable = {s.name for s in auto_stages.STAGES if s.name != "report"}
+    assert runnable == set(auto_stages.RUNNERS)
+
+
+def test_every_gate_names_a_real_dry_run_stage():
+    from editing.auto.schema import GATE_STAGES
+
+    for gate, stage_name in GATE_STAGES.items():
+        assert stage_name in auto_stages.BY_NAME
+        assert gate in auto_gates.GATE_SPECS
+
+
+def test_dependents_are_transitive():
+    following = auto_stages.dependents("roughcut_build")
+    assert "layers_build" in following
+    assert "assets_dry_run" in following, "should reach through layers_build"
+    assert "discover" not in following
+
+
+@pytest.mark.parametrize("name,why", [
+    ("clip.remove", "deletes"),
+    ("clip.insert", "ripples"),
+    ("marker.add", "marker"),
+])
+def test_the_riskiest_operation_is_named(name, why):
+    got, explanation = riskiest([{"op": "marker.add"}, {"op": name}])
+    assert got == name
+    assert why in explanation
+
+
+def test_an_unknown_operation_is_treated_as_the_riskiest():
+    """Something the table has not heard of is what to warn about."""
+    got, why = riskiest([{"op": "clip.remove"}, {"op": "mystery.op"}])
+    assert got == "mystery.op"
+    assert "does not recognise" in why
+
+
+# ---------------------------------------------------------------------------
+# A whole run
+# ---------------------------------------------------------------------------
+
+def test_a_mock_run_completes_with_nothing_installed(runner, auto_config):
+    """No FFmpeg, no GPU, no model server, no Premiere, no assets."""
+    state = run_once(runner, auto_config)
+
+    assert state.status in ("complete", "blocked"), state.status
+    assert not state.of_status("failed")
+    for name in ("discover", "analyze", "recommend", "roughcut_build",
+                 "roughcut_dry_run", "layers_build", "layers_dry_run",
+                 "assets_plan", "assets_dry_run", "report"):
+        result = state.stage(name)
+        assert result is not None and result.ok, (
+            f"{name} is {result.status if result else 'missing'}: "
+            f"{result.note if result else ''}"
+        )
+
+
+def test_a_mock_run_executes_nothing(runner, auto_config):
+    state = run_once(runner, auto_config)
+    assert all(not gate.executed for gate in state.gates)
+    assert all(not gate.ready for gate in state.gates), (
+        "--no-premiere must leave every gate shut"
+    )
+
+
+def test_the_style_reaches_every_pass_that_cares(runner, auto_config):
+    state = run_once(runner, auto_config)
+    assert state.stage("layers_build").summary["style"] == "cinematic_minecraft"
+
+    layers = json.loads(
+        (Path(state.artifacts_dir) / "layers" / "structure.json")
+        .read_text("utf-8")
+    )
+    assert layers["style"] == "cinematic_minecraft"
+    placement = json.loads(
+        (Path(state.artifacts_dir) / "assets" / "structure.placement.json")
+        .read_text("utf-8")
+    )
+    assert placement["style"] == "cinematic_minecraft"
+
+
+def test_markers_only_reaches_the_layer_and_asset_passes(runner, auto_config):
+    state = run_once(runner, replace(auto_config, markers_only=True))
+
+    layers = json.loads(
+        (Path(state.artifacts_dir) / "layers" / "structure.json")
+        .read_text("utf-8")
+    )
+    ops = {op["op"] for op in layers["plan"]["ops"]}
+    assert ops <= {"sequence.activate", "marker.add"}
+
+    placement = json.loads(
+        (Path(state.artifacts_dir) / "assets" / "structure.placement.json")
+        .read_text("utf-8")
+    )
+    asset_ops = {op["op"] for op in placement["plan"]["ops"]}
+    assert asset_ops <= {"sequence.activate", "marker.add"}
+
+
+def test_skipping_a_pass_marks_it_skipped_not_failed(runner, auto_config):
+    state = run_once(
+        runner, replace(auto_config, skip_review=True, skip_assets=True)
+    )
+    for name in auto_stages.REVIEW_STAGES + auto_stages.ASSET_STAGES:
+        result = state.stage(name)
+        assert result.status == "skipped"
+        assert "--skip" in result.note
+    assert state.stage("layers_build").ok, "the rest of the run continues"
+
+
+def test_an_empty_asset_library_still_produces_a_valid_run(runner, auto_config,
+                                                           tmp_path):
+    empty = tmp_path / "no_assets"
+    state = run_once(
+        runner, replace(auto_config, asset_library=str(empty))
+    )
+
+    assets = state.stage("assets_plan")
+    assert assets.ok
+    assert assets.summary["placed"] == 0
+    assert assets.summary["missing"] > 0, "a shopping list, not a crash"
+    assert state.stage("assets_dry_run").ok
+
+
+def test_a_missing_asset_folder_is_a_warning_not_a_block(runner, auto_config,
+                                                         tmp_path):
+    """The shopping list is most useful to somebody with no library at all."""
+    state = run_once(
+        runner, replace(auto_config, asset_library=str(tmp_path / "nope"))
+    )
+    index = state.stage("assets_index")
+    assert index.ok
+    assert any("assets init" in w for w in index.warnings)
+
+
+def test_no_footage_fails_with_the_command_to_fix_it(config, tmp_path):
+    runner = AutoRunner(config)
+    state = run_once(runner, AutoRunConfig(
+        footage_folder=str(tmp_path / "empty"), mock=True, no_premiere=True,
+    ))
+
+    failure = state.first_failure()
+    assert failure is not None
+    assert failure.stage == "discover"
+    assert failure.failure.next_command
+    assert failure.failure.can_resume
+
+
+def test_a_failed_stage_stops_the_pipeline(config, tmp_path):
+    runner = AutoRunner(config)
+    state = run_once(runner, AutoRunConfig(
+        footage_folder=str(tmp_path / "empty"), mock=True, no_premiere=True,
+    ))
+
+    assert state.status == "failed"
+    assert state.stage("analyze").status == "blocked"
+    assert "earlier stage failed" in state.stage("analyze").note
+
+
+def test_the_run_records_a_log(runner, auto_config):
+    state = run_once(runner, auto_config)
+    log = Path(state.run_dir) / "logs" / "run.log"
+    assert log.exists()
+    assert "stage discover" in log.read_text("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoints and resume
+# ---------------------------------------------------------------------------
+
+def test_a_second_run_reuses_its_checkpoints(runner, auto_config):
+    state = run_once(runner, auto_config)
+    again = runner.run(runner.load(state.run_id))
+
+    assert again.stage("analyze").from_checkpoint
+    assert again.stage("recommend").from_checkpoint
+    assert again.stats()["from_checkpoint"] > 0
+
+
+def test_a_deleted_artifact_invalidates_its_checkpoint(runner, auto_config):
+    state = run_once(runner, auto_config)
+    timeline = Path(state.artifacts_dir) / "timelines" / "structure.json"
+    assert timeline.exists()
+    timeline.unlink()
+
+    again = runner.run(runner.load(state.run_id))
+    assert not again.stage("analyze").from_checkpoint, (
+        "a checkpoint naming a missing artifact must not be trusted"
+    )
+    assert again.stage("analyze").ok
+
+
+def test_a_changed_artifact_invalidates_its_checkpoint(runner, auto_config):
+    state = run_once(runner, auto_config)
+    timeline = Path(state.artifacts_dir) / "timelines" / "structure.json"
+    timeline.write_text(timeline.read_text("utf-8") + "\n", "utf-8")
+
+    again = runner.run(runner.load(state.run_id))
+    assert not again.stage("analyze").from_checkpoint
+
+
+def test_a_corrupted_checkpoint_re_runs_the_stage(runner, auto_config, config):
+    state = run_once(runner, auto_config)
+    store.checkpoint_path(config, state.run_id, "recommend").write_text(
+        "{not json", "utf-8"
+    )
+
+    again = runner.run(runner.load(state.run_id))
+    assert not again.stage("recommend").from_checkpoint
+    assert again.stage("recommend").ok
+
+
+def test_changing_the_style_rebuilds_only_what_depends_on_it(runner,
+                                                             auto_config):
+    state = run_once(runner, auto_config)
+    reloaded = runner.load(state.run_id)
+    reloaded.config = replace(reloaded.config, style="fast_funny")
+
+    again = runner.run(reloaded)
+    assert again.stage("analyze").from_checkpoint, "analysis is style-blind"
+    assert not again.stage("layers_build").from_checkpoint
+    assert again.stage("layers_build").summary["style"] == "fast_funny"
+
+
+def test_restyling_in_place_reuses_the_analysis(runner, auto_config):
+    """Comparing two styles should not cost a second analysis."""
+    from dataclasses import replace as _replace
+
+    state = run_once(runner, auto_config)
+    reloaded = runner.load(state.run_id)
+    reloaded.config = _replace(reloaded.config, style="fast_funny")
+    again = runner.resume(reloaded)
+
+    assert again.run_id == state.run_id, "restyling must not fork a new run"
+    assert again.stage("analyze").from_checkpoint
+    assert again.stage("recommend").from_checkpoint
+    assert not again.stage("layers_build").from_checkpoint
+    assert again.stage("layers_build").summary["style"] == "fast_funny"
+
+
+def test_restyling_in_place_reuses_the_analysis(runner, auto_config, config):
+    """Changing the style should not cost a re-analysis.
+
+    Starting a fresh run with a different style gives a different run ID and
+    therefore a fresh set of checkpoints. Restyling an existing run instead
+    keeps every style-blind stage, which is what makes trying four presets on
+    one edit cheap.
+    """
+    state = run_once(runner, auto_config)
+    reloaded = runner.load(state.run_id)
+    reloaded.config = replace(reloaded.config, style="fast_funny")
+    store.write_config(config, reloaded.run_id, reloaded.config)
+
+    again = runner.resume(reloaded)
+
+    for name in ("discover", "analyze", "recommend", "roughcut_build"):
+        assert again.stage(name).from_checkpoint, f"{name} was re-run"
+    assert not again.stage("layers_build").from_checkpoint
+    assert again.stage("layers_build").summary["style"] == "fast_funny"
+    assert not again.stage("assets_plan").from_checkpoint
+
+
+def test_refresh_rebuilds_a_stage_and_everything_after_it(runner, auto_config):
+    state = run_once(runner, auto_config)
+    again = runner.run(
+        runner.load(state.run_id), refresh=["roughcut_build"]
+    )
+
+    assert not again.stage("roughcut_build").from_checkpoint
+    assert not again.stage("layers_build").from_checkpoint
+    assert again.stage("analyze").from_checkpoint, "upstream is untouched"
+
+
+def test_resume_retries_a_blocked_stage(runner, auto_config, config):
+    """The usual reason to type `resume` is that you just fixed the blocker."""
+    state = run_once(runner, auto_config)
+    reloaded = runner.load(state.run_id)
+    blocked = reloaded.stage("assets_plan")
+    blocked.status = "blocked"
+    blocked.note = "pretend the library was missing"
+    store.clear_checkpoint(config, state.run_id, "assets_plan")
+    store.save(config, reloaded)
+
+    again = runner.resume(reloaded)
+    assert again.stage("assets_plan").ok
+
+
+def test_resume_continues_after_a_failure_is_fixed(config, footage, tmp_path,
+                                                    monkeypatch, frame_source,
+                                                    fake_probe):
+    from editing.roughcut import review as review_module
+
+    written = tmp_path / "frame.jpg"
+    written.write_bytes(b"\xff\xd8jpeg")
+    monkeypatch.setattr(
+        review_module.ff, "extract_frame", lambda *a, **k: written
+    )
+
+    missing = tmp_path / "not_yet"
+    runner = AutoRunner(config)
+    original = runner.pipeline_for
+    runner.pipeline_for = lambda state: _wire(original(state), frame_source)
+
+    state = run_once(runner, AutoRunConfig(
+        footage_folder=str(missing), mock=True, no_premiere=True,
+    ))
+    assert state.status == "failed"
+
+    # The user creates the folder and resumes.
+    missing.mkdir()
+    for index in range(2):
+        (missing / f"clip_{index}.mp4").write_bytes(b"video" * 512)
+
+    resumed = runner.resume(runner.load(state.run_id))
+    assert resumed.stage("discover").ok
+    assert resumed.stage("roughcut_build").ok
+
+
+def _wire(pipeline, frame_source):
+    real = pipeline.analyzer
+
+    def build(**kwargs):
+        kwargs.setdefault("use_motion", False)
+        analyzer = real(**kwargs)
+        analyzer._frame_source = frame_source
+        return analyzer
+    pipeline.analyzer = build
+    return pipeline
+
+
+def test_a_stage_that_produced_nothing_writes_no_checkpoint(runner,
+                                                            auto_config,
+                                                            config):
+    """Half-finishing must not look like finishing."""
+    state = run_once(runner, auto_config)
+    for stage in auto_stages.STAGES:
+        if not stage.resumable or not stage.artifacts:
+            continue
+        checkpoint = store.read_checkpoint(config, state.run_id, stage.name)
+        if checkpoint is not None:
+            assert checkpoint.artifacts, (
+                f"{stage.name} wrote a checkpoint with no artifacts"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Execution gates
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def executable(runner, auto_config):
+    """A completed run that is allowed to execute (no --no-premiere)."""
+    return run_once(runner, replace(auto_config, no_premiere=False))
+
+
+def test_gates_are_created_for_all_four_passes(executable):
+    assert {gate.stage for gate in executable.gates} == {
+        "roughcut", "review", "layers", "assets"
+    }
+
+
+def test_a_later_gate_waits_for_the_rough_cut_to_exist(executable):
+    """Applying a style to a sequence that is not built yet cannot work."""
+    for name in ("review", "layers", "assets"):
+        gate = executable.gate(name)
+        assert not gate.ready
+        assert "rough cut has not been built" in gate.blocked_reason
+
+
+def test_a_gate_knows_what_it_would_do(executable):
+    gate = executable.gate("roughcut")
+    assert gate.dry_run_passed
+    assert gate.operation_count > 0
+    assert gate.sequence_name
+    assert gate.riskiest_operation
+    assert gate.on_scratch
+    assert "--yes" in gate.command
+
+
+def test_no_premiere_shuts_every_gate(runner, auto_config):
+    state = run_once(runner, auto_config)
+    for gate in state.gates:
+        assert not gate.ready
+        assert "--no-premiere" in gate.blocked_reason
+
+
+def test_execution_refuses_without_yes(config, executable):
+    engine = FakeEngine()
+    result = auto_gates.execute(
+        config, executable, "roughcut", yes=False, engine=engine
+    )
+    assert result["success"] is False
+    assert result["code"] == "needs_yes"
+    assert engine.calls == []
+
+
+def test_execution_refuses_when_the_dry_run_did_not_pass(config, executable):
+    reloaded = replace(executable)
+    reloaded.stage("roughcut_dry_run").status = "failed"
+    reloaded.gates = auto_gates.compute_gates(config, reloaded)
+
+    engine = FakeEngine()
+    result = auto_gates.execute(
+        config, reloaded, "roughcut", yes=True, engine=engine
+    )
+    assert result["success"] is False
+    assert "has not passed" in result["refused_reason"]
+    assert engine.calls == []
+
+
+def test_execution_refuses_an_unknown_stage(config, executable):
+    with pytest.raises(EditingError):
+        auto_gates.execute(config, executable, "everything", yes=True)
+
+
+def test_a_gate_that_passes_every_check_executes(config, executable):
+    engine = FakeEngine()
+    result = auto_gates.execute(
+        config, executable, "roughcut", yes=True, engine=engine
+    )
+
+    assert result["success"] is True
+    assert result["executed"] is True
+    assert len(engine.calls) == 1
+    assert engine.calls[0].get("dry_run") is not True
+
+
+def test_a_gate_is_never_executed_twice(config, executable):
+    engine = FakeEngine()
+    auto_gates.execute(config, executable, "roughcut", yes=True, engine=engine)
+    again = auto_gates.execute(
+        config, executable, "roughcut", yes=True, engine=engine
+    )
+
+    assert again["success"] is False
+    assert again["code"] == "already_executed"
+    assert len(engine.calls) == 1, "the second attempt must not reach Premiere"
+
+
+def test_a_resume_never_erases_the_record_of_an_execution(config, executable,
+                                                          runner):
+    """The bug this pins was quiet and total.
+
+    A dry run and a real execution wrote the *same* file. So every ``resume``
+    after an execution overwrote "executed: true" with "executed: false", the
+    later passes then believed the sequence had never been built, and every
+    downstream gate was permanently blocked with no way to clear it.
+    """
+    auto_gates.execute(
+        config, executable, "roughcut", yes=True, engine=FakeEngine()
+    )
+    report = Path(executable.artifacts_dir) / "roughcut" / "structure.execution.json"
+    assert json.loads(report.read_text("utf-8"))["executed"] is True
+
+    resumed = runner.resume(runner.load(executable.run_id))
+
+    assert json.loads(report.read_text("utf-8"))["executed"] is True, (
+        "the dry run stage overwrote the execution record"
+    )
+    layers = json.loads(
+        (Path(resumed.artifacts_dir) / "layers" / "structure.json")
+        .read_text("utf-8")
+    )
+    assert layers["roughcut_executed"] is True
+
+
+def test_the_later_gates_open_once_the_rough_cut_exists(config, executable,
+                                                        runner):
+    """The whole point of the chain: execute, resume, execute the next one."""
+    auto_gates.execute(
+        config, executable, "roughcut", yes=True, engine=FakeEngine()
+    )
+    resumed = runner.resume(runner.load(executable.run_id))
+    layers = resumed.gate("layers")
+
+    assert layers.ready, layers.blocked_reason
+
+    engine = FakeEngine()
+    result = auto_gates.execute(
+        config, resumed, "layers", yes=True, engine=engine
+    )
+    assert result["success"] is True
+    assert len(engine.calls) == 1
+
+
+def test_executing_the_rough_cut_marks_the_later_plans_stale(config,
+                                                             executable):
+    """Those plans recorded that the sequence did not exist. Now it does."""
+    auto_gates.execute(
+        config, executable, "roughcut", yes=True, engine=FakeEngine()
+    )
+    for stage in ("layers_build", "assets_plan"):
+        assert store.read_checkpoint(config, executable.run_id, stage) is None
+    assert any("stale" in w for w in executable.warnings)
+
+
+def test_a_stale_later_gate_says_which_command_fixes_it(config, executable):
+    auto_gates.execute(
+        config, executable, "roughcut", yes=True, engine=FakeEngine()
+    )
+    gates = auto_gates.compute_gates(config, executable)
+    layers = next(g for g in gates if g.stage == "layers")
+
+    assert not layers.ready
+    assert "auto resume" in layers.blocked_reason
+
+
+def test_a_premiere_failure_is_explained_with_the_fix(config, executable):
+    class Unreachable:
+        def run(self, plan):  # pragma: no cover - never called
+            raise AssertionError("should not be reached")
+
+    # No engine and no bridge: the executor cannot build one, and refuses.
+    # The rough cut gate is the one with no dependency on a prior execution,
+    # so the refusal it hits is genuinely the unreachable host.
+    result = auto_gates.execute(config, executable, "roughcut", yes=True)
+    assert result["success"] is False
+    assert "Premiere Bridge is unreachable" in result["refused_reason"]
+    assert "auto execute-stage roughcut" in result["next_command"]
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+def test_the_report_is_written_in_both_forms(runner, auto_config):
+    state = run_once(runner, auto_config)
+    json_path, text_path = store.report_paths(runner.config, state.run_id)
+
+    assert json_path.exists() and text_path.exists()
+    document = json.loads(json_path.read_text("utf-8"))
+    assert document["run_id"] == state.run_id
+    assert document["limitations"]
+
+
+def test_the_report_says_what_it_did_not_do(runner, auto_config):
+    state = run_once(runner, auto_config)
+    text = (store.report_paths(runner.config, state.run_id)[1]
+            .read_text("utf-8"))
+
+    assert "NOT executed" in text
+    assert "MOCK mode" in text
+    assert "no-premiere" in text
+    assert "LIMITATIONS" in text
+
+
+def test_the_report_carries_the_next_commands(runner, auto_config):
+    state = run_once(runner, auto_config)
+    report = auto_report.build_report(runner.config, state)
+    assert report.next_commands
+    assert all("editing.cli" in command for command in report.next_commands)
+
+
+def test_a_failure_report_names_the_command_to_try(config, tmp_path):
+    runner = AutoRunner(config)
+    state = run_once(runner, AutoRunConfig(
+        footage_folder=str(tmp_path / "empty"), mock=True, no_premiere=True,
+    ))
+    text = auto_report.render_failure(state)
+
+    assert "FAILED  discover" in text
+    assert "next   :" in text
+    assert "auto resume" in text
+
+
+def test_missing_assets_are_a_warning_not_a_crash(runner, auto_config,
+                                                   tmp_path):
+    state = run_once(
+        runner, replace(auto_config, asset_library=str(tmp_path / "gone"))
+    )
+    report = auto_report.build_report(runner.config, state)
+
+    assert state.status != "failed"
+    assert any("shopping list" in w or "assets init" in w
+               for w in report.warnings)
+
+
+def test_status_renders_every_stage(runner, auto_config):
+    state = run_once(runner, auto_config)
+    text = auto_report.render_status(state)
+    for name in STAGE_ORDER:
+        assert name in text
+
+
+# ---------------------------------------------------------------------------
+# Listing and cleaning
+# ---------------------------------------------------------------------------
+
+def test_runs_are_listed_newest_first(config, auto_config):
+    runner = AutoRunner(config)
+    runner.start(auto_config)
+    runner.start(replace(auto_config, style="fast_funny"))
+
+    runs = store.list_runs(config)
+    assert len(runs) == 2
+    assert runs[0]["run_id"] >= runs[1]["run_id"]
+
+
+def test_clean_is_a_dry_run_by_default(config, auto_config):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+
+    result = store.clean(config)
+    assert result["dry_run"] is True
+    assert Path(state.run_dir).exists(), "a dry run must delete nothing"
+
+
+def test_clean_removes_incomplete_runs(config, auto_config):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+
+    store.clean(config, dry_run=False)
+    assert not Path(state.run_dir).exists()
+
+
+def test_clean_keeps_completed_runs_unless_told_otherwise(config, auto_config):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+    state.status = "complete"
+    store.save(config, state)
+
+    result = store.clean(config, dry_run=False)
+    assert Path(state.run_dir).exists()
+    assert any("completed" in entry["reason"] for entry in result["kept"])
+
+    store.clean(config, dry_run=False, failed_only=False)
+    assert not Path(state.run_dir).exists()
+
+
+def test_clean_keeps_runs_that_touched_premiere(config, auto_config):
+    from editing.auto.schema import AutoExecutionGate
+
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+    state.gates = [AutoExecutionGate(stage="roughcut", executed=True)]
+    store.save(config, state)
+
+    result = store.clean(config, dry_run=False)
+    assert Path(state.run_dir).exists()
+    assert any("executed" in entry["reason"] for entry in result["kept"])
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def run_cli(argv, capsys):
+    from editing.cli import main
+
+    code = main(argv)
+    return code, capsys.readouterr()
+
+
+def test_the_cli_runs_the_whole_pipeline(footage, tmp_path, capsys, monkeypatch,
+                                          frame_source, fake_probe):
+    from editing.roughcut import review as review_module
+
+    written = tmp_path / "frame.jpg"
+    written.write_bytes(b"\xff\xd8jpeg")
+    monkeypatch.setattr(
+        review_module.ff, "extract_frame", lambda *a, **k: written
+    )
+    monkeypatch.setattr(
+        "editing.visual.frames.FFmpegFrameSource.extract",
+        lambda self, path, window: frame_source.extract(path, window),
+    )
+
+    code, captured = run_cli([
+        "auto", "run", "--folder", str(footage), "--style", "minimal_clean",
+        "--mock", "--no-premiere", "--max-windows", "2",
+        "--output-dir", str(tmp_path / "out"), "--json", "-q",
+    ], capsys)
+
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["success"] is True
+    assert payload["stats"]["failed"] == 0
+
+
+def test_the_cli_refuses_to_execute_without_yes(config, executable, capsys):
+    code, captured = run_cli([
+        "auto", "execute-stage", "roughcut", "--run", executable.run_id,
+        "--output-dir", str(config.output_dir), "--no-premiere",
+        "--json", "-q",
+    ], capsys)
+
+    assert code == 1
+    payload = json.loads(captured.out)
+    assert payload["success"] is False
+    assert payload["code"] == "needs_yes"
+
+
+def test_the_cli_lists_and_shows_status(config, executable, capsys):
+    code, captured = run_cli([
+        "auto", "list-runs", "--output-dir", str(config.output_dir),
+        "--no-premiere", "--json", "-q",
+    ], capsys)
+    assert code == 0
+    assert json.loads(captured.out)["count"] >= 1
+
+    code, captured = run_cli([
+        "auto", "status", "--run", executable.run_id,
+        "--output-dir", str(config.output_dir), "--no-premiere",
+        "--json", "-q",
+    ], capsys)
+    assert code == 0
+    assert json.loads(captured.out)["run_id"] == executable.run_id
+
+
+def test_the_cli_shows_gates(config, executable, capsys):
+    code, captured = run_cli([
+        "auto", "show-gates", "--run", executable.run_id,
+        "--output-dir", str(config.output_dir), "--no-premiere",
+        "--json", "-q",
+    ], capsys)
+
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert {gate["stage"] for gate in payload["gates"]} == {
+        "roughcut", "review", "layers", "assets"
+    }
+
+
+def test_the_cli_explains_a_failure(config, tmp_path, capsys):
+    runner = AutoRunner(config)
+    state = run_once(runner, AutoRunConfig(
+        footage_folder=str(tmp_path / "empty"), mock=True, no_premiere=True,
+    ))
+
+    code, captured = run_cli([
+        "auto", "explain-failure", "--run", state.run_id,
+        "--output-dir", str(config.output_dir), "--no-premiere",
+        "--json", "-q",
+    ], capsys)
+
+    assert code == 0
+    payload = json.loads(captured.out)
+    assert payload["failed"]
+    assert payload["failed"][0]["failure"]["next_command"]
+
+
+def test_the_cli_clean_needs_yes_to_delete(config, auto_config, capsys):
+    runner = AutoRunner(config)
+    state = runner.start(auto_config)
+
+    code, captured = run_cli([
+        "auto", "clean", "--output-dir", str(config.output_dir),
+        "--no-premiere", "--json", "-q",
+    ], capsys)
+
+    assert code == 0
+    assert json.loads(captured.out)["dry_run"] is True
+    assert Path(state.run_dir).exists()
+
+
+# ---------------------------------------------------------------------------
+# Session 9 -- the feedback stages
+# ---------------------------------------------------------------------------
+#
+# Three properties, and the first is the important one: a review is optional,
+# and a run that does not want one must be completely unaffected by the fact
+# that the machinery exists.
+
+def test_feedback_is_off_unless_it_is_asked_for(runner, auto_config):
+    """Every other pass is opt-out; this one is opt-in, and defaults prove it."""
+    from editing.auto.stages import FEEDBACK_STAGES
+
+    state = run_once(runner, auto_config)
+    for name in FEEDBACK_STAGES:
+        result = state.stage(name)
+        assert result is not None and result.status == "skipped", name
+        assert "--feedback" in result.note
+
+
+def test_skipped_feedback_does_not_block_the_run(runner, auto_config):
+    """Not merely 'skipped': the stages after it must still be satisfied."""
+    state = run_once(runner, auto_config)
+    assert not state.of_status("failed")
+    assert state.stage("report").ok
+    assert state.satisfied("feedback_start"), (
+        "a skipped optional stage must still satisfy what depends on it"
+    )
+
+
+def test_no_session_is_created_by_a_normal_run(config, runner, auto_config):
+    from editing.feedback import store as feedback_store
+
+    state = run_once(runner, auto_config)
+    run_config = store.run_config(config, state.run_id)
+    assert feedback_store.list_sessions(run_config) == []
+
+
+def test_the_feedback_stages_open_a_session_and_a_queue(
+    config, runner, auto_config
+):
+    from editing.feedback import store as feedback_store
+
+    state = run_once(runner, replace(auto_config, feedback=True))
+    assert not state.of_status("failed")
+
+    for name in ("feedback_start", "feedback_queue", "feedback_report"):
+        result = state.stage(name)
+        assert result is not None and result.ok, (
+            f"{name}: {result.status if result else 'missing'}")
+
+    run_config = store.run_config(config, state.run_id)
+    sessions = feedback_store.list_sessions(run_config)
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert session.run_id == state.run_id
+
+    directory = feedback_store.session_dir(run_config, session.session_id)
+    assert (directory / "queue.json").exists()
+    assert (directory / "feedback.jsonl").exists()
+    assert (directory / "report.md").exists()
+    assert state.stage("feedback_queue").summary["questions"] > 0
+
+
+def test_a_resume_adds_to_the_review_rather_than_splitting_it(
+    config, runner, auto_config
+):
+    """``feedback_start`` is not resumable, so it must be idempotent instead.
+
+    Opening a second session on a resume would split one review across two
+    logs with no way to tell which was current -- and neither could be
+    rewritten to merge them, because the log is append-only.
+    """
+    from editing.feedback import store as feedback_store
+
+    state = run_once(runner, replace(auto_config, feedback=True))
+    run_config = store.run_config(config, state.run_id)
+    first = feedback_store.list_sessions(run_config)[0]
+
+    resumed = runner.resume(state)
+    sessions = feedback_store.list_sessions(
+        store.run_config(config, resumed.run_id))
+
+    assert len(sessions) == 1, [s.session_id for s in sessions]
+    assert sessions[0].session_id == first.session_id
+    assert resumed.stage("feedback_start").summary["reused"] is True
+
+
+def test_a_broken_review_costs_the_review_and_not_the_run(
+    config, runner, auto_config, monkeypatch
+):
+    """The feedback stages are non-critical, and that has to be real."""
+    from editing.auto import stages as stages_module
+
+    def explode(pipeline, run, context):
+        raise RuntimeError("the review machinery fell over")
+
+    monkeypatch.setitem(stages_module.RUNNERS, "feedback_queue", explode)
+    state = run_once(runner, replace(auto_config, feedback=True))
+
+    assert state.stage("feedback_queue").status == "failed"
+    assert state.stage("roughcut_build").ok
+    assert state.stage("report").ok, "the run report must still be written"
+
+
+def test_the_run_report_says_how_to_start_a_review_even_when_none_ran(
+    config, runner, auto_config
+):
+    state = run_once(runner, auto_config)
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    feedback = report.feedback
+    assert feedback["enabled"] is False
+    assert feedback["session_id"] == ""
+    assert feedback["worth_reviewing"] > 0, (
+        "there is a whole rough cut here; something is worth reviewing")
+    assert "feedback start" in feedback["start_command"]
+    assert state.run_id in feedback["start_command"]
+    assert "feedback queue" in feedback["queue_command"]
+    assert feedback["saved_to"]
+    assert "trains" in feedback["trains_nothing"]
+
+    text = auto_report.render(state, report)
+    assert "WORTH A HUMAN LOOK" in text
+    assert "No review has been started for this run." in text
+
+
+def test_the_run_report_names_the_session_once_one_exists(
+    config, runner, auto_config
+):
+    state = run_once(runner, replace(auto_config, feedback=True))
+    run_config = store.run_config(config, state.run_id)
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    assert report.feedback["enabled"] is True
+    assert report.feedback["session_id"]
+    assert report.feedback["questions"] > 0
+    text = auto_report.render(state, report)
+    assert report.feedback["session_id"] in text
+
+
+def test_a_report_survives_a_feedback_layer_that_cannot_be_read(
+    config, runner, auto_config, monkeypatch
+):
+    """An optional section must never be able to break the run report."""
+    from editing.feedback import store as feedback_store
+
+    state = run_once(runner, auto_config)
+    monkeypatch.setattr(
+        feedback_store, "latest_session",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk is gone")),
+    )
+    report = auto_report.build_report(runner.config, state, None)
+    assert report.run_id == state.run_id
+    assert isinstance(report.feedback, dict)
+
+
+def test_the_review_lives_inside_the_run_it_is_about(
+    config, runner, auto_config
+):
+    """Each run is hermetic, and its review is part of what it produced.
+
+    Two runs over the same footage in different styles produce two different
+    edits and deserve two separate reviews; a shared feedback directory would
+    mix them with nothing to tell them apart.
+    """
+    from editing.feedback import store as feedback_store
+
+    state = run_once(runner, replace(auto_config, feedback=True))
+    run_config = store.run_config(config, state.run_id)
+
+    assert feedback_store.list_sessions(run_config), "not in the run folder"
+    assert feedback_store.list_sessions(config) == [], (
+        "the shared output directory must be untouched"
+    )
+    session_dir = feedback_store.session_dir(
+        run_config, feedback_store.list_sessions(run_config)[0].session_id)
+    assert Path(state.artifacts_dir) in Path(session_dir).parents
+
+
+def test_the_printed_commands_can_reach_the_session_they_name(
+    config, runner, auto_config
+):
+    """The report tells you what to type; typing it has to work.
+
+    ``--session`` alone would point at the shared output directory, where a
+    run-scoped review does not exist -- so both flags have to be printed.
+    """
+    state = run_once(runner, replace(auto_config, feedback=True))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    feedback = report.feedback
+
+    for key in ("queue_command", "report_command"):
+        command = feedback[key]
+        assert f"--run {state.run_id}" in command, key
+        assert f"--session {feedback['session_id']}" in command, key
+
+
+# ---------------------------------------------------------------------------
+# Session 10A -- the transcription stage
+# ---------------------------------------------------------------------------
+
+def test_transcription_is_off_unless_it_is_asked_for(runner, auto_config):
+    """It loads a speech model, so it is opt-in like the feedback stages."""
+    state = run_once(runner, auto_config)
+    result = state.stage("transcribe")
+    assert result is not None and result.status == "skipped"
+    assert "--transcribe" in result.note
+
+
+def test_a_skipped_transcription_does_not_block_analysis(runner, auto_config):
+    """Analysis works without dialogue. It is just less good, and says so."""
+    state = run_once(runner, auto_config)
+    assert not state.of_status("failed")
+    assert state.stage("analyze").ok
+    assert state.satisfied("transcribe")
+
+
+def test_transcription_runs_before_analysis(runner, auto_config):
+    """Order matters: a transcript produced after analysis helps nothing."""
+    from editing.auto.schema import STAGE_ORDER
+    assert STAGE_ORDER.index("transcribe") < STAGE_ORDER.index("analyze")
+    assert STAGE_ORDER.index("discover") < STAGE_ORDER.index("transcribe")
+
+
+def test_the_transcribe_stage_produces_transcripts(runner, auto_config, config):
+    """Driven with the mock backend, so this needs no speech model."""
+    from editing.transcripts import store as transcript_store
+
+    state = run_once(runner, replace(
+        auto_config, transcribe=True, transcribe_backend="mock"))
+    result = state.stage("transcribe")
+    assert result is not None and result.ok, result.note
+
+    summary = result.summary
+    assert summary["files"] == 3
+    assert summary["transcribed"] == 3
+    assert summary["words"] > 0
+
+    run_config = store.run_config(config, state.run_id)
+    written = list(run_config.transcripts_dir.glob("*.json"))
+    assert written, "the durable transcripts the pipeline reads"
+    transcript, _stale = transcript_store.load(
+        run_config, json.loads(written[0].read_text("utf-8"))["asset_id"])
+    assert transcript is not None and len(transcript)
+
+
+def test_a_second_run_transcribes_nothing(runner, auto_config, config):
+    """What makes ``--transcribe`` safe to leave on."""
+    first = run_once(runner, replace(
+        auto_config, transcribe=True, transcribe_backend="mock"))
+    assert first.stage("transcribe").summary["transcribed"] == 3
+
+    resumed = runner.resume(first)
+    summary = resumed.stage("transcribe").summary
+    assert summary["transcribed"] == 0
+    assert summary["skipped"] == 3
+
+
+def test_a_missing_speech_model_blocks_the_stage_and_not_the_run(
+    runner, auto_config, monkeypatch
+):
+    from editing.transcribe import backends as backends_module
+
+    monkeypatch.setattr(
+        backends_module.FasterWhisperBackend, "installed",
+        staticmethod(lambda: False))
+    state = run_once(runner, replace(auto_config, transcribe=True))
+
+    result = state.stage("transcribe")
+    assert result.status == "blocked", result.status
+    assert "faster-whisper is not installed" in (
+        result.failure.why if result.failure else "")
+    assert "pip install faster-whisper" in (
+        result.failure.next_command if result.failure else "")
+
+    assert state.stage("analyze").ok, "the run continues without dialogue"
+    assert state.stage("roughcut_build").ok
+    assert state.stage("report").ok
+
+
+def test_one_unreadable_clip_does_not_fail_the_stage(
+    runner, auto_config, footage, config
+):
+    """A batch survives its worst file, and the run report says which."""
+    (footage / "clip_01.mp4").write_bytes(b"")
+
+    state = run_once(runner, replace(
+        auto_config, transcribe=True, transcribe_backend="mock"))
+    result = state.stage("transcribe")
+
+    assert result.ok, result.status
+    assert result.summary["failed"] == 1
+    assert result.summary["transcribed"] == 2
+    assert any("clip_01" in warning for warning in result.warnings)
+
+
+def test_the_transcription_model_reaches_the_stage(runner, auto_config):
+    state = run_once(runner, replace(
+        auto_config, transcribe=True, transcribe_backend="mock",
+        transcribe_model="base", transcribe_language="en"))
+    summary = state.stage("transcribe").summary
+    assert summary["model"] == "base"
+    assert summary["backend"] == "mock"
+    assert summary["mock"] is True, (
+        "a run built on fabricated transcripts must say so in its report")

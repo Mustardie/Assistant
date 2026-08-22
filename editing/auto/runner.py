@@ -495,6 +495,10 @@ class AutoRunner:
             return "--skip-assets was set"
         if run.skip_episode and name in stages_module.EPISODE_STAGES:
             return "--skip-episode was set"
+        # Inverted, like feedback below: transcription is opt-in because it
+        # loads a speech model and takes minutes per episode.
+        if not run.transcribe and name in stages_module.TRANSCRIBE_STAGES:
+            return "--transcribe was not set"
         # Inverted, and the only stage group that is: feedback is opt-in
         # because it starts a review a person has to finish.
         if not run.feedback and name in stages_module.FEEDBACK_STAGES:
