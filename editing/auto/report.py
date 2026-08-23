@@ -86,11 +86,71 @@ def build_report(
             if entry not in report.warnings:
                 report.warnings.append(entry)
 
+    report.director = _director_section(state)
     report.render = _render_section(config, state, pipeline)
     report.feedback = _feedback_section(config, state, pipeline)
     report.check_in_premiere = _check_list(state)
     report.next_commands = _next_commands(state, report)
     return report
+
+
+def _director_section(state: AutoRunState) -> dict:
+    """Which selector chose this cut, and what the rules made of it.
+
+    Filled whether or not the stage ran, because "this cut was chosen by
+    thresholds" is a fact about the cut, and a report that only mentioned the
+    director when it ran would make its absence invisible.
+    """
+    section = {
+        "enabled": bool(state.config.director),
+        "ran": False,
+        "mock": False,
+        "backend": "",
+        "model": "",
+        "mode": state.config.director_mode,
+        "style_guide": "",
+        "decisions": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "modified": 0,
+        "selection": "heuristic",
+        "plan_command": "python -m editing.cli director plan",
+        "run_with_director": (
+            "python -m editing.cli auto run --folder "
+            f"{state.config.footage_folder or '<folder>'} --director "
+            f"--style {state.config.style} --no-premiere"),
+        "note": (
+            "The director proposes; deterministic checks decide. Every "
+            "rejection names the rule that made it."
+        ),
+    }
+
+    result = state.stage("director_plan")
+    if result is not None and result.summary:
+        section["ran"] = result.ok
+        for key in ("backend", "model", "mock", "mode", "style_guide",
+                    "decisions", "accepted", "rejected", "modified",
+                    "cut_duration"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+        section["report_command"] = (
+            f"python -m editing.cli director report --run {state.run_id}")
+        section["rejected_command"] = (
+            f"python -m editing.cli director show-rejected "
+            f"--run {state.run_id}")
+        section["compare_command"] = (
+            f"python -m editing.cli director compare-heuristic "
+            f"--run {state.run_id}")
+    if result is not None and result.status in ("blocked", "failed"):
+        section["blocked_reason"] = (
+            result.failure.why if result.failure else result.note)
+
+    # What actually chose the ranges, read from the rough cut stage rather
+    # than from what was asked for.
+    roughcut = state.stage("roughcut_build")
+    if roughcut is not None and roughcut.summary.get("selection"):
+        section["selection"] = roughcut.summary["selection"]
+    return section
 
 
 def _render_section(
@@ -341,6 +401,7 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
             ("markers-only", run.markers_only),
             ("skip-review", run.skip_review), ("skip-assets", run.skip_assets),
             ("render-proxy", run.render_proxy), ("transcribe", run.transcribe),
+            ("director", run.director),
         ) if on
     ]
     add(f"modes      : {', '.join(modes) if modes else 'none'}")
@@ -414,6 +475,42 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
         for line in gate.render().splitlines():
             add(f"  {line}")
         add("")
+
+    # -- who chose the cut -------------------------------------------------
+    director = report.director or {}
+    add(_THIN)
+    add("WHO CHOSE THIS CUT")
+    add(_THIN)
+    if director.get("ran"):
+        add(f"  A director pass ran with {director.get('model', '?')} "
+            f"({director.get('backend', '?')}).")
+        add(f"  {director.get('decisions', 0)} decision(s): "
+            f"{director.get('accepted', 0)} accepted, "
+            f"{director.get('rejected', 0)} rejected by the rules, "
+            f"{director.get('modified', 0)} modified.")
+        add(f"  Style guide: {director.get('style_guide', '?')}.  "
+            f"Ranges chosen by: {director.get('selection', '?')}.")
+        if director.get("mock"):
+            add("  ! MOCK DIRECTOR: the decisions came from four fixed rules,")
+            add("    not from a model. This is a rule-based cut with extra "
+                "steps.")
+        add(f"  why each : {director.get('rejected_command', '')}")
+        add(f"  compare  : {director.get('compare_command', '')}")
+    elif director.get("blocked_reason"):
+        add(f"  The director pass did not run: "
+            f"{str(director['blocked_reason'])[:150]}")
+        add("  The cut was chosen by the rule-based selector instead.")
+    else:
+        add("  The rule-based selector chose this cut: usefulness "
+            "thresholds, dead")
+        add("  air, danger and audio spikes, judged eight seconds at a time. "
+            "It cannot")
+        add("  see that a dull stretch is a setup, or that the episode opens "
+            "on walking.")
+        add("  To have a model read the whole episode and decide instead:")
+        add(f"    {director.get('run_with_director', '')}")
+    add(f"  {director.get('note', '')}")
+    add("")
 
     # -- the watchable version ---------------------------------------------
     render_section = report.render or {}
@@ -568,6 +665,22 @@ def _headlines(state: AutoRunState, report: AutoRunReport) -> list[str]:
                 "Asset library empty or nothing matched; every placeholder is "
                 "a marker. `auto report` lists what to go and find."
             )
+
+    director = report.director or {}
+    if director.get("ran"):
+        out.append(
+            f"The cut was chosen by a director pass "
+            f"({director.get('accepted', 0)} of "
+            f"{director.get('decisions', 0)} decisions accepted, "
+            f"{director.get('rejected', 0)} refused by the rules)"
+            + (" -- in MOCK mode, so by fixed rules rather than a model."
+               if director.get("mock") else ".")
+        )
+    elif run.director:
+        out.append(
+            "A director pass was asked for and did not run; the cut was "
+            "chosen by the rule-based selector."
+        )
 
     render_section = report.render or {}
     if render_section.get("rendered"):

@@ -104,10 +104,24 @@ STAGES = (
         manual_command="python -m editing.cli recommend",
     ),
     AutoStage(
+        name="director_plan",
+        summary="A model reads the whole episode and decides what the cut is",
+        # Needs the story layer to be worth running, but must come *before*
+        # the rough cut it chooses the ranges for -- so it depends on
+        # recommendations and reads the episode memory opportunistically.
+        requires=("recommend",),
+        config_keys=("name", "style", "director_mode", "director_model",
+                     "director_backend", "style_guide", "target_duration"),
+        artifacts=("director/structure.plan.json",),
+        requires_model=True,
+        critical=False,
+        manual_command="python -m editing.cli director plan",
+    ),
+    AutoStage(
         name="roughcut_build",
         summary="Select ranges and lay out the scratch sequence",
         requires=("recommend",),
-        config_keys=("name",),
+        config_keys=("name", "director", "director_mode"),
         artifacts=("roughcut/structure.json",),
         manual_command="python -m editing.cli roughcut build",
     ),
@@ -293,6 +307,11 @@ ASSET_STAGES = ("assets_index", "assets_plan", "assets_dry_run")
 #: Stages the episode pass owns. Skipped as a group by ``--skip-episode``.
 #: Neither executes anything, so neither has a dry run or a gate.
 EPISODE_STAGES = ("episode_memory", "retention_plan")
+
+#: The director pass, on its own. Opt-in via ``--director``: it needs a model
+#: endpoint, and a pipeline that silently required one would stop working on
+#: every machine that has not set one up.
+DIRECTOR_STAGES = ("director_plan",)
 
 #: The proxy render, on its own. Opt-in via ``--render-proxy``: it is the
 #: only stage that produces a file measured in hundreds of megabytes, and a
@@ -578,11 +597,101 @@ def run_recommend(pipeline, run, context) -> tuple:
     )
 
 
+def run_director_plan(pipeline, run, context) -> tuple:
+    """Ask the director what the cut is, and check every answer.
+
+    Non-critical, like the review pass and for the same reason: a machine with
+    no model endpoint still produces every plan, and losing this one costs the
+    story-aware selection rather than the run. The rough cut stage then falls
+    back to the thresholds and says in its own summary that it did.
+    """
+    from editing.director.schema import DirectorConfig
+
+    settings = pipeline.director_config(
+        backend=run.director_backend or None,
+        model=run.director_model or None,
+        mode=run.director_mode or None,
+        style=run.style or None,
+        target_duration=(run.target_duration or None),
+    )
+    health = pipeline.director_status(settings)
+    if not health.get("ready"):
+        raise StageBlocked(
+            "could not run the director pass",
+            f"the director model is not reachable "
+            f"({health.get('error') or 'no reason given'}). The run continues "
+            "and the rough cut will be chosen by the rule-based selector.",
+            code="director_unreachable",
+            next_command=str(health.get("hint")
+                             or "python -m editing.cli director status"),
+            detail={"health": health},
+        )
+
+    plan = pipeline.director_plan(
+        name=run.name, settings=settings,
+        style_guide_path=run.style_guide or "",
+    )
+    context["director_plan"] = plan
+
+    if plan.failure is not None:
+        raise StageBlocked(
+            "the director pass produced no usable cut",
+            plan.failure.message,
+            code=plan.failure.code,
+            next_command=plan.failure.hint
+            or "python -m editing.cli director report",
+            detail={"stage": plan.failure.stage},
+        )
+
+    stats = plan.stats()
+    return (
+        [str(pipeline.config.director_dir / f"{run.name}.plan.json")],
+        {
+            "backend": plan.backend,
+            "model": plan.model,
+            # Loud, for the same reason the transcription stage is: a cut
+            # chosen by four fixed rules must never read as a directed one.
+            "mock": plan.mock,
+            "cached": plan.cached,
+            "mode": plan.mode,
+            "style_guide": plan.style_guide.name,
+            "decisions": stats["decisions"],
+            "accepted": stats["accepted"],
+            "rejected": stats["rejected"],
+            "modified": stats["modified"],
+            "needs_human_review": stats["needs_human_review"],
+            "ranges": stats["ranges"],
+            "cut_duration": stats["cut_duration"],
+        },
+        list(plan.warnings),
+    )
+
+
 def run_roughcut_build(pipeline, run, context) -> tuple:
+    from editing.roughcut.build import RoughCutOptions
+
+    # The director stage is non-critical, so it may have been skipped,
+    # blocked or have failed -- in every one of those cases this falls back to
+    # the thresholds and the summary below says which selector actually ran.
+    #
+    # The test is ``ranges``, not ``is not None``. A blocked director stage
+    # still leaves its plan in the context (the rejections are worth keeping),
+    # and a plan with no ranges produces a threshold cut -- so keying on the
+    # object's existence made the report say "hybrid" over a cut the
+    # thresholds had chosen entirely, which is the one outcome this whole
+    # layer is not allowed to produce.
+    director = context.get("director_plan")
+    if director is None and run.director:
+        director = pipeline.director_plan_or_none(name=run.name)
+    usable = director is not None and bool(director.ranges)
+    mode = run.director_mode if (run.director and usable) else "heuristic"
+
     plan = pipeline.rough_cut(
         timeline=context.get("timeline"),
         recommendations=context.get("recommendations"),
         name=run.name,
+        options=RoughCutOptions(mode=mode),
+        director_plan=director,
         # Validated here so the saved plan carries ``dry_run_passed``. The
         # dry-run stage re-validates but writes nothing: rewriting the plan
         # would change its fingerprint and invalidate this stage's own
@@ -609,6 +718,9 @@ def run_roughcut_build(pipeline, run, context) -> tuple:
             "markers": stats["markers"],
             "operations": stats["operations"],
             "unconverted": stats["unconverted"],
+            # Which selector actually chose the ranges. Not what was asked
+            # for -- what happened.
+            "selection": mode,
         },
         list(plan.warnings),
     )
@@ -966,6 +1078,7 @@ RUNNERS = {
     "transcribe": run_transcribe,
     "analyze": run_analyze,
     "recommend": run_recommend,
+    "director_plan": run_director_plan,
     "roughcut_build": run_roughcut_build,
     "roughcut_dry_run": run_roughcut_dry_run,
     "review_export_frames": run_review_export_frames,

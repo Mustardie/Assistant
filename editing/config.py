@@ -435,6 +435,18 @@ class EditingConfig:
         return self.output_dir / "feedback"
 
     @property
+    def director_dir(self) -> Path:
+        """Director contexts, plans, prompts and comparisons.
+
+        Its own directory for the same reason ``critic_dir`` is: a director
+        plan is one opinion about footage, and re-running it must never be
+        able to overwrite the rough cut it is an alternative to. The prompt
+        lands here too, as text, because the first thing to do about a strange
+        plan is read what was actually asked.
+        """
+        return self.output_dir / "director"
+
+    @property
     def render_dir(self) -> Path:
         """Proxy renders: job folders, the videos, and their review notes.
 
@@ -462,7 +474,7 @@ class EditingConfig:
             self.audio_dir, self.recommendations_dir, self.plans_dir,
             self.roughcut_dir, self.review_dir, self.critic_dir,
             self.layers_dir, self.asset_library_dir, self.episode_dir,
-            self.feedback_dir, self.render_dir,
+            self.feedback_dir, self.render_dir, self.director_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

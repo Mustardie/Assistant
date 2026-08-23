@@ -1,6 +1,6 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-23 (Session 10B).
+Context for continuing this work in a new chat. Updated 2026-08-23 (Session 10C).
 
 ---
 
@@ -8,7 +8,7 @@ Context for continuing this work in a new chat. Updated 2026-08-23 (Session 10B)
 
 ```cmd
 cd /d E:\Assistant
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1499 passed
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1692 passed
 
 REM hear the footage first -- the story layer is blind without this:
 pip install faster-whisper
@@ -17,6 +17,15 @@ python -m editing.cli transcribe folder D:\Footage\test --model small
 REM the whole pipeline, planning only, with nothing installed:
 python -m editing.cli auto run --folder D:\Footage\test --mock --no-premiere --transcribe
 python -m editing.cli auto report
+
+REM watch what it decided, without opening Premiere:
+python -m editing.cli render roughcut
+python -m editing.cli render open
+
+REM have a model choose the cut instead of a threshold:
+python -m editing.cli director status
+python -m editing.cli director plan --backend mock
+python -m editing.cli director compare-heuristic
 
 REM then tell it what you think of the result:
 python -m editing.cli feedback start
@@ -30,7 +39,7 @@ Everything below is detail behind that.
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all eleven sessions and 1499 passing editing tests.
+This has all twelve sessions and 1692 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -51,7 +60,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in eleven sessions
+## What was built, in twelve sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -85,6 +94,16 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
      over every decision → ratings, reasons, corrections, appended to a log
      that is never rewritten → preference signals, training signals, exports.
      Trains nothing.
+                                                    ↓
+     Session 10B renders any rough cut to a proxy MP4 with FFmpeg and writes a
+     timestamped review file beside it. No Premiere, no GPU, no model — the
+     first pass whose output is something you watch.
+                                                    ↓
+     Session 10C stops choosing footage with a threshold. A model reads the
+     whole structured episode — transcript, beats, loops, setups, payoffs,
+     risks, your prose style guide — and decides what the cut is. Twelve
+     deterministic checks then decide what it is allowed to do, and every
+     refusal names the rule. The heuristic remains the fallback, always.
 ```
 
 | Session | Package | What it added |
@@ -100,6 +119,7 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
 | 9 | `feedback/` | the review queue, the append-only log, preference and training signals |
 | 10A | `transcribe/` | local faster-whisper, the cache, batches, the durable-transcript seam |
 | 10B | `render/` | FFmpeg proxy renders, review notes, the render cache |
+| 10C | `director/` | a model chooses the cut; twelve rules decide what it may do |
 
 ### Session 7 — the auto pipeline
 
@@ -256,6 +276,60 @@ and 720p30-with-no-audio rendered in 1.2s to a 15.06s file against a planned
 segments. `auto run --render-proxy` completed all 23 stages on the same
 footage. The test suite itself needs no FFmpeg: every subprocess goes through
 an injected runner.
+
+### Session 10C -- the director pass
+
+The Week 2 feature, and the first one that changes *what the edit is* rather
+than what can be done with it. Selection up to here was local: `usefulness >=
+0.40`, dead air goes, danger stays, judged eight seconds at a time. That cannot
+see that a dull stretch at 04:12 is the setup for the thing at 31:40, that the
+episode opens on walking, or that the same joke has landed three times.
+
+A model now reads the whole structured episode and decides what the cut is.
+Then twelve deterministic checks decide what it is allowed to do.
+
+- `editing/director/`
+  - `schema.py` -- `DirectorConfig` and the ten records; the closed action,
+    reason and viewer-effect vocabularies; `NOT_MEASURED`
+  - `style_guide.py` -- prose editing rules, from four places, with a built-in
+    default that has real rules in it
+  - `context.py` -- the brief: merge, trim, thin, and say what was left out
+  - `prompt.py` -- the instruction, and the context renderer the budget is
+    measured against
+  - `backends.py` -- any OpenAI-compatible endpoint, plus the mock that
+    decides by four fixed rules and says so
+  - `parse.py` -- untrusted text to decisions: resolve, repair, discard
+  - `safety.py` -- the twelve checks, in a fixed order
+  - `convert.py` -- accepted ranges into Session 3's builder; hybrid merging
+  - `compare.py` -- director cut against threshold cut
+  - `store.py` -- the plan, the prompt as text, the cache
+  - `report.py` -- decisions, rejections, and what to type next
+  - `run.py` -- the orchestration, and every failure as a result
+- `editing/config.py` -- `director_dir`
+- `editing/roughcut/build.py` -- `RoughCutOptions.mode` and `_select`; the
+  heuristic path is byte-for-byte unchanged
+- `editing/pipeline.py` -- `director_config|status|context|plan`,
+  `load_director_plan`, `director_plan_or_none`, `director_report`,
+  `compare_director`, `style_guide`, `clear_director_cache`; `rough_cut`
+  gained `director_plan`
+- `editing/cli.py` -- `director build-context|plan|report|show-decisions|
+  show-rejected|show-style|compare-heuristic|render|status|clear-cache`
+- `editing/auto/` -- one more stage, `director_plan`, before `roughcut_build`,
+  opt-in behind `--director`, plus a `WHO CHOSE THIS CUT` section in every run
+  report whether or not it ran
+- `tests/editing/test_editing_director.py` -- 179 tests, plus 9 in the auto
+  suite
+
+**Verified against a real HTTP endpoint.** Five tests run an
+OpenAI-compatible server on loopback and assert the whole envelope: the URL,
+the message roles, the JSON-mode hint, the `Authorization` header, and
+unwrapping an answer that arrives fenced with a sentence either side. No model
+is involved and nothing leaves the machine.
+
+**Not verified against a real model.** Whether a 14B or 70B model actually
+makes better editing choices than the threshold is unknown, and
+`director compare-heuristic` plus rendering both cuts is the only way to find
+out. That is now gap 23 and the highest-value next action in the whole system.
 
 ---
 
@@ -536,23 +610,110 @@ whole render again in disk terms, and the question that follows a failed join
 is always "which clip is wrong" -- which should not cost a second render to
 answer.
 
+### From Session 10C
+
+**The model proposes; the deterministic layer disposes.** A `DirectorDecision`
+arrives with `accepted=False` and only a check can change that. This is the
+same structure Session 4 gave the critic, and it is what makes a language model
+safe to have near an edit at all: a model asked to be creative will
+occasionally invent a payoff that is not there, and a system that acts on the
+invention has no way to tell afterwards.
+
+**A decision names segment ids, never timestamps.** Times come from the
+timeline the context was built from. That single choice removes a whole class
+of failure -- a hallucinated range resolves to nothing and is rejected with a
+reason rather than becoming footage that does not exist. There is exactly one
+place a number from the model becomes a time (`shorten`), and it is clamped
+inside the segments the decision named, so the worst a wrong number can do is
+choose a different part of footage that genuinely exists.
+
+**Merge before you drop.** The context builder's biggest reduction is folding
+adjacent segments that would get the same verdict into one candidate, and it
+loses nothing -- the director would have made one decision about them anyway.
+Everything after that (thinning, shortening speech, dropping sections) loses
+something, and is ordered worst-value-first with every reduction recorded on
+the plan.
+
+**Speech is summarised head *and* tail.** The end of a stretch of commentary is
+where the reaction usually is, and a director judging whether a joke lands
+needs the punchline more than the setup. Nothing is ever paraphrased: a
+paraphrase is a claim about what somebody said.
+
+**The style guide is read by the model and not parsed by the rules.** A rule
+this system cannot check is a rule it must not claim to enforce. So prose
+changes which decisions get *proposed*, and the report shows which lines were
+actually cited -- which is how a person finds out whether their guide is being
+used at all.
+
+**Hybrid is the default in auto mode, not `director`.** A director given 160
+candidates makes forty decisions, not 160 -- the prompt explicitly says it does
+not need one per range. In `director` mode the other 120 are simply absent,
+which is a short, choppy cut. In `hybrid` they fall through to the rule the
+system has always used. Footage the director explicitly *cut* is never re-added.
+
+**`required_setup` is the check that justifies the layer.** Cutting the setup
+for a payoff that stays in makes the payoff arrive from nowhere, and no local
+heuristic can see it: the setup looks like nothing and the only reason to keep
+it sits twenty minutes later. If this layer earns its cost anywhere, it is
+there.
+
+**Anything that keeps a payoff ends up holding it.** A plain `keep` over a
+payoff is still unprotected, so a later style or asset pass could zoom or duck
+it. Found because an earlier check (speech, retiming) can downgrade a decision
+to `keep` before `protected_payoff` ever sees it.
+
+**A keep reasoned as "pacing" is not grind.** The grind budget originally
+counted it, and "pacing" is the natural category for an ordinary keep -- so the
+budget rejected most of a normal cut. Only `speed_up`, and a keep the director
+itself called `boring_repetition`, count.
+
+**The answer cache stores raw text, not parsed decisions.** The parser and the
+safety pass will both change as this is tuned, and a cache of parsed output
+would mean fixing a parser bug did not fix anything already cached. Re-parsing
+on every hit is free.
+
+**The context fingerprint spells its numbers.** The same int-versus-float bug
+the render cache had: a context built in memory carries `start=0` where the
+same context read from JSON carries `0.0`, and `repr` spells those differently.
+Second time this exact bug has appeared in two sessions; worth checking for a
+third time in any new fingerprint.
+
+**A blocked director stage still leaves its plan behind**, and keying the cut's
+selection mode on the plan *existing* rather than on it having ranges reported
+a threshold cut as a director cut. The whole layer's credibility rests on the
+report saying which selector actually ran, so this is now pinned by a test.
+
+**No transcript means no director cut, and the plan says why once.** Footage
+with only picture gives every decision one channel of evidence, which caps at
+0.45 -- below the 0.55 needed to change a frame. That is Session 8's rule
+producing the correct outcome (a director working from pictures alone is
+guessing) and a baffling one to read as twelve separate "confidence too low"
+rejections. So the cause is named once, with the fix.
+
+**Nothing here says which cut is better.** `compare-heuristic` measures
+*disagreement* -- agreement on footage, what each side kept that the other
+dropped, and how many decisions rest on something no threshold could see. There
+is no quality metric, and inventing one would be the mistake Session 8 refused
+to make about retention. Render both and watch them.
+
 ---
 
 ## Current state
 
-- **1499 editing tests**, ~115s, needing no FFmpeg, GPU, model server, Premiere,
+- **1692 editing tests**, ~110s, needing no FFmpeg, GPU, model server, Premiere,
   Whisper or real media
-- `tests/premiere/` passes too (277 there, 1776 across both suites)
+- `tests/premiere/` passes too (277 there, 1969 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
   client) are pre-existing and unrelated
-- `editing/README.md` is the full user documentation (~3460 lines); §0 covers
-  auto mode, §16 the feedback collector and §17 the proxy render
+- `editing/README.md` is the full user documentation (~3820 lines); §0 covers
+  auto mode, §16 the feedback collector, §17 the proxy render and §18 the
+  director pass
 
 **Note on running the tests here:** pytest's default temp root
 (`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
 every test errors in setup. Pass `--basetemp` at a writable path.
 
-**Verified on real footage**: `auto run` completes all 23 stages on real MP4s
+**Verified on real footage**: `auto run` completes all 24 stages on real MP4s
 with real FFmpeg, in mock mode, in about a minute -- including the proxy
 render, which produced a 47s video from a three-clip cut.
 `render roughcut` was verified separately on footage deliberately mixing
@@ -628,6 +789,24 @@ both export formats -- but **not** yet against a real review of real footage.
     a real episode's proxy and said whether the *cut* was any good. That is the
     entire point of the feature and is now the cheapest way to find out whether
     threshold selection produces watchable video.
+23. **The director has never been run against a real model on a real episode.**
+    The HTTP contract is verified against a loopback OpenAI-compatible server
+    and the decisions against fixtures, but whether a 14B or 70B model makes
+    better editing choices than `usefulness >= 0.40` is unknown. This is now
+    the highest-value next action in the system, and it is one command plus an
+    endpoint: `director plan`, then `director compare-heuristic`, then render
+    both cuts and watch them.
+24. **Nothing checks a director decision for taste.** The twelve rules check
+    structure -- does this range exist, is the payoff protected, is its setup
+    still in, does the cut fit its runtime. A confident bad creative call
+    passes every one of them, which is why `show-rejected` and the comparison
+    exist.
+25. **The director is one pass, not a conversation.** It does not see the
+    render and revise. Feeding the proxy, or the Session 9 feedback log, back
+    into a second director pass is the obvious next step and is not built.
+26. **The prompt has been tuned against nothing.** Its instructions, its
+    ceilings and its output shape are opinions, and the first real run will
+    say which of them a model actually follows.
 
 ---
 
@@ -636,6 +815,31 @@ both export formats -- but **not** yet against a real review of real footage.
 The system is now usable enough that the next steps are about *reality*, not
 features.
 
+- **Point the director at a real model and compare the two cuts.** This is
+  the highest-value action in the system now: the whole of Session 10C is
+  built, tested and unverified against an actual model. It needs an endpoint
+  and about four commands:
+
+  ```cmd
+  set EDITING_DIRECTOR_BASE_URL=http://localhost:8000/v1
+  set EDITING_DIRECTOR_MODEL=qwen2.5-14b-instruct
+  python -m editing.cli director plan --style-guide docs\my_editing_style.md
+  python -m editing.cli director compare-heuristic
+  python -m editing.cli director render --quality proxy
+  python -m editing.cli render roughcut          REM the threshold cut, to compare
+  ```
+
+  Read `compare-heuristic` first: **agreement** near 1.0 means the model
+  reproduced the threshold and this layer is not earning its cost, and
+  `DECISIONS NO THRESHOLD COULD MAKE` is the column that says otherwise. Then
+  watch both proxies, because no number in this system can tell you which cut
+  is better.
+- **Then tune the prompt against what a model actually does.**
+  `editing/director/prompt.py` is one file, the whole instruction is in it, and
+  the ceilings (`max_hooks_in_cut`, `max_grind_seconds`, `min_confidence`) are
+  opinions in `schema.py`. Expect the first real run to show the model
+  over-keeping -- that is the standard failure of a model asked to be an
+  editor, and the prompt already argues against it in three places.
 - **Render a real episode's rough cut and watch it.** This is now the cheapest
   way to find out whether anything above the rough cut is worth keeping, and it
   needs no GPU, no model server and no Premiere:
@@ -723,6 +927,11 @@ Useful flags on `auto run`:
 | `--skip-review` / `--skip-assets` / `--skip-episode` | skip a whole pass |
 | `--transcribe` | produce transcripts with local Whisper first (opt-in) |
 | `--transcribe-model` / `--transcribe-language` | Whisper size, and the language |
+| `--director` | a model reads the episode and chooses the cut (opt-in) |
+| `--director-mode` | `hybrid` (default) fills what it did not mention, or `director` |
+| `--director-backend` / `--director-model` | which endpoint, and which model |
+| `--style-guide <path>` | your prose editing rules, for the director |
+| `--target-duration N` | runtime the director should aim at, in seconds |
 | `--render-proxy` | also render a watchable proxy MP4 with FFmpeg (opt-in) |
 | `--render-quality` / `--render-height` | `draft`/`proxy`/`preview`/`high`, and the height |
 | `--feedback` | also open a review session and build its queue (opt-in) |
@@ -774,6 +983,47 @@ Measured on this machine, CPU only: `tiny` ~15x realtime, `small` ~4.3x,
 so a 40-minute episode with `small` is about nine minutes. `torch` here is
 `2.13.0+cpu`, so CUDA auto-detection reports false; `--device cuda` forces it
 if CTranslate2 can use a GPU without torch.
+
+The director pass, which is how the cut stops being a threshold:
+
+```cmd
+python -m editing.cli director status              REM is a model reachable
+python -m editing.cli director show-style          REM the style guide in force
+python -m editing.cli director build-context       REM what it would be shown
+python -m editing.cli director build-context --show-prompt
+python -m editing.cli director plan                REM ask it, and check it
+python -m editing.cli director plan --backend mock REM no model at all
+python -m editing.cli director plan --style-guide docs\my_editing_style.md
+python -m editing.cli director show-decisions
+python -m editing.cli director show-rejected       REM what the rules refused
+python -m editing.cli director compare-heuristic   REM is it doing anything
+python -m editing.cli director render --quality proxy
+```
+
+Every one of these takes `--run <run_id>` to reach an auto run's own plan, the
+same way the feedback and render commands do.
+
+Point it at any OpenAI-compatible endpoint -- vLLM, LM Studio, llama.cpp's
+server, OpenRouter, Together, OpenAI:
+
+```cmd
+set EDITING_DIRECTOR_BASE_URL=http://localhost:8000/v1
+set EDITING_DIRECTOR_MODEL=qwen2.5-14b-instruct
+set EDITING_DIRECTOR_API_KEY=...
+```
+
+The settings are deliberately separate from the vision model's: reading
+pictures window by window and reasoning over a whole document want different
+models. The brief for a 40-minute episode is roughly 15-25k tokens.
+
+Three modes, and the heuristic never goes away:
+
+```cmd
+python -m editing.cli roughcut build                    REM thresholds
+python -m editing.cli director plan --mode director     REM only its decisions
+python -m editing.cli director plan --mode hybrid       REM its decisions, rest
+                                                        REM from the thresholds
+```
 
 Proxy rendering, which is how you actually see a cut. No Premiere, no GPU:
 

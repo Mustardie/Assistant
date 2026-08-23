@@ -34,6 +34,16 @@ from editing.critic import (
 from editing.critic.schema import (
     CriticReport, RevisionPlan, RevisionSet,
 )
+from editing.director import compare as director_compare
+from editing.director import convert as director_convert
+from editing.director import report as director_report
+from editing.director import run as director_run
+from editing.director import store as director_store
+from editing.director import style_guide as director_style_guide
+from editing.director.backends import check as director_check
+from editing.director.schema import (
+    DirectorConfig, DirectorContext, DirectorPlan, StyleGuide,
+)
 from editing.discovery import discover
 from editing.episode import memory as episode_memory_module
 from editing.episode import plan as episode_plan_module
@@ -752,17 +762,32 @@ class Pipeline:
         name: str = "structure",
         validate: bool = True,
         save: bool = True,
+        director_plan: Optional[DirectorPlan] = None,
     ) -> RoughCutPlan:
-        """Build a rough cut plan from the timeline and recommendations."""
+        """Build a rough cut plan from the timeline and recommendations.
+
+        ``options.mode`` decides where the ranges come from. In ``director``
+        or ``hybrid`` mode the plan on disk is loaded automatically unless one
+        is passed in; without one, the rule-based selector runs and the cut
+        says that it did.
+        """
         if timeline is None:
             timeline = self.load_timeline(name=name)
         if recommendations is None:
             recommendations = self.load_recommendations(name=name)
         assets = self.assets or self._assets_or_empty()
 
+        # Only loaded when a mode asks for it, and a missing plan falls back
+        # to the thresholds with the fallback recorded on the cut.
+        director = director_plan
+        mode = (options.mode if options else "heuristic") or "heuristic"
+        if director is None and mode in ("director", "hybrid"):
+            director = director_store.plan_or_none(self.config, name=name)
+
         plan = build_rough_cut(
             timeline, recommendations,
             assets=assets, options=options, validate=validate,
+            director_plan=director,
         )
 
         self.say(
@@ -2179,6 +2204,199 @@ class Pipeline:
         """
         return feedback_queue_module.estimate(
             self.feedback_artifacts(name=name))
+
+    # ------------------------------------------------------------------
+    # The director pass
+    # ------------------------------------------------------------------
+    #
+    # Reads everything the other passes produced, asks a model what the cut
+    # is, and checks every answer with rules. Executes nothing, and never
+    # replaces the heuristic selector -- ``rough_cut`` falls back to it
+    # whenever there is no usable plan here.
+
+    def director_config(self, **overrides) -> DirectorConfig:
+        """Director settings from the environment, overridden by kwargs."""
+        base = DirectorConfig.from_env()
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if clean:
+            from dataclasses import replace
+            base = replace(base, **clean)
+        return base.validated()
+
+    def director_status(
+        self, settings: Optional[DirectorConfig] = None
+    ) -> dict:
+        """Whether a director pass could run right now. Calls no model."""
+        return director_check(settings or self.director_config())
+
+    def style_guide(
+        self, path: str = "", *, text: Optional[str] = None
+    ) -> StyleGuide:
+        """The prose style guide in force, and where it came from."""
+        return director_style_guide.load(path or None, text=text)
+
+    def director_context(
+        self,
+        *,
+        name: str = "structure",
+        settings: Optional[DirectorConfig] = None,
+        style_guide_path: str = "",
+        style_guide_text: Optional[str] = None,
+        timeline: Optional[StructureTimeline] = None,
+        save: bool = True,
+    ) -> DirectorContext:
+        """Assemble what the director will be shown. Calls no model.
+
+        Every input but the timeline is optional and read from disk when it is
+        there. A context built without the episode memory is a different thing
+        from one built with it, and ``context.sources`` records which.
+        """
+        settings = settings or self.director_config()
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+
+        preset = None
+        if settings.style:
+            try:
+                preset = style_presets.get(settings.style)
+            except EditingError:
+                preset = None
+
+        context = director_run.build_context(
+            timeline,
+            settings=settings,
+            style_guide_path=style_guide_path,
+            style_guide_text=style_guide_text,
+            memory=self._episode_memory_or_none(name),
+            retention=self._retention_or_none(name),
+            recommendations=self._recommendations_or_none(name),
+            roughcut=self._rough_cut_or_none(name),
+            preferences=self._preferences_or_none(),
+            style_preset=preset,
+            name=name,
+        )
+        if save:
+            director_store.save_context(self.config, context, name=name)
+        return context
+
+    def director_plan(
+        self,
+        *,
+        name: str = "structure",
+        settings: Optional[DirectorConfig] = None,
+        context: Optional[DirectorContext] = None,
+        style_guide_path: str = "",
+        style_guide_text: Optional[str] = None,
+        model=None,
+        force: bool = False,
+        save: bool = True,
+    ) -> DirectorPlan:
+        """Ask the director, check the answer, and write the plan."""
+        settings = settings or self.director_config()
+        if context is None:
+            context = self.director_context(
+                name=name, settings=settings,
+                style_guide_path=style_guide_path,
+                style_guide_text=style_guide_text,
+                save=save,
+            )
+
+        plan = director_run.plan(
+            self.config, context,
+            settings=settings, model=model, cache=self.cache,
+            force=force, say=self.say,
+        )
+        for warning in plan.warnings[:10]:
+            self.say(f"  ! {warning}")
+        if plan.failure is not None:
+            self.say(f"  x {plan.failure.message}")
+        if save:
+            director_run.persist(self.config, plan, context, name=name)
+        return plan
+
+    def load_director_plan(self, *, name: str = "structure") -> DirectorPlan:
+        return director_store.load_plan(self.config, name=name)
+
+    def load_director_context(
+        self, *, name: str = "structure"
+    ) -> DirectorContext:
+        return director_store.load_context(self.config, name=name)
+
+    def director_plan_or_none(
+        self, *, name: str = "structure"
+    ) -> Optional[DirectorPlan]:
+        return director_store.plan_or_none(self.config, name=name)
+
+    def director_report(self, plan: Optional[DirectorPlan] = None, *,
+                        name: str = "structure") -> str:
+        plan = plan or self.load_director_plan(name=name)
+        return director_report.render(plan)
+
+    def compare_director(
+        self,
+        *,
+        name: str = "structure",
+        plan: Optional[DirectorPlan] = None,
+        timeline: Optional[StructureTimeline] = None,
+        options: Optional[RoughCutOptions] = None,
+        save: bool = True,
+    ) -> dict:
+        """Measure the director cut against the cut the thresholds make.
+
+        Answers "is this doing anything", which is the only question worth
+        asking about a creative layer. It deliberately does not answer "is it
+        better" -- nothing here can, and rendering both is how you find out.
+        """
+        from editing.roughcut.select import select_ranges
+
+        plan = plan or self.load_director_plan(name=name)
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        options = options or RoughCutOptions()
+        assets = self.assets or self._assets_or_empty()
+        durations = {
+            asset.asset_id: asset.duration
+            for asset in (assets or timeline.assets)
+        }
+
+        heuristic = select_ranges(
+            timeline, self._recommendations_or_none(name),
+            keep_threshold=options.keep_threshold,
+            filler_speed=options.filler_speed,
+            handle=options.handle,
+            keep_filler=not options.drop_filler,
+            asset_durations=durations,
+        )
+        payload = director_compare.compare(plan, heuristic, name=name)
+        if save:
+            director_store.save_comparison(self.config, payload, name=name)
+        return payload
+
+    def clear_director_cache(self) -> int:
+        return director_store.clear_cache(self.cache)
+
+    def _episode_memory_or_none(self, name: str):
+        try:
+            return self.load_episode_memory(name=name)
+        except EditingError:
+            return None
+
+    def _retention_or_none(self, name: str):
+        try:
+            return self.load_retention_plan(name=name)
+        except EditingError:
+            return None
+
+    def _preferences_or_none(self):
+        """Preference signals from the latest review, if there is one.
+
+        Never raises and never starts a session: an absent review is the
+        normal case, and the director works without one.
+        """
+        try:
+            return self.feedback_signals()
+        except Exception:  # noqa: BLE001 - an optional input, never a failure
+            return []
 
     # ------------------------------------------------------------------
     # Proxy renders

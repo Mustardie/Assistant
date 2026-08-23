@@ -43,6 +43,7 @@ STAGE_ORDER = (
     "transcribe",
     "analyze",
     "recommend",
+    "director_plan",
     "roughcut_build",
     "roughcut_dry_run",
     "review_export_frames",
@@ -193,6 +194,25 @@ class AutoRunConfig:
     transcribe_backend: str = ""
     #: ISO language code, or empty to auto-detect.
     transcribe_language: str = ""
+
+    #: Run a director pass before the rough cut, and build the cut from its
+    #: decisions. Off by default because it needs a model endpoint; when it
+    #: is off the rough cut is chosen by the thresholds exactly as before.
+    director: bool = False
+    #: How the rough cut uses the director: ``director`` or ``hybrid``.
+    #: ``hybrid`` fills every stretch the director did not mention from the
+    #: rule-based selector, which is the safer default of the two.
+    director_mode: str = "hybrid"
+    #: Model name at the director endpoint. Empty means the configured one.
+    director_model: str = ""
+    #: Which backend produces the decisions. ``mock`` decides by fixed rule
+    #: and stamps every artifact as such -- for exercising the pipeline,
+    #: never for an edit.
+    director_backend: str = ""
+    #: Path to a prose style guide. Empty uses the built-in one.
+    style_guide: str = ""
+    #: Target runtime the director aims at, in seconds. 0 means no target.
+    target_duration: float = 0.0
 
     #: Render a watchable proxy of the rough cut with FFmpeg. Off by default
     #: because it is the only stage that costs minutes of CPU and produces
@@ -636,6 +656,10 @@ class AutoRunReport:
     critic: dict = field(default_factory=dict)
     layers: dict = field(default_factory=dict)
     assets: dict = field(default_factory=dict)
+    #: The director pass: which model, what it decided, what the rules
+    #: refused. Always filled, whether or not the stage ran -- "this cut was
+    #: chosen by thresholds" is worth saying out loud.
+    director: dict = field(default_factory=dict)
     #: The proxy render: where the video is, where the notes are, and the
     #: exact command to make another. Always filled, whether or not the
     #: render stage ran -- "you could watch this" is worth saying to somebody

@@ -499,6 +499,11 @@ class AutoRunner:
         # loads a speech model and takes minutes per episode.
         if not run.transcribe and name in stages_module.TRANSCRIBE_STAGES:
             return "--transcribe was not set"
+        # Inverted as well: the director needs a model endpoint, and a
+        # pipeline that silently required one would stop working everywhere
+        # that has not set one up.
+        if not run.director and name in stages_module.DIRECTOR_STAGES:
+            return "--director was not set"
         # Inverted too: rendering is opt-in because it is the only stage
         # that costs minutes of CPU and hundreds of megabytes of disk.
         if not run.render_proxy and name in stages_module.RENDER_STAGES:

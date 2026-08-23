@@ -36,6 +36,11 @@ Commands, in the order a session normally uses them::
     render      roughcut | from-plan | show | list | report | notes | open |
                 clean   -- a watchable proxy MP4 of a rough cut, made with
                 FFmpeg. No Premiere, and nothing is executed
+    director    build-context | plan | report | show-decisions |
+                show-rejected | show-style | compare-heuristic | render |
+                status | clear-cache   -- a model reads the whole episode and
+                decides what the cut is; deterministic rules check every
+                answer
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -82,6 +87,11 @@ from editing.assets.compile import AssetOptions
 from editing.assets.place import PlacementLimits
 from editing.style import presets as style_presets, report as layers_report
 from editing.style.compile import CompileOptions
+from editing.director import compare as director_compare
+from editing.director import report as director_report
+from editing.director import schema as director_schema
+from editing.director import store as director_store
+from editing.director import style_guide as director_style_guide
 from editing.render import report as render_report
 from editing.render import schema as render_schema
 from editing.render import store as render_store
@@ -609,14 +619,29 @@ def cmd_draft(args) -> int:
 
 
 def _roughcut_options(args) -> RoughCutOptions:
+    """Selection settings from whichever command asked for them.
+
+    Read with ``getattr`` and defaults rather than by attribute: this is
+    called from ``roughcut``, which declares every flag, and from ``director``,
+    which declares the handful that make sense there. Requiring all of them
+    would mean either duplicating the whole flag set onto a second command
+    group or crashing on the ones it left out.
+    """
+    defaults = RoughCutOptions()
+
+    def value(name: str, fallback):
+        found = getattr(args, name, None)
+        return fallback if found is None else found
+
     return RoughCutOptions(
-        sequence_name=args.sequence,
-        keep_threshold=args.keep_threshold,
-        filler_speed=args.filler_speed,
-        handle=args.handle,
-        drop_filler=args.drop_filler,
-        allow_zooms=not args.no_zooms,
-        preset=args.preset or "",
+        sequence_name=value("sequence", defaults.sequence_name),
+        keep_threshold=value("keep_threshold", defaults.keep_threshold),
+        filler_speed=value("filler_speed", defaults.filler_speed),
+        handle=value("handle", defaults.handle),
+        drop_filler=bool(getattr(args, "drop_filler", False)),
+        allow_zooms=not getattr(args, "no_zooms", False),
+        preset=value("preset", "") or "",
+        mode=value("mode", defaults.mode),
     )
 
 
@@ -1676,6 +1701,12 @@ def _auto_config(args) -> AutoRunConfig:
         transcribe_model=getattr(args, "transcribe_model", "") or "",
         transcribe_language=getattr(args, "transcribe_language", "") or "",
         transcribe_backend=getattr(args, "transcribe_backend", "") or "",
+        director=getattr(args, "director", False),
+        director_mode=getattr(args, "director_mode", "") or "hybrid",
+        director_model=getattr(args, "director_model", "") or "",
+        director_backend=getattr(args, "director_backend", "") or "",
+        style_guide=getattr(args, "style_guide", "") or "",
+        target_duration=float(getattr(args, "target_duration", 0.0) or 0.0),
         render_proxy=getattr(args, "render_proxy", False),
         render_quality=getattr(args, "render_quality", "") or "",
         render_height=int(getattr(args, "render_height", 0) or 0),
@@ -2257,6 +2288,194 @@ def _render_batch(batch, *, limit: int = 40) -> str:
                 lines.append(f"    fix : {job.failure.hint}")
     for warning in batch.warnings:
         lines.append(f"  ! {warning}")
+    return "\n".join(lines)
+
+
+def cmd_director(args) -> int:
+    """A model reads the whole episode and decides what the cut is.
+
+    Ten subcommands. None of them touches Premiere or executes anything: the
+    pass produces decisions, deterministic rules check them, and the rough cut
+    builder turns what survives into ranges.
+    """
+    pipeline = _run_scoped_pipeline(args)
+    command = args.director_command
+    name = getattr(args, "name", "structure") or "structure"
+
+    settings = pipeline.director_config(
+        backend=getattr(args, "backend_name", None),
+        model=getattr(args, "model_name", None),
+        base_url=getattr(args, "base_url", None),
+        api_key=getattr(args, "api_key", None),
+        temperature=getattr(args, "temperature", None),
+        mode=getattr(args, "mode", None),
+        style=getattr(args, "style", None),
+        target_duration=getattr(args, "target", None),
+        max_duration=getattr(args, "max_duration", None),
+        max_segments=getattr(args, "max_segments", None),
+        max_context_chars=getattr(args, "context_chars", None),
+        max_output_tokens=getattr(args, "max_tokens", None),
+        use_cache=(False if getattr(args, "no_cache", False) else None),
+    )
+
+    if command == "status":
+        health = pipeline.director_status(settings)
+        if args.json:
+            _emit({"success": True, "health": health,
+                   "settings": settings.to_dict()})
+            return EXIT_OK
+        print(_render_director_status(health, settings))
+        return EXIT_OK
+
+    if command == "show-style":
+        guide = pipeline.style_guide(getattr(args, "style_guide", "") or "")
+        if args.json:
+            _emit({"success": True, **guide.to_dict()})
+            return EXIT_OK
+        print(director_style_guide.describe(guide))
+        return EXIT_OK
+
+    if command == "clear-cache":
+        if not getattr(args, "yes", False):
+            raise EditingError(
+                "Clearing the director cache needs --yes",
+                hint="Every cached answer would have to be asked for again, "
+                     "which costs a model call per episode. Re-run with "
+                     "`director clear-cache --yes` if that is what you want.",
+            )
+        removed = pipeline.clear_director_cache()
+        if args.json:
+            _emit({"success": True, "removed": removed})
+            return EXIT_OK
+        print(f"Removed {removed} cached director answer(s).")
+        return EXIT_OK
+
+    if command == "build-context":
+        context = pipeline.director_context(
+            name=name, settings=settings,
+            style_guide_path=getattr(args, "style_guide", "") or "",
+        )
+        if args.json:
+            _emit({"success": True, **context.to_dict()})
+            return EXIT_OK
+        print(director_report.render_context_summary(context))
+        if getattr(args, "show_prompt", False):
+            from editing.director import prompt as director_prompt
+            print(director_prompt.build(context, settings).user)
+        else:
+            print(f"  Written to "
+                  f"{director_store.context_path(pipeline.config, name)}")
+            print("  Add --show-prompt to print what the model would be sent.")
+        return EXIT_OK
+
+    if command == "plan":
+        plan = pipeline.director_plan(
+            name=name, settings=settings,
+            style_guide_path=getattr(args, "style_guide", "") or "",
+            force=getattr(args, "force", False),
+        )
+        if args.json:
+            _emit({"success": plan.ok, **plan.to_dict()})
+        else:
+            print(director_report.render(plan))
+        return EXIT_OK if plan.ok else EXIT_ERROR
+
+    if command == "report":
+        plan = pipeline.load_director_plan(name=name)
+        if args.json:
+            _emit({"success": plan.ok, **plan.to_dict()})
+            return EXIT_OK
+        print(director_report.render(plan))
+        return EXIT_OK
+
+    if command in ("show-decisions", "show-rejected"):
+        plan = pipeline.load_director_plan(name=name)
+        rejected = command == "show-rejected"
+        pool = plan.rejected if rejected else plan.accepted
+        if args.json:
+            _emit({"success": True, "count": len(pool),
+                   "decisions": [entry.to_dict() for entry in pool]})
+            return EXIT_OK
+        print(director_report.render_decisions(
+            plan, limit=args.limit,
+            action=getattr(args, "action", "") or "",
+            rejected=rejected,
+        ))
+        return EXIT_OK
+
+    if command == "compare-heuristic":
+        payload = pipeline.compare_director(
+            name=name, options=_roughcut_options(args))
+        if args.json:
+            _emit({"success": True, **payload})
+            return EXIT_OK
+        print(director_compare.render(payload))
+        return EXIT_OK
+
+    if command == "render":
+        # Build the cut from the director plan, then hand it to the Session
+        # 10B renderer. Two separate verbs on purpose: the plan is a set of
+        # decisions and the render is a video, and conflating them would mean
+        # you could not re-render without re-deciding.
+        options = _roughcut_options(args)
+        options.mode = getattr(args, "mode", None) or "director"
+        cut = pipeline.rough_cut(
+            name=name, options=options, validate=False,
+            director_plan=pipeline.director_plan_or_none(name=name),
+        )
+        render_settings = pipeline.render_config(
+            quality=getattr(args, "quality", None),
+            height=getattr(args, "height", None),
+            backend=("mock" if getattr(args, "mock", False) else None),
+        )
+        job = pipeline.render_roughcut(
+            name=name, plan=cut, settings=render_settings,
+            force=getattr(args, "force", False),
+        )
+        if args.json:
+            _emit({"success": job.ok, "mode": options.mode,
+                   "clips": len(cut.placements), **job.to_dict()})
+        else:
+            print(render_report.render_text(job))
+        return EXIT_OK if job.ok else EXIT_ERROR
+
+    raise EditingError("Unknown director command")
+
+
+def _render_director_status(health: dict, settings) -> str:
+    lines = ["=" * 78, "DIRECTOR PASS", "=" * 78, ""]
+    ready = health.get("ready")
+    lines.append(f"  backend   : {health.get('backend')} "
+                 f"{'[ready]' if ready else '[NOT REACHABLE]'}")
+    lines.append(f"  model     : {settings.model}")
+    lines.append(f"  endpoint  : {settings.base_url}")
+    lines.append(f"  mode      : {settings.mode}")
+    lines.append(f"  context   : up to {settings.max_segments} range(s), "
+                 f"{settings.max_context_chars} characters")
+    if settings.target_duration or settings.max_duration:
+        lines.append(f"  runtime   : target {settings.target_duration:.0f}s, "
+                     f"max {settings.max_duration:.0f}s")
+    lines.append("")
+    if not ready:
+        lines.append("  A director pass cannot run yet.")
+        if health.get("error"):
+            lines.append(f"    error: {health['error']}")
+        if health.get("hint"):
+            for line in str(health["hint"]).split(". "):
+                if line.strip():
+                    lines.append(f"    {line.strip()}")
+        lines.append("")
+    if health.get("warning"):
+        lines.append(f"  ! {health['warning']}")
+        lines.append("")
+    for warning in health.get("config_warnings", []):
+        lines.append(f"  ! {warning}")
+    if health.get("config_warnings"):
+        lines.append("")
+    lines.append("  Any OpenAI-compatible endpoint works: vLLM, LM Studio,")
+    lines.append("  llama.cpp-server, or a hosted API. Set")
+    lines.append("  EDITING_DIRECTOR_BASE_URL, EDITING_DIRECTOR_MODEL and")
+    lines.append("  EDITING_DIRECTOR_API_KEY, or pass --base-url/--model.")
     return "\n".join(lines)
 
 
@@ -3825,6 +4044,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="mock fabricates transcripts and stamps every artifact as fake; "
              "for exercising the pipeline, never for an edit")
     au_run.add_argument(
+        "--director", action="store_true",
+        help="have a model read the whole episode and choose the cut "
+             "(off by default: it needs a model endpoint)")
+    au_run.add_argument(
+        "--director-mode", dest="director_mode", default="hybrid",
+        choices=["director", "hybrid"],
+        help="hybrid fills what the director did not mention from the "
+             "rule-based selector (default)")
+    au_run.add_argument(
+        "--director-model", dest="director_model", default="",
+        help="model name at the director endpoint")
+    au_run.add_argument(
+        "--director-backend", dest="director_backend", default="",
+        choices=["", "openai", "mock"],
+        help="mock decides by fixed rule and stamps every artifact as such")
+    au_run.add_argument(
+        "--style-guide", dest="style_guide", default="",
+        help="a prose file of your editing rules, for the director")
+    au_run.add_argument(
+        "--target-duration", dest="target_duration", type=float, default=0.0,
+        help="runtime the director should aim at, in seconds")
+    au_run.add_argument(
         "--render-proxy", dest="render_proxy", action="store_true",
         help="render a watchable proxy MP4 of the rough cut with FFmpeg "
              "(off by default: minutes of CPU and hundreds of MB)")
@@ -4133,6 +4374,157 @@ def build_parser() -> argparse.ArgumentParser:
     for transcribe_parser in (tr_file, tr_folder, tr_status, tr_show,
                               tr_export, tr_clear):
         transcribe_parser.set_defaults(func=cmd_transcribe)
+
+    # -- director ---------------------------------------------------------
+    director = subparsers.add_parser(
+        "director",
+        help="a model reads the whole episode and decides what the cut is "
+             "(proposes only: deterministic rules check every answer)",
+    )
+    director_subs = director.add_subparsers(
+        dest="director_command", required=True)
+
+    def _add_director_model_args(parser: argparse.ArgumentParser) -> None:
+        group = parser.add_argument_group("director model")
+        group.add_argument(
+            "--backend", dest="backend_name", default=None,
+            choices=list(director_schema.BACKENDS),
+            help="mock decides by fixed rule and says so; never an editorial "
+                 "judgement")
+        group.add_argument(
+            "--model", dest="model_name", default=None,
+            help="model name at the endpoint (default qwen2.5-14b-instruct)")
+        group.add_argument(
+            "--base-url", dest="base_url", default=None,
+            help="any OpenAI-compatible endpoint, ending in /v1")
+        group.add_argument(
+            "--api-key", dest="api_key", default=None,
+            help="only if the endpoint needs one")
+        group.add_argument("--temperature", type=float, default=None)
+        group.add_argument(
+            "--max-tokens", dest="max_tokens", type=int, default=None,
+            help="ceiling on the answer length")
+
+    def _add_director_shape_args(parser: argparse.ArgumentParser) -> None:
+        group = parser.add_argument_group("the cut")
+        group.add_argument(
+            "--style-guide", dest="style_guide", default="",
+            help="a prose file of your editing rules. Omit for the built-in "
+                 "guide; `director show-style` prints whichever is in use")
+        group.add_argument(
+            "--style", default=None, choices=style_presets.names(),
+            help="tell the director what the style pass will add on top")
+        group.add_argument(
+            "--target", type=float, default=None,
+            help="target runtime in seconds")
+        group.add_argument(
+            "--max-duration", dest="max_duration", type=float, default=None,
+            help="hard maximum runtime in seconds")
+        group.add_argument(
+            "--max-segments", dest="max_segments", type=int, default=None,
+            help="ceiling on candidate ranges shown to the model")
+        group.add_argument(
+            "--context-chars", dest="context_chars", type=int, default=None,
+            help="ceiling on the size of the brief, in characters")
+
+    dr_context = director_subs.add_parser(
+        "build-context", help="what the director would be shown, and nothing "
+                              "else. Calls no model")
+    dr_context.add_argument("--name", default="structure")
+    dr_context.add_argument("--show-prompt", dest="show_prompt",
+                            action="store_true",
+                            help="print the whole prompt as it would be sent")
+    _add_director_model_args(dr_context)
+    _add_director_shape_args(dr_context)
+    _add_common(dr_context)
+
+    dr_plan = director_subs.add_parser(
+        "plan", help="ask the director, check every answer, write the plan")
+    dr_plan.add_argument("--name", default="structure")
+    dr_plan.add_argument(
+        "--mode", default=None, choices=list(director_schema.MODES),
+        help="director uses only its decisions; hybrid fills the gaps from "
+             "the rule-based selector (default director)")
+    dr_plan.add_argument("--force", action="store_true",
+                         help="ignore the cache and ask again")
+    _add_director_model_args(dr_plan)
+    _add_director_shape_args(dr_plan)
+    _add_common(dr_plan)
+
+    dr_report = director_subs.add_parser(
+        "report", help="the full report for the current plan")
+    dr_report.add_argument("--name", default="structure")
+    _add_common(dr_report)
+
+    dr_show = director_subs.add_parser(
+        "show-decisions", help="every accepted decision, in full")
+    dr_show.add_argument("--name", default="structure")
+    dr_show.add_argument("--limit", type=int, default=40)
+    dr_show.add_argument("--action", default="",
+                         choices=[""] + list(director_schema.ACTIONS),
+                         help="only decisions asking for this")
+    _add_common(dr_show)
+
+    dr_rejected = director_subs.add_parser(
+        "show-rejected", help="what the rules refused, and which rule")
+    dr_rejected.add_argument("--name", default="structure")
+    dr_rejected.add_argument("--limit", type=int, default=40)
+    dr_rejected.add_argument("--action", default="",
+                             choices=[""] + list(director_schema.ACTIONS))
+    _add_common(dr_rejected)
+
+    dr_style = director_subs.add_parser(
+        "show-style", help="the style guide in force, and where it came from")
+    dr_style.add_argument("--style-guide", dest="style_guide", default="")
+    _add_common(dr_style)
+
+    dr_compare = director_subs.add_parser(
+        "compare-heuristic",
+        help="the director cut against the cut the thresholds make")
+    dr_compare.add_argument("--name", default="structure")
+    dr_compare.add_argument("--keep-threshold", type=float, default=None)
+    dr_compare.add_argument("--filler-speed", type=float, default=None)
+    dr_compare.add_argument("--handle", type=float, default=None)
+    dr_compare.add_argument("--drop-filler", action="store_true")
+    _add_common(dr_compare)
+
+    dr_render = director_subs.add_parser(
+        "render", help="build the director cut and render it to a proxy")
+    dr_render.add_argument("--name", default="structure")
+    dr_render.add_argument(
+        "--mode", default=None, choices=list(director_schema.MODES),
+        help="which selector builds the cut (default director)")
+    dr_render.add_argument("--quality", default=None,
+                           choices=list(render_schema.QUALITIES))
+    dr_render.add_argument("--height", type=int, default=None)
+    dr_render.add_argument("--force", action="store_true")
+    dr_render.add_argument("--mock", action="store_true",
+                           help="render a placeholder instead of a video")
+    dr_render.add_argument("--keep-threshold", type=float, default=None)
+    dr_render.add_argument("--filler-speed", type=float, default=None)
+    dr_render.add_argument("--handle", type=float, default=None)
+    dr_render.add_argument("--drop-filler", action="store_true")
+    _add_common(dr_render)
+
+    dr_status = director_subs.add_parser(
+        "status", help="is a director model reachable, and with what settings")
+    _add_director_model_args(dr_status)
+    _add_director_shape_args(dr_status)
+    _add_common(dr_status)
+
+    dr_clear = director_subs.add_parser(
+        "clear-cache", help="drop every cached director answer")
+    dr_clear.add_argument("--yes", action="store_true",
+                          help="required: each answer costs a model call")
+    _add_common(dr_clear)
+
+    for director_parser in (dr_context, dr_plan, dr_report, dr_show,
+                            dr_rejected, dr_style, dr_compare, dr_render,
+                            dr_status, dr_clear):
+        director_parser.add_argument(
+            "--run", default="",
+            help="scope to one auto run's artifacts")
+        director_parser.set_defaults(func=cmd_director)
 
     # -- render -----------------------------------------------------------
     render = subparsers.add_parser(

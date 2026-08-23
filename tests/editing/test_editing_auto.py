@@ -1570,3 +1570,206 @@ def test_rendering_defaults_to_off_in_the_run_config():
 
     args = build_parser().parse_args(["auto", "run", "--folder", "D:/clips"])
     assert _auto_config(args).render_proxy is False
+
+
+# ---------------------------------------------------------------------------
+# Session 10C -- the director stage
+# ---------------------------------------------------------------------------
+
+def test_the_director_is_off_unless_it_is_asked_for(runner, auto_config):
+    """It needs a model endpoint, so it cannot be a default."""
+    state = run_once(runner, auto_config)
+    result = state.stage("director_plan")
+
+    assert result is not None and result.status == "skipped"
+    assert "--director" in result.note
+
+
+def test_a_skipped_director_leaves_the_thresholds_in_charge(
+    runner, auto_config
+):
+    state = run_once(runner, auto_config)
+    assert state.stage("roughcut_build").ok
+    assert state.stage("roughcut_build").summary["selection"] == "heuristic"
+
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    assert report.director["enabled"] is False
+    assert report.director["ran"] is False
+    assert "--director" in report.director["run_with_director"]
+
+    text = auto_report.render(state, report)
+    assert "WHO CHOSE THIS CUT" in text
+    assert "rule-based selector chose this cut" in text
+
+
+def test_the_director_runs_before_the_cut_it_chooses_the_ranges_for():
+    assert STAGE_ORDER.index("recommend") < STAGE_ORDER.index("director_plan")
+    assert STAGE_ORDER.index("director_plan") < \
+        STAGE_ORDER.index("roughcut_build")
+
+
+@pytest.fixture
+def spoken_footage(footage):
+    """The same clips, with subtitles beside them.
+
+    Without a transcript the director has one channel of evidence, every
+    decision caps below the confidence floor, and no cut is possible -- which
+    is correct and is tested separately. This fixture is for the path where
+    it can actually decide.
+    """
+    for index in range(3):
+        (footage / f"clip_{index:02d}.srt").write_text(
+            '1\n00:00:01,000 --> 00:00:06,000\nright so today we are going to find some diamonds\n\n2\n00:00:07,000 --> 00:00:12,000\noh god a creeper watch out\n\n3\n00:00:13,000 --> 00:00:15,500\nthere we go that is what we came for\n',
+            encoding="utf-8",
+        )
+    return footage
+
+
+def test_the_director_stage_produces_a_plan(
+    runner, auto_config, config, spoken_footage
+):
+    """Driven with the mock backend, so this needs no model."""
+    state = run_once(runner, replace(
+        auto_config, director=True, director_backend="mock"))
+    result = state.stage("director_plan")
+    assert result is not None and result.ok, result.note
+
+    summary = result.summary
+    assert summary["backend"] == "mock"
+    assert summary["mock"] is True, (
+        "a cut chosen by four fixed rules must never read as a directed one")
+    assert summary["decisions"] > 0
+
+    run_config = store.run_config(config, state.run_id)
+    assert (run_config.director_dir / "structure.plan.json").exists()
+    assert (run_config.director_dir / "structure.prompt.txt").exists()
+
+
+def test_footage_with_no_transcript_cannot_be_directed_and_says_why(
+    runner, auto_config, config
+):
+    """One channel of evidence caps every decision below the floor.
+
+    That is the correct outcome -- a director working from pictures alone is
+    guessing -- and the plan has to say so rather than leave twelve separate
+    "confidence too low" rejections to be pieced together.
+    """
+    state = run_once(runner, replace(
+        auto_config, director=True, director_backend="mock"))
+    result = state.stage("director_plan")
+
+    assert result.status == "blocked"
+    assert state.stage("roughcut_build").ok, "the thresholds took over"
+    assert state.stage("roughcut_build").summary["selection"] == "heuristic"
+
+    run_config = store.run_config(config, state.run_id)
+    plan = json.loads(
+        (run_config.director_dir / "structure.plan.json").read_text("utf-8"))
+    assert plan["decisions"], "the decisions are kept, not thrown away"
+    assert any("no transcript" in warning
+               for warning in plan["safety"]["warnings"])
+
+
+def test_the_cut_records_which_selector_actually_chose_it(
+    runner, auto_config, spoken_footage
+):
+    """Not what was asked for -- what happened."""
+    state = run_once(runner, replace(
+        auto_config, director=True, director_backend="mock",
+        director_mode="hybrid"))
+
+    director = state.stage("director_plan")
+    roughcut = state.stage("roughcut_build")
+    assert roughcut.ok
+    if director.ok:
+        assert roughcut.summary["selection"] == "hybrid"
+    else:
+        # The director is non-critical: when it cannot produce a cut the
+        # thresholds take over and the summary says so.
+        assert roughcut.summary["selection"] == "heuristic"
+
+
+def test_an_unreachable_director_blocks_the_stage_and_not_the_run(
+    runner, auto_config, monkeypatch
+):
+    from editing.director import backends as director_backends
+
+    monkeypatch.setattr(
+        director_backends, "check",
+        lambda settings: {"backend": "openai", "ready": False,
+                          "error": "connection refused",
+                          "hint": "start a server",
+                          "config_warnings": []})
+
+    state = run_once(runner, replace(auto_config, director=True))
+    result = state.stage("director_plan")
+
+    assert result.status == "blocked", result.status
+    assert "not reachable" in (result.failure.why if result.failure else "")
+
+    # Every plan is unaffected, and the cut falls back to the thresholds.
+    assert state.stage("roughcut_build").ok
+    assert state.stage("roughcut_build").summary["selection"] == "heuristic"
+    assert state.stage("report").ok
+    assert state.status != "failed"
+
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    assert "not reachable" in report.director["blocked_reason"]
+    assert "did not run" in auto_report.render(state, report)
+
+
+def test_the_run_report_says_a_mock_director_is_a_mock(
+    runner, auto_config, spoken_footage
+):
+    state = run_once(runner, replace(
+        auto_config, director=True, director_backend="mock"))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    if report.director["ran"]:
+        assert report.director["mock"] is True
+        text = auto_report.render(state, report)
+        assert "MOCK DIRECTOR" in text
+        assert "rule-based cut with extra steps" in text
+
+
+def test_the_director_settings_reach_the_stage(
+    runner, auto_config, spoken_footage
+):
+    state = run_once(runner, replace(
+        auto_config, director=True, director_backend="mock",
+        director_mode="director", target_duration=120.0))
+    result = state.stage("director_plan")
+    if result.ok:
+        assert result.summary["mode"] == "director"
+
+
+def test_the_director_flags_reach_the_run_config():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args([
+        "auto", "run", "--folder", "D:/clips", "--director",
+        "--director-mode", "director", "--director-backend", "mock",
+        "--director-model", "llama-3.3", "--style-guide", "docs/mine.md",
+        "--target-duration", "600",
+    ])
+    run = _auto_config(args)
+
+    assert run.director is True
+    assert run.director_mode == "director"
+    assert run.director_backend == "mock"
+    assert run.director_model == "llama-3.3"
+    assert run.style_guide == "docs/mine.md"
+    assert run.target_duration == 600.0
+
+
+def test_the_director_defaults_to_off_and_hybrid():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args(["auto", "run", "--folder", "D:/clips"])
+    run = _auto_config(args)
+    assert run.director is False
+    assert run.director_mode == "hybrid", (
+        "the safer of the two: it fills what the director did not mention")
