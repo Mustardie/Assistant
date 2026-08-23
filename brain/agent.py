@@ -125,10 +125,14 @@ class Agent:
             "open", "find", "search", "show", "list", "organize", "rename", "move",
             "copy", "delete", "restore", "inspect", "locate", "look for", "extract",
             "unzip", "compress", "zip", "reveal", "properties", "installed", "installation",
-            "where is",
+            "where is", "summarize", "identify", "understand", "what is", "what's",
+            "commit", "stage", "junk", "safe to share", "safe to delete",
         ]
         if not any(word in normalized for word in action_words):
             return False
+
+        if any(term in normalized for term in ("commit", "stage", "git status", "repository", "repo")):
+            return True
 
         file_indicators = [
             "pdf", "word", "docx", "doc", "excel", "sheet", "ppt", "powerpoint",
@@ -138,6 +142,8 @@ class Agent:
             "screenshot", "picture", "photo", "text", "file manager", "recording",
             "capture", "document", "worksheet", "audio", "music file", "my downloads",
             "my notes", "my pictures", "my photos", "game", "app", "program",
+            "log", "crash", "settings", "config", "git", "repository", "repo",
+            "model", "weights", "build", "artifact", "source code", "ui reference",
         ]
         if any(indicator in normalized for indicator in file_indicators):
             return True
@@ -306,7 +312,7 @@ class Agent:
             self._pending_candidates = candidates
             self._pending_intent = response.get("intent")
             self._pending_user_goal = user
-            lines = [f"{i + 1}. {c.get('path')}" for i, c in enumerate(candidates)]
+            lines = [f"{i + 1}. {c.get('summary') or 'Unknown purpose'} — {c.get('path')}" for i, c in enumerate(candidates)]
             self._speak(
                 "I found a few close matches, but I'm not confident enough to guess. "
                 "Which one did you mean?"
@@ -429,7 +435,7 @@ class Agent:
     def _act_on_result(self, user: str, intent: str, result: dict):
         path = result.get("path")
 
-        if intent in {"open_file", "open_folder", "find_installation", "search"}:
+        if intent in {"open_file", "open_folder", "find_installation"}:
            original_goal = self._pending_user_goal or user
            self._pending_user_goal = None
            normalized = original_goal.lower()
@@ -448,6 +454,27 @@ class Agent:
            self._record_tool_result("file_open", open_result)
            safe_print("\n[file_open]")
            safe_print(open_result)
+           return
+
+        if intent == "search":
+           summary = result.get("summary") or (result.get("profile") or {}).get("summary", {}).get("text")
+           confidence = result.get("confidence")
+           risk = result.get("risk")
+           name = Path(path).name if path else "the best match"
+           message = f"I found {name}."
+           if summary:
+               message += f" {summary}"
+           if risk:
+               message += f" Risk: {risk}."
+           self._speak(message)
+           safe_print({
+               "path": path,
+               "summary": summary,
+               "confidence": confidence,
+               "risk": risk,
+               "evidence": result.get("evidence", []),
+               "safe_next_actions": result.get("safe_next_actions", []),
+           })
            return
 
         if intent == "list_folder":
@@ -493,6 +520,28 @@ class Agent:
     def _handle_file_request(self, user: str):
         safe_print("\n[file_request]")
         try:
+            normalized = user.lower()
+            if any(phrase in normalized for phrase in ("what should i commit", "what should not commit", "what shouldn't i commit", "git status", "summarize git", "explain untracked")):
+                success, response = run_tool("file_git_summary", {})
+                self._record_tool_result("file_git_summary", response)
+                if success and isinstance(response, dict):
+                    self._speak(response.get("human_summary") or "I inspected the repository status.")
+                else:
+                    self._speak(str(response))
+                safe_print(response)
+                return
+            if "stage" in normalized and any(word in normalized for word in ("safe", "only", "should")):
+                success, response = run_tool("file_safe_stage", {})
+                self._record_tool_result("file_safe_stage", response)
+                if success and isinstance(response, dict):
+                    self._speak(
+                        (response.get("human_summary") or "I built a staging review plan.")
+                        + " I did not stage anything; review and confirm the exact paths first."
+                    )
+                else:
+                    self._speak(str(response))
+                safe_print(response)
+                return
             success, response = run_tool("file_search", {"query": user, "limit": 10})
             self._record_tool_result("file_search", response)
             if not success:
@@ -512,7 +561,7 @@ class Agent:
                 self._pending_candidates = candidates
                 self._pending_intent = response.get("intent")
                 self._pending_user_goal = user
-                lines = [f"{i + 1}. {c.get('path')}" for i, c in enumerate(candidates)]
+                lines = [f"{i + 1}. {c.get('summary') or 'Unknown purpose'} — {c.get('path')}" for i, c in enumerate(candidates)]
                 self.assistant.speak(
                     "I found a few close matches, but I’m not confident enough to guess. Which one did you mean?"
                 )

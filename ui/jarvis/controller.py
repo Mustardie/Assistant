@@ -52,7 +52,11 @@ class JarvisUIController:
         if re.search(r"\b(play|watch|review|open)\b.*\b(video|clip|movie|render|\.mp4|\.mov|\.mkv)\b", lower):
             path_match = re.search(r"([A-Za-z]:[\\/][^\n\r\"']+\.(?:mp4|mov|mkv|avi|webm))", text, re.I)
             ensure("video_player", data={"path": path_match.group(1).strip() if path_match else None})
-        if re.search(r"\b(find|search|locate|show)\b.*\b(file|folder|document|pdf|notes?|assignment)\b", lower):
+        if re.search(
+            r"\b(find|search|locate|show|summarize|identify|classify|understand)\b.*"
+            r"\b(file|folder|document|pdf|notes?|assignment|logs?|settings|reference|render|artifact|model weights?)\b",
+            lower,
+        ) or re.search(r"\b(what should i commit|git status|safe(?:ly)? stage)\b", lower):
             ensure("file_search", data={"query": text, "results": [], "loading": True})
         if re.search(r"\b(remember|memory|recall|what do you know about me|forget)\b", lower):
             ensure("memory_recall", data={"query": text, "memories": [], "used": False})
@@ -152,7 +156,7 @@ class JarvisUIController:
                 calls.append({**payload, "status": "failed" if event_type == "tool_failed" else "complete"})
                 self.manager.update(progress.widget_id, data={"tool_calls": calls, "status": "recovering" if event_type == "tool_failed" else "running"})
             if event_type == "tool_failed":
-                if payload.get("tool") == "file_search":
+                if payload.get("tool") in {"file_search", "file_intent_search"}:
                     file_widget = self.manager.find_type("file_search")
                     if file_widget:
                         self.manager.update(file_widget.widget_id, loading=False, error=str(payload.get("error") or "File search failed"))
@@ -164,13 +168,15 @@ class JarvisUIController:
                     items.append({"title": f"{payload.get('tool') or 'Tool'} failed", "status": "error", "detail": str(payload.get("error") or "Unknown failure")})
                     self.manager.update(notifications.widget_id, data={"notifications": items})
             else:
-                if payload.get("tool") == "file_search":
+                if payload.get("tool") in {"file_search", "file_intent_search"}:
                     file_widget = self.manager.find_type("file_search")
                     if file_widget:
                         raw = payload.get("result") or {}
                         results = []
                         if isinstance(raw, dict):
-                            if raw.get("status") == "clarify":
+                            if isinstance(raw.get("results"), list):
+                                results = raw.get("results") or []
+                            elif raw.get("status") == "clarify":
                                 results = raw.get("candidates") or []
                             elif raw.get("status") == "ok" and raw.get("result"):
                                 results = [raw.get("result")]

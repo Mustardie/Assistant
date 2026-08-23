@@ -22,6 +22,12 @@ File Management (search first, then act):
   results are ambiguous. NEVER try to guess a file path yourself or use
   file_open with a path you invented -- always route file/folder/install
   requests through file_search first.
+- file_profile(path, inspect_content) <- bounded purpose, risk, safe actions,
+  related files, Git state, confidence, and evidence for one file
+- file_intent_search(query, limit) <- ranked meaning/purpose search such as
+  "Minecraft crash log", "Hindi worksheet", or "files not to commit"
+- file_git_summary(path) <- read-only human Git status and commit-risk advice
+- file_safe_stage(path) <- returns an exact staging review plan; NEVER stages
 - file_open(path)
 - file_list(path)
 - file_create(path)
@@ -216,9 +222,12 @@ Gmail:
 - gmail_delete(message_id)
 
 Connectors (discover before using a generic integration):
+- connector_list()
 - connector_status(name)
 - connector_capabilities(name)
+- connector_plan(name, capability, arguments, confirm)
 - connector_execute(name, capability, arguments, confirm)
+- connector_test(name)
 
 Desktop control:
 - type_text(text)

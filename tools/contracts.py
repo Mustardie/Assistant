@@ -43,9 +43,12 @@ class ToolResult:
         stale = False
         retryable = False
         if isinstance(result, dict):
-            if result.get("success") is False:
+            status = str(result.get("status") or "").lower()
+            error_shaped = bool(result.get("error") or result.get("error_message")) and result.get("success") is not True
+            partial = bool(result.get("partial") or status == "partial")
+            if result.get("success") is False or status in {"error", "failed", "failure"} or error_shaped or partial:
                 reported_success = False
-            error = result.get("error") or result.get("message") if not reported_success else None
+            error = (result.get("error") or result.get("error_message") or result.get("message")) if not reported_success else None
             stale = bool(result.get("stale"))
             retryable = bool(result.get("retryable"))
         if stale:
@@ -120,6 +123,25 @@ class ToolDecisionLayer:
                 return ToolAssessment(False, tool, normalized, f"Missing required arguments: {', '.join(missing)}")
 
         explicit = confirmed or any(bool(normalized.get(key)) for key in self._CONFIRMATION_KEYS)
+        if tool in {"file_move", "move_file"} and not explicit:
+            source = normalized.get("source") or normalized.get("path")
+            if source:
+                try:
+                    from tools.file_intelligence import assess_file_action
+
+                    file_safety = assess_file_action(source, "move")
+                    if file_safety.get("risk") in {"high", "critical"}:
+                        return ToolAssessment(
+                            False,
+                            tool,
+                            normalized,
+                            file_safety.get("reason") or "Moving this important file requires confirmation",
+                            requires_confirmation=True,
+                        )
+                except Exception:
+                    # The tool itself repeats this guard.  Do not turn a
+                    # classifier availability problem into an invented risk.
+                    pass
         if tool in self._HIGH_RISK and not explicit:
             return ToolAssessment(
                 False,
@@ -147,4 +169,3 @@ class ToolResultVerifier:
         if isinstance(result.data, dict) and result.data.get("contradicts_request"):
             return Verification(True, False, False, "The result contradicts the request", True)
         return Verification(True, True, False, "Verified", False)
-

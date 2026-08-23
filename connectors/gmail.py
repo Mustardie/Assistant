@@ -7,6 +7,7 @@ account and the existing Gmail implementation remains the single API client.
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 
 from connectors.base import Connector, ConnectorCapability, ConnectorResult, ConnectorStatus
 
@@ -22,7 +23,14 @@ class GmailConnector(Connector):
     def _default_auth_check() -> bool:
         try:
             from youtube_auth import TOKEN_PATH
-            return TOKEN_PATH.exists()
+
+            if not TOKEN_PATH.exists():
+                return False
+            payload = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+            scopes = set(payload.get("scopes") or [])
+            has_gmail_scope = any("gmail" in str(scope).lower() for scope in scopes)
+            has_renewable_credentials = bool(payload.get("refresh_token") or payload.get("token"))
+            return has_gmail_scope and has_renewable_credentials
         except Exception:
             return False
 
@@ -40,8 +48,11 @@ class GmailConnector(Connector):
             ConnectorCapability("delete", "Delete a message", mutating=True, requires_confirmation=True),
         ]
 
-    def execute(self, capability: str, arguments: dict) -> ConnectorResult:
+    def execute(self, capability: str, arguments: dict, *, confirmed: bool = False) -> ConnectorResult:
         try:
+            arguments = dict(arguments or {})
+            if confirmed and capability in {"send", "reply"}:
+                arguments["confirm"] = True
             if capability == "summary":
                 limit = arguments.get("limit", 10)
                 if arguments.get("unread"):
@@ -62,4 +73,3 @@ class GmailConnector(Connector):
                 connector=self.name,
                 capability=capability,
             )
-

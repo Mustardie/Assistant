@@ -521,9 +521,58 @@ def file_search(query, limit=10, action=None, filters=None, sort=None):
     happen inside file_manager_service.search -- callers (agent.py) just
     interpret the status field.
     """
+    from tools.file_intelligence import enrich_search_response
+
     if isinstance(query, dict):
-        return file_manager_service.search(query=query, limit=limit)
-    return file_manager_service.search(query=query, limit=limit, action=action, filters=filters, sort=sort)
+        response = file_manager_service.search(query=query, limit=limit)
+        query_text = str(query.get("query") or query.get("text") or "")
+    else:
+        response = file_manager_service.search(query=query, limit=limit, action=action, filters=filters, sort=sort)
+        query_text = str(query)
+    try:
+        records = file_manager_service.indexer.get_raw_records(limit=5000)
+    except Exception as exc:
+        logger.warning("Could not load file index records for intent enrichment: %s", exc)
+        records = None
+    return enrich_search_response(query_text, response, records, limit=limit)
+
+
+def file_profile(path, inspect_content=True):
+    """Return bounded purpose/risk evidence for one local file."""
+    from tools.file_intelligence import profile_file
+
+    return {"success": True, "profile": profile_file(path, inspect_content=bool(inspect_content)).to_dict()}
+
+
+def file_intent_search(query, limit=10):
+    """Search the local index by likely purpose instead of filename alone."""
+    from tools.file_intelligence import search_file_intent
+
+    try:
+        records = file_manager_service.indexer.get_raw_records(limit=10000)
+    except Exception as exc:
+        return {"success": False, "query": str(query), "results": [], "error": f"File index unavailable: {exc}"}
+    results = search_file_intent(str(query), records, limit=max(1, min(int(limit), 50)))
+    return {
+        "success": True,
+        "query": str(query),
+        "results": results,
+        "count": len(results),
+        "content_policy": "bounded samples and metadata only",
+    }
+
+
+def file_git_summary(path=None):
+    from tools.file_git import summarize_git_status
+
+    return summarize_git_status(path).to_dict()
+
+
+def file_safe_stage(path=None):
+    """Build a reviewable staging plan. This function never runs git add."""
+    from tools.file_git import safe_stage_plan
+
+    return safe_stage_plan(path)
 
 
 def file_open(path):
@@ -564,7 +613,19 @@ def file_list(path):
     return file_manager_service.list_folder(path)
 
 
-def file_move(source, destination):
+def file_move(source, destination, confirm=False):
+    from tools.file_intelligence import assess_file_action
+
+    assessment = assess_file_action(source, "move")
+    if assessment["risk"] in {"high", "critical"} and not confirm:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "source": str(source),
+            "destination": str(destination),
+            "error": assessment["reason"],
+            "file_safety": assessment,
+        }
     from file_manager.operations import FileOperations
     return FileOperations(file_manager_service).move(source, destination)
 
@@ -622,6 +683,17 @@ def file_rename(source, destination):
 
 
 def file_delete(path, confirm=False):
+    from tools.file_intelligence import assess_file_action
+
+    assessment = assess_file_action(path, "delete")
+    if not confirm:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "path": str(path),
+            "error": assessment["reason"],
+            "file_safety": assessment,
+        }
     from file_manager.operations import FileOperations
     return FileOperations(file_manager_service).delete(path, confirm=confirm)
 
@@ -633,7 +705,12 @@ def file_restore(path):
 
 def file_metadata(path):
     from file_manager.metadata import FileMetadata
-    return FileMetadata(file_manager_service).metadata(path)
+    from tools.file_intelligence import profile_file
+
+    value = FileMetadata(file_manager_service).metadata(path)
+    if isinstance(value, dict):
+        return {**value, "file_profile": profile_file(path).to_dict()}
+    return {"metadata": value, "file_profile": profile_file(path).to_dict()}
 
 
 def show_properties(path):
@@ -686,7 +763,19 @@ def file_ops_copy_file(source, destination):
     return copy_file(source, destination)
 
 
-def file_ops_move_file(source, destination):
+def file_ops_move_file(source, destination, confirm=False):
+    from tools.file_intelligence import assess_file_action
+
+    assessment = assess_file_action(source, "move")
+    if assessment["risk"] in {"high", "critical"} and not confirm:
+        return {
+            "success": False,
+            "requires_confirmation": True,
+            "source": str(source),
+            "destination": str(destination),
+            "error": assessment["reason"],
+            "file_safety": assessment,
+        }
     return move_file(source, destination)
 
 
@@ -794,6 +883,19 @@ def skill_test(name):
 
 # ---------------- Connector wrappers ---------------- #
 
+def connector_list():
+    from connectors.defaults import default_registry
+
+    registry = default_registry()
+    return {
+        "success": True,
+        "connectors": [
+            {"name": name, "status": registry.status(name).value, "capabilities": registry.capabilities(name)}
+            for name in registry.names()
+        ],
+    }
+
+
 def connector_status(name):
     from connectors.defaults import default_registry
 
@@ -818,6 +920,22 @@ def connector_execute(name, capability, arguments=None, confirm=False):
         arguments or {},
         confirmed=confirm,
     ).to_dict()
+
+
+def connector_test(name):
+    from connectors.defaults import default_registry
+
+    return default_registry().test(name)
+
+
+def connector_plan(name, capability, arguments=None, confirm=False):
+    from dataclasses import asdict
+
+    from connectors.base import ConnectorRequest
+    from connectors.defaults import default_registry
+
+    request = ConnectorRequest(name, capability, arguments or {}, bool(confirm))
+    return asdict(default_registry().plan(request))
 
 
 def pause_indexing():
@@ -947,6 +1065,10 @@ TOOLS = {
     "premiere_undo": premiere_undo,
 
     "file_search": file_search,
+    "file_profile": file_profile,
+    "file_intent_search": file_intent_search,
+    "file_git_summary": file_git_summary,
+    "file_safe_stage": file_safe_stage,
     "file_open": file_open,
     "file_create": file_create,
     "file_list": file_list,
@@ -995,6 +1117,13 @@ TOOLS = {
     "exclude_folder": exclude_folder,
     "remove_from_index": remove_from_index,
 
+    "connector_list": connector_list,
+    "connector_status": connector_status,
+    "connector_capabilities": connector_capabilities,
+    "connector_plan": connector_plan,
+    "connector_execute": connector_execute,
+    "connector_test": connector_test,
+
     "type_text": type_text,
     "press_key": press_key,
     "hotkey": hotkey,
@@ -1017,11 +1146,6 @@ TOOLS = {
     "skill_duplicate": skill_duplicate,
     "skill_test": skill_test,
 
-    # Normalized connector discovery/execution. Existing dedicated Gmail
-    # tools remain for compatibility while new connectors use this contract.
-    "connector_status": connector_status,
-    "connector_capabilities": connector_capabilities,
-    "connector_execute": connector_execute,
 }
 
 # Context for sequential tool executions. Each tool result is stored under
@@ -1172,7 +1296,19 @@ def run_tool(tool_name, arguments):
 
         tool_context[f"{tool_name}_result"] = result
 
-        if isinstance(result, dict) and result.get("success") is False:
+        result_status = str(result.get("status") or "").lower() if isinstance(result, dict) else ""
+        error_shaped = bool(
+            isinstance(result, dict)
+            and (result.get("error") or result.get("error_message"))
+            and result.get("success") is not True
+        )
+        partial = bool(isinstance(result, dict) and (result.get("partial") or result_status == "partial"))
+        if isinstance(result, dict) and (
+            result.get("success") is False
+            or result_status in {"error", "failed", "failure"}
+            or error_shaped
+            or partial
+        ):
             logger.warning("[Executor] %s reported failure: %s", tool_name, result.get("error", result))
             # The legacy contract used to return True here merely because
             # the Python function did not raise.  That made

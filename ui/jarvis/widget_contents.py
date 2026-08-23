@@ -430,9 +430,28 @@ class FileSearchWidget(WidgetContent):
             self.query.setText(str(data["query"]))
         self.results.clear()
         for result in data.get("results") or []:
-            value = result if isinstance(result, str) else result.get("path", "")
-            self.results.addItem(value)
-            self.results.item(self.results.count() - 1).setData(Qt.UserRole, value)
+            if isinstance(result, str):
+                path = result
+                title = result
+                tooltip = result
+            else:
+                path = result.get("path", "")
+                summary = result.get("summary") or (result.get("profile") or {}).get("summary", {}).get("text") or "Purpose unknown"
+                confidence = result.get("confidence")
+                risk = result.get("risk") or (result.get("profile") or {}).get("risk")
+                badges = []
+                if risk:
+                    badges.append(str(risk).upper())
+                if isinstance(confidence, (int, float)):
+                    badges.append(f"{confidence:.0%}")
+                badge_text = f"  [{' · '.join(badges)}]" if badges else ""
+                title = f"{Path(path).name or path}{badge_text}\n{summary}"
+                evidence = result.get("evidence") or (result.get("profile") or {}).get("evidence") or []
+                tooltip = f"{path}\n\n{summary}\n\nEvidence:\n" + "\n".join(str(item) for item in evidence[:8])
+            self.results.addItem(title)
+            item = self.results.item(self.results.count() - 1)
+            item.setData(Qt.UserRole, path)
+            item.setToolTip(tooltip)
         if state.loading:
             self.notice.setText("Searching…")
         elif state.error:

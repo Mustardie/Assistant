@@ -87,12 +87,14 @@ class IntentRouter:
     _LOCAL = re.compile(
         r"\b(file|folder|directory|document|pdf|docx|spreadsheet|workbook|image|photo|"
         r"archive|zip|downloads?|desktop|path|project files?|screenshot|assignment|homework|"
-        r"notes?|videos?|audio|recording)\b",
+        r"notes?|videos?|audio|recording|logs?|crash report|settings|config(?:uration)?|"
+        r"build artifacts?|model weights?)\b",
         re.I,
     )
     _LOCAL_ACTION = re.compile(
         r"\b(find|search|locate|open|list|create|write|rename|move|copy|delete|restore|"
-        r"extract|compress|inspect|show|reveal|organize|save)\b",
+        r"extract|compress|inspect|show|reveal|organize|save|summarize|identify|"
+        r"classify|understand)\b",
         re.I,
     )
     _APP = re.compile(
@@ -181,6 +183,18 @@ class IntentRouter:
                 safety_notes=notes,
             )
 
+        if re.search(r"\b(what should i commit|should not commit|shouldn't commit|git status|untracked|safe(?:ly)? stage|stage only)\b", lowered):
+            tools = ["file_git_summary"]
+            if "stage" in lowered:
+                tools.append("file_safe_stage")
+            return IntentDecision(
+                Intent.LOCAL_TASK,
+                0.97,
+                likely_required_tools=tools,
+                memory_relevant=False,
+                safety_notes=["Git inspection is read-only", "never stage without an explicit reviewed path list"],
+            )
+
         if self._CODING.search(text):
             return IntentDecision(
                 Intent.CODING,
@@ -197,7 +211,10 @@ class IntentRouter:
             return IntentDecision(
                 Intent.LOCAL_TASK,
                 0.92,
-                likely_required_tools=["file_search"],
+                likely_required_tools=["file_intent_search"] if re.search(
+                    r"\b(crash|worksheet|settings|reference|render|junk|purpose|summarize|identify|classify|understand)\b",
+                    lowered,
+                ) else ["file_search"],
                 memory_relevant=True,
                 safety_notes=notes,
             )
