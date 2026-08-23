@@ -83,6 +83,9 @@ def test_detect_editing():
     assert detect("duplicate the Create Word skill as Backup")["intent"] == "duplicate"
     assert detect("show me my skills")["intent"] == "list"
     assert detect("what skills do you have")["intent"] == "list"
+    assert detect("dry run the Create Word skill") == {
+        "intent": "test", "args": {"name": "Create Word"}
+    }
 
 
 def test_detect_returns_none_for_normal_requests():
@@ -143,6 +146,10 @@ class FakeSkillManager:
 
     def duplicate_skill(self, name, new_name=None):
         return self._log("duplicate_skill", name=name, new_name=new_name)
+
+    def test_skill(self, name):
+        self.calls.append(("test_skill", {"name": name}))
+        return {"success": True, "name": name, "steps": 3, "errors": [], "executed": False}
 
     def play(self, name):
         self.calls.append(("play", {"name": name}))

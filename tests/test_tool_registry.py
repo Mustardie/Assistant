@@ -62,3 +62,10 @@ def test_run_tool_returns_error_for_unresolved_placeholder(monkeypatch):
     assert success is False
     assert "Unresolved placeholder" in result
     assert "echo_result" not in tool_context
+
+
+def test_run_tool_returns_false_when_tool_reports_failure(monkeypatch):
+    monkeypatch.setitem(TOOLS, "failing", lambda: {"success": False, "error": "failed honestly"})
+    success, result = run_tool("failing", {})
+    assert success is False
+    assert result["error"] == "failed honestly"

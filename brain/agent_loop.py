@@ -10,8 +10,10 @@ from urllib.parse import quote, urlsplit
 from config.settings import settings
 from skills.manager import skill_manager
 from recommendation.errors import RecommendationConfigurationError
+from brain.runtime import AgentRuntime
+from brain.state import AgentState, TaskStatus
 from tools.browser.browser_agent import browser_agent
-from tools.tool_registry import clear_tool_context, run_tool
+from tools.tool_registry import TOOLS, clear_tool_context, run_tool
 
 logger = logging.getLogger(__name__)
 
@@ -700,12 +702,12 @@ def _detect_complex_task(goal: str) -> str | None:
     """Classify a fresh goal into a deterministic multi-step task, or None
     when the normal planner loop should handle it."""
     goal = goal or ""
-    if _RESEARCH_PATTERN.search(goal):
-        return "research"
     if _GDOCS_WRITE_PATTERN.search(goal):
         return "gdocs"
     if _DOC_TO_FOLDER_PATTERN.search(goal):
         return "document_to_folder"
+    if _RESEARCH_PATTERN.search(goal):
+        return "research"
     if _DOC_WRITE_PATTERN.search(goal):
         return "gdocs"
     if _FLIGHT_SEARCH_PATTERN.search(goal):
@@ -914,6 +916,14 @@ def _detect_skill_request(goal: str) -> dict | None:
         match = _SKILL_IMPORT_PATTERN.search(goal)
         return {"intent": "import", "args": {"path": match.group(1)}}
 
+    test_match = re.search(
+        r"\b(?:test|validate|dry\s+run)\s+(?:the\s+|my\s+)?(.+?)\s+skill\b",
+        goal,
+        re.IGNORECASE,
+    )
+    if test_match:
+        return {"intent": "test", "args": {"name": test_match.group(1).strip()}}
+
     play_match = _SKILL_PLAY_PATTERN.search(goal)
     if play_match:
         name = play_match.group(1).strip()
@@ -1115,6 +1125,7 @@ class AgentLoop:
         on_file_search_result=None,
         track_file_action=None,
         fallback=None,
+        runtime=None,
     ):
         self.brain = brain
         self.speak = speak
@@ -1122,6 +1133,9 @@ class AgentLoop:
         self.on_file_search_result = on_file_search_result
         self.track_file_action = track_file_action
         self.fallback = fallback
+        self.runtime = runtime or AgentRuntime(TOOLS)
+        self.task_state: AgentState | None = None
+        self._confirmed_tool: str | None = None
         self._last_response = ""
         self._consecutive_guard_firings = 0
         self._no_step_streak = 0
@@ -1369,6 +1383,16 @@ class AgentLoop:
                 result = skill_manager.import_skill(args.get("path"))
                 self.speak(result["speak"])
                 return "done"
+            if intent == "test":
+                result = skill_manager.test_skill(args.get("name"))
+                if result.get("success"):
+                    self.speak(
+                        f"Skill '{result['name']}' passed test mode with "
+                        f"{result['steps']} step(s). No actions were executed."
+                    )
+                else:
+                    self.speak("Skill test failed: " + "; ".join(result.get("errors") or []))
+                return "done"
 
             if intent == "play":
                 name = args.get("name")
@@ -1455,6 +1479,7 @@ class AgentLoop:
         *,
         resume_goal: str | None = None,
         resume_observations: list[dict] | None = None,
+        resume_state: AgentState | None = None,
     ) -> dict | None:
         """Runs the plan -> execute -> observe loop for one user turn.
 
@@ -1475,6 +1500,18 @@ class AgentLoop:
         user = normalize_user_input(user)
         goal = normalize_user_input(resume_goal or user)
         observations: list[dict] = list(resume_observations) if resume_observations else []
+        original_intent_hint = intent_hint
+        self.task_state = resume_state or (self.task_state if resume_goal and self.task_state else self.runtime.start(goal))
+        self._confirmed_tool = None
+        if resume_state and resume_state.pending_decisions:
+            resolution = self.runtime.resume(resume_state, user)
+            if resolution and not resolution.get("accepted"):
+                self.speak("Okay — I did not perform that action.")
+                return None
+            if resolution:
+                self._confirmed_tool = resolution.get("tool")
+        runtime_hint = self.runtime.prompt_context(self.task_state)
+        intent_hint = f"{intent_hint}\n{runtime_hint}" if intent_hint else runtime_hint
         recovery_attempts = 0
         last_failed_signature: tuple | None = None
         repeat_failures = 0
@@ -1599,6 +1636,19 @@ class AgentLoop:
                             return None
                 except Exception:
                     logger.exception("[Skills] Automatic matching failed -- continuing normally")
+
+        # Unambiguous legacy capabilities (local file resolution and
+        # YouTube recommendation) are exposed through the caller's
+        # fallback. Dispatch them after complex-task/skill detection but
+        # before an LLM call, so an unavailable planner cannot prevent a
+        # deterministic request from running. The fallback returns False
+        # for ordinary conversation, so direct-answer requests still stay
+        # tool-free.
+        if not resume_goal and not observations and self.fallback:
+            if self.fallback(user, original_intent_hint):
+                if self.task_state:
+                    self.task_state.mark_complete()
+                return None
 
         # Deterministic page resolution: when the goal asks to CONSUME a
         # page ("summarise my chatgpt tab", "what's on the page") and no
@@ -1838,6 +1888,8 @@ class AgentLoop:
 
             if decision.get("done"):
                 self._consecutive_guard_firings = 0
+                if self.task_state:
+                    self.task_state.mark_complete()
                 logger.info("[Agent] Goal marked complete on iteration %s", iteration)
                 return None
 
@@ -1851,7 +1903,7 @@ class AgentLoop:
             if not step:
                 # LLM returned no tool step — if it's the first turn and
                 # the fallback catches it (youtube/file), dispatch there.
-                if not observations and self.fallback and self.fallback(user, intent_hint):
+                if not observations and self.fallback and self.fallback(user, original_intent_hint):
                     return None
 
                 # A weak planner that has already gathered the data it
@@ -2029,6 +2081,13 @@ class AgentLoop:
                     safe_print(error)
                     return None
 
+                if outcome.get("needs_user"):
+                    self.speak(
+                        f"Before I run {tool}, I need your confirmation because "
+                        f"it can cause a destructive or external side effect. Should I proceed?"
+                    )
+                    return _pending_result()
+
                 if outcome["stop"]:
                     return None
 
@@ -2171,8 +2230,31 @@ class AgentLoop:
         tool = step.get("tool")
         arguments = step.get("arguments", {})
 
+        assessment = self.runtime.assess_tool(
+            self.task_state,
+            step,
+            confirmed=self._confirmed_tool == tool,
+        )
+        if assessment.requires_confirmation:
+            return {"success": False, "result": assessment.reason, "stop": False, "needs_user": True}
+        if not assessment.allowed:
+            raw_result = {"success": False, "error": assessment.reason, "retryable": True}
+            normalized, verification = self.runtime.observe(self.task_state, step, False, raw_result)
+            return {
+                "success": verification.succeeded,
+                "result": normalized.to_dict(),
+                "stop": False,
+                "needs_user": False,
+            }
+
+        arguments = assessment.arguments
+        step = {**step, "arguments": arguments}
+
         raw_success, result = run_tool(tool, arguments)
-        success = _tool_reported_success(raw_success, result)
+        normalized, verification = self.runtime.observe(
+            self.task_state, step, raw_success, result
+        )
+        success = verification.succeeded
 
         if success and self.track_file_action and tool in {"file_rename", "file_move"}:
             self.track_file_action(tool, arguments)
@@ -2196,7 +2278,13 @@ class AgentLoop:
             logger.info("browser_open succeeded; returning control for next decision")
             stop = True
 
-        return {"success": success, "result": result, "stop": stop}
+        return {
+            "success": success,
+            "result": result,
+            "stop": stop,
+            "needs_user": False,
+            "verification": verification,
+        }
 
     def _guard_identical_call(self, tool: str, signature: tuple) -> str:
         """Track consecutive identical (tool, normalized arguments) proposals.

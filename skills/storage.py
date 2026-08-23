@@ -108,7 +108,14 @@ def metadata_file(name: str) -> Path:
 
 def load_skill(name: str) -> dict | None:
     data = read_json(skill_file(name))
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    try:
+        from skills.schema import migrate
+        return migrate(data, load_timeline(name), load_metadata(name))
+    except ValueError:
+        logger.warning("Skill '%s' has an invalid definition", name)
+        return data
 
 
 def save_skill(record: dict) -> None:
@@ -271,14 +278,22 @@ def import_skill(archive_path: Path | str) -> str | None:
             if folder.exists():
                 shutil.rmtree(folder, ignore_errors=True)
             ensure_layout(name)
+            root_resolved = folder.resolve()
             for entry in names:
                 parts = Path(entry).parts
                 if len(parts) < 2:
                     continue  # stray top-level file -- not part of the skill
-                target = folder.joinpath(*parts[1:])
+                target = folder.joinpath(*parts[1:]).resolve()
+                if target != root_resolved and root_resolved not in target.parents:
+                    raise ValueError(f"Unsafe path in skill archive: {entry}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(entry) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
+        record = load_skill(name)
+        if record is None:
+            raise ValueError("Imported archive does not contain a valid skill.json")
+        from skills.schema import migrate
+        save_skill(migrate(record, load_timeline(name), load_metadata(name)))
         logger.info("Imported skill from %s", archive)
         return name
     except Exception:

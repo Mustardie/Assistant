@@ -20,6 +20,7 @@ from pathlib import Path
 from config.settings import settings
 from skills import parser as parser_module
 from skills import planner, storage
+from skills import schema as skill_schema
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,7 @@ class SkillManager:
             "tags": profile.get("tags", []),
             "version": 1,
         }
+        record = skill_schema.build_definition(record, timeline, meta)
         storage.save_skill(record)
 
         step_count = len(parsed["semantic"])
@@ -361,6 +363,23 @@ class SkillManager:
         if imported is None:
             return {"success": False, "speak": "Could not import that skill file."}
         return {"success": True, "speak": f"Imported skill '{imported}'."}
+
+    def test_skill(self, name: str) -> dict:
+        """Validate and describe playback without executing recorded actions."""
+        record = storage.load_skill(name)
+        if record is None:
+            return {"success": False, "errors": [f"Skill '{name}' was not found"]}
+        timeline = storage.load_timeline(name)
+        errors = skill_schema.validate_definition(record, timeline)
+        return {
+            "success": not errors,
+            "name": name,
+            "steps": len(timeline.get("semantic") or []),
+            "required_tools": record.get("required_tools") or skill_schema.required_tools_for(timeline.get("semantic") or []),
+            "confirmation_required": bool((record.get("safety") or {}).get("confirmation_required")),
+            "errors": errors,
+            "executed": False,
+        }
 
     # ------------------------------------------------------------------ #
     # Planning integration

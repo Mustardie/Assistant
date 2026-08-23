@@ -215,6 +215,11 @@ Gmail:
 - gmail_mark_read(message_id)
 - gmail_delete(message_id)
 
+Connectors (discover before using a generic integration):
+- connector_status(name)
+- connector_capabilities(name)
+- connector_execute(name, capability, arguments, confirm)
+
 Desktop control:
 - type_text(text)
 - press_key(key)
@@ -245,6 +250,7 @@ Skills (Nova's learned desktop workflows -- handled automatically, no planner wo
 - skill_delete(name)
 - skill_duplicate(name, new_name)
 - skill_export(name, destination)
+- skill_test(name)          <- validate a skill without executing actions
 - skill_run is NOT a planner tool -- skill playback always goes through
   Nova's deterministic skill engine so it can pause for user input safely.
 """
@@ -862,10 +868,6 @@ class Brain:
             memory_lines.append(f"- Preferred response length: {length}")
         for pref in comm.get("preferences", []):
             memory_lines.append(f"- Communication preference: {pref}")
-        for label, key in [("Projects", "projects"), ("Goals", "goals"), ("Key facts", "facts_about_user")]:
-            items = user_memory.get(key, [])
-            if items:
-                memory_lines.append(f"- {label}: {'; '.join(items)}")
         memory_text = "\n".join(memory_lines) if memory_lines else "No stored information yet."
         return (
             f"{AGENT_SYSTEM_PROMPT}\n\n"
@@ -892,7 +894,12 @@ class Brain:
             observations = observations[-5:]
         observations_text = self._format_observations(observations or [])
 
-        relevant_memories = self.memory_manager.get_relevant_memories(query=user, limit=4)
+        memory_enabled = bool(intent_hint and "memory_relevant=true" in intent_hint.lower())
+        relevant_memories = self.memory_manager.get_planning_context(
+            query=goal or user,
+            enabled=memory_enabled,
+            limit=3,
+        )
         memories_text = ""
         if relevant_memories:
             mem_lines = [f"- [{m.get('category','fact')}] {m.get('text','')}" for m in relevant_memories]

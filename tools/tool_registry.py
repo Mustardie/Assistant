@@ -786,6 +786,40 @@ def skill_duplicate(name, new_name=None):
     return skill_manager.duplicate_skill(name, new_name)
 
 
+def skill_test(name):
+    from skills.manager import skill_manager
+
+    return skill_manager.test_skill(name)
+
+
+# ---------------- Connector wrappers ---------------- #
+
+def connector_status(name):
+    from connectors.defaults import default_registry
+
+    return {"success": True, "connector": name, "status": default_registry().status(name).value}
+
+
+def connector_capabilities(name):
+    from connectors.defaults import default_registry
+
+    capabilities = default_registry().capabilities(name)
+    if not capabilities:
+        return {"success": False, "error": f"Connector '{name}' is unavailable or has no capabilities"}
+    return {"success": True, "connector": name, "capabilities": capabilities}
+
+
+def connector_execute(name, capability, arguments=None, confirm=False):
+    from connectors.defaults import default_registry
+
+    return default_registry().execute(
+        name,
+        capability,
+        arguments or {},
+        confirmed=confirm,
+    ).to_dict()
+
+
 def pause_indexing():
     return file_manager_service.pause_indexing()
 
@@ -981,6 +1015,13 @@ TOOLS = {
     "skill_delete": skill_delete,
     "skill_export": skill_export,
     "skill_duplicate": skill_duplicate,
+    "skill_test": skill_test,
+
+    # Normalized connector discovery/execution. Existing dedicated Gmail
+    # tools remain for compatibility while new connectors use this contract.
+    "connector_status": connector_status,
+    "connector_capabilities": connector_capabilities,
+    "connector_execute": connector_execute,
 }
 
 # Context for sequential tool executions. Each tool result is stored under
@@ -1133,6 +1174,11 @@ def run_tool(tool_name, arguments):
 
         if isinstance(result, dict) and result.get("success") is False:
             logger.warning("[Executor] %s reported failure: %s", tool_name, result.get("error", result))
+            # The legacy contract used to return True here merely because
+            # the Python function did not raise.  That made
+            # (True, {"success": False}) a normal outcome and allowed callers
+            # to claim success after a tool explicitly failed.
+            return False, result
         else:
             logger.info("[Executor] Tool completed successfully: %s", tool_name)
 

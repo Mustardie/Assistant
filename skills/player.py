@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # Answer keywords for confirmation prompts.
 _SKIP_WORDS = ("skip", "skip it", "next", "skip this", "continue anyway")
 _STOP_WORDS = ("stop", "cancel", "abort", "quit", "no")
+_CONFIRM_WORDS = ("yes", "y", "confirm", "confirmed", "ok", "okay", "go ahead", "proceed")
 
 _BROWSER_EXES = ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe")
 
@@ -69,6 +70,7 @@ class PlaybackSession:
         self._started_at = time.time()
         self.improvement_offer = False
         self.failure_reason: str | None = None
+        self._confirmed_step_indexes: set[int] = set()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -95,6 +97,16 @@ class PlaybackSession:
             return "failed"
         while self._step_index < len(self.recorded_steps):
             step = self.recorded_steps[self._step_index]
+
+            if step.get("requires_confirmation") and self._step_index not in self._confirmed_step_indexes:
+                self._pending_question = (
+                    step.get("confirmation_prompt")
+                    or f"This skill is about to run a sensitive step ({step.get('type', 'action')}). Should I proceed?"
+                )
+                self._pending_step_index = self._step_index
+                self._pending_input_kind = "safety_confirm"
+                self.status = "need_input"
+                return "need_input"
 
             if self._needs_variable_input(step):
                 self._pending_question = self._build_variable_question(step)
@@ -137,10 +149,25 @@ class PlaybackSession:
                 )
                 return
             self._values[variable.get("name")] = value
+        elif self._pending_input_kind == "safety_confirm":
+            lowered = text.lower()
+            normalized_answer = lowered.strip(" .!?")
+            if normalized_answer not in _CONFIRM_WORDS:
+                self.status = "cancelled"
+                self._pending_question = None
+                self._pending_input_kind = None
+                self._pending_step_index = None
+                return
+            if self._pending_step_index is not None:
+                self._confirmed_step_indexes.add(self._pending_step_index)
         elif self._pending_input_kind == "confirm":
             lowered = text.lower()
             if any(word in lowered for word in _STOP_WORDS):
                 self.status = "cancelled"
+                self._pending_question = None
+                self._pending_input_kind = None
+                self._pending_step_index = None
+                return
             elif any(word in lowered for word in _SKIP_WORDS):
                 self._skip_requested = True
             else:
@@ -659,6 +686,7 @@ class PlaybackSession:
             result = "cancelled"
         else:
             result = "success"
+            self.status = "done"
             recorded_actions = [s for s in self.recorded_steps if s.get("type") not in ("wait", "ensure_app")]
             actual_actions = [s for s in self._actual_steps if s.get("type") not in ("wait", "ensure_app")]
             if len(actual_actions) < len(recorded_actions) and len(actual_actions) > 0:

@@ -233,16 +233,19 @@ class Agent:
         except UnicodeEncodeError:
             safe_message = str(message).encode("utf-8", errors="replace").decode("utf-8")
             self.assistant.speak(safe_message)
-        self.memory_manager.add_message("assistant", message)
+        if hasattr(self, "memory_manager"):
+            self.memory_manager.add_message("assistant", message)
         # Fire voice callback immediately so TTS starts without waiting
         # for agent.run() to finish.
-        if self._voice_callback:
+        if getattr(self, "_voice_callback", None):
             try:
                 self._voice_callback(message)
             except Exception:
                 logger.exception("Voice callback failed in _speak")
 
     def _record_tool_result(self, tool_name: str, result) -> None:
+        if not hasattr(self, "memory_manager"):
+            return
         self.memory_manager.add_message(
             "tool",
             str(result),
@@ -592,6 +595,7 @@ class Agent:
                 intent_hint=intent_hint,
                 resume_goal=pending["goal"],
                 resume_observations=pending["observations"],
+                resume_state=pending.get("task_state"),
             )
             return
 
