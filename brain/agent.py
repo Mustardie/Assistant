@@ -55,6 +55,7 @@ class Agent:
         self._pending_user_goal = None
         self._last_file_action = None
         self._voice_callback = None
+        self._event_callback = None
         # Set by AgentLoop.run() whenever it pauses mid-task (a genuine
         # clarifying question, a recovery dead-end, or the iteration budget
         # running out) instead of truly finishing. When set, the NEXT user
@@ -68,6 +69,7 @@ class Agent:
             on_file_search_result=self._on_file_search_result,
             track_file_action=self._track_file_action,
             fallback=self._run_intent_fallback,
+            emit_event=self._emit_event,
         )
         self._run_lock = threading.Lock()
 
@@ -75,6 +77,23 @@ class Agent:
         """Register a function to be called immediately when Nova speaks,
         so TTS can start without waiting for agent.run() to finish."""
         self._voice_callback = callback
+
+    def set_event_callback(self, callback):
+        """Receive structured, best-effort runtime events for rich clients.
+
+        The agent never depends on this callback, so a closed or faulty UI
+        cannot break task execution.
+        """
+        self._event_callback = callback
+
+    def _emit_event(self, event_type: str, payload: dict | None = None) -> None:
+        callback = getattr(self, "_event_callback", None)
+        if callback is None:
+            return
+        try:
+            callback(event_type, dict(payload or {}))
+        except Exception:
+            logger.exception("Agent event callback failed for %s", event_type)
 
     def _is_youtube_request(self, user: str) -> bool:
         normalized = user.lower().strip()
@@ -228,6 +247,7 @@ class Agent:
         return "I couldn’t find a matching email to reply to."
 
     def _speak(self, message: str) -> None:
+        self._emit_event("assistant_speaking", {"text": str(message)})
         try:
             self.assistant.speak(message)
         except UnicodeEncodeError:
@@ -561,13 +581,25 @@ class Agent:
             logger.warning("Agent.run() called while already running; dropping duplicate call for: %s", user[:80])
             return
         try:
+            self._emit_event("assistant_thinking", {"goal": str(user)})
             self._run_inner(user)
         finally:
+            self._emit_event("idle", {})
             self._run_lock.release()
 
     def _run_inner(self, user):
         user = normalize_user_input(user)
         self.memory_manager.add_message("user", user)
+        try:
+            memories = self.memory_manager.get_planning_context(user, enabled=True, limit=5)
+        except Exception:
+            logger.exception("Unable to prepare memory event")
+            memories = []
+        self._emit_event("memory_retrieved", {
+            "query": user,
+            "memories": memories,
+            "used": bool(memories),
+        })
 
         if self._handle_rename_correction(user):
             return

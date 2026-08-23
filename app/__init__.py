@@ -1,0 +1,2 @@
+"""Standalone application entry points."""
+

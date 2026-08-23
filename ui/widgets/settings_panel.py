@@ -77,12 +77,21 @@ PROVIDER_SUBTITLES = {
 
 # Voice options: display label shown in the combo, value persisted in
 # settings["voice"] (kept in the "Name — voice_id" format main.py parses).
-VOICE_OPTIONS = [
+PIPER_VOICE_OPTIONS = [
     ("Ryan — en_US-ryan-high", "Ryan (high)"),
     ("Amy — en_US-amy-medium", "Amy (medium)"),
     ("Kristin — en_US-kristin-medium", "Kristin (medium)"),
     ("LibriTTS — en_US-libritts-high", "LibriTTS (high)"),
 ]
+KOKORO_VOICE_OPTIONS = [
+    ("Heart — af_heart", "Heart"),
+    ("Nova — af_nova", "Nova"),
+    ("Bella — af_bella", "Bella"),
+    ("Puck — am_puck", "Puck"),
+    ("Michael — am_michael", "Michael"),
+    ("Emma — bf_emma", "Emma"),
+]
+VOICE_OPTIONS = PIPER_VOICE_OPTIONS
 
 
 class _Toggle(QWidget):
@@ -378,6 +387,18 @@ class SettingsPanel(QWidget):
         "auto_speak": True,
         "show_timestamps": True,
         "always_on_top": False,
+        "core_animation": True,
+        "widget_hover_effects": True,
+        "auto_open_widgets": True,
+        "show_live_transcript": True,
+        "reduced_motion": False,
+        "voice_preload": True,
+        "targeted_memory": True,
+        "show_memory_sources": True,
+        "confirm_destructive": True,
+        "confirm_external_actions": True,
+        "confirm_commands": True,
+        "layout_snap": True,
     }
 
     def __init__(self, parent=None):
@@ -393,7 +414,7 @@ class SettingsPanel(QWidget):
         # header
         header = QHBoxLayout()
         header.setContentsMargins(22, 18, 14, 10)
-        title = QLabel("Settings")
+        title = QLabel("JARVIS Control Matrix")
         title.setStyleSheet(
             f"color: {TEXT}; font-family: {FONT_FAMILY}; font-size: {FONT_H3}px;"
             "font-weight: 700; background: transparent;"
@@ -417,6 +438,7 @@ class SettingsPanel(QWidget):
         self._build_appearance(body_layout)
         self._build_provider(body_layout)
         self._build_api_keys(body_layout)
+        self._build_jarvis_runtime(body_layout)
         self._build_preferences(body_layout)
         body_layout.addStretch(1)
 
@@ -484,10 +506,8 @@ class SettingsPanel(QWidget):
         row_voice = QHBoxLayout()
         row_voice.setSpacing(10)
         row_voice.addWidget(_label("Voice"))
-        self._voice_combo = _combo(
-            [label for _, label in VOICE_OPTIONS],
-            [value for value, _ in VOICE_OPTIONS],
-        )
+        initial_options = KOKORO_VOICE_OPTIONS if self._settings["voice_engine"] == "kokoro" else PIPER_VOICE_OPTIONS
+        self._voice_combo = _combo([label for _, label in initial_options], [value for value, _ in initial_options])
         self._voice_combo.setMaximumWidth(240)
         voice_idx = self._voice_combo.findData(self._settings["voice"])
         if voice_idx >= 0:
@@ -802,8 +822,50 @@ class SettingsPanel(QWidget):
         self._hotkey_edit.textChanged.connect(self._on_hotkey_changed)
         card.body_layout.addWidget(_LabeledRow("Voice hotkey", self._hotkey_edit))
         card.body_layout.addWidget(
-            _label("Global shortcut to open Nova and talk (press again to stop).",
+            _label("Global shortcut to open JARVIS and talk (press again to stop).",
                    TEXT_FAINT, FONT_TINY, 400, wrap=True)
+        )
+        layout.addWidget(card)
+
+    def _build_jarvis_runtime(self, layout):
+        """Controls specific to the intelligence core and autonomous UI."""
+        card = _SectionCard("JARVIS RUNTIME")
+        rows = [
+            ("core_animation", "Animate intelligence core"),
+            ("widget_hover_effects", "Widget hover energy effects"),
+            ("auto_open_widgets", "Open useful widgets automatically"),
+            ("show_live_transcript", "Show live voice transcript"),
+            ("reduced_motion", "Reduce non-essential motion"),
+            ("voice_preload", "Preload speech models at launch"),
+            ("targeted_memory", "Use targeted task memory"),
+            ("show_memory_sources", "Show memory source details"),
+            ("layout_snap", "Keep widgets inside safe layout zones"),
+        ]
+        safety_rows = [
+            ("confirm_destructive", "Confirm destructive file actions"),
+            ("confirm_external_actions", "Confirm messages and external actions"),
+            ("confirm_commands", "Confirm command execution"),
+        ]
+        self._jarvis_toggles = {}
+        for key, label in rows:
+            control = _Toggle(self._settings[key])
+            control.setProperty("key", key)
+            control.toggled.connect(self._on_toggle)
+            self._jarvis_toggles[key] = control
+            card.body_layout.addWidget(_LabeledRow(label, control))
+        card.body_layout.addWidget(_label("SAFETY", TEXT_FAINT, FONT_TINY, 600))
+        for key, label in safety_rows:
+            control = _Toggle(self._settings[key])
+            control.setProperty("key", key)
+            control.toggled.connect(self._on_toggle)
+            self._jarvis_toggles[key] = control
+            card.body_layout.addWidget(_LabeledRow(label, control))
+        card.body_layout.addWidget(
+            _label(
+                "Provider, model, API keys, voice, appearance, hotkey, memory, autonomy, "
+                "widget behavior, and safety are controlled from this one matrix.",
+                TEXT_FAINT, FONT_TINY, 400, wrap=True,
+            )
         )
         layout.addWidget(card)
 
@@ -843,17 +905,16 @@ class SettingsPanel(QWidget):
             self._settings = merged
             self._name_edit.setText(merged["assistant_name"])
             self._engine_combo.setCurrentText(merged["voice_engine"])
-            voice_idx = self._voice_combo.findData(merged["voice"])
-            if voice_idx >= 0:
-                self._voice_combo.setCurrentIndex(voice_idx)
-            else:
-                self._voice_combo.setCurrentText(merged["voice"])
+            merged["voice"] = self._populate_voice_options(merged["voice_engine"], merged["voice"])
+            self._settings["voice"] = merged["voice"]
             self._speed_slider.setValue(int(merged["speed"] * 100))
             self._provider_combo.setCurrentText(merged["provider"])
             self._hotkey_edit.setText(merged["hotkey"])
             self._auto_speak.setChecked(merged["auto_speak"])
             self._timestamps.setChecked(merged["show_timestamps"])
             self._ontop.setChecked(merged["always_on_top"])
+            for key, control in self._jarvis_toggles.items():
+                control.setChecked(bool(merged[key]))
             env = read_env()
             self._youtube_edit.setText(env.get("YOUTUBE_API_KEY", ""))
             self._tavily_edit.setText(env.get("TAVILY_API_KEY", ""))
@@ -885,7 +946,22 @@ class SettingsPanel(QWidget):
 
     def _on_engine_changed(self, text):
         self._settings["voice_engine"] = text
+        self._settings["voice"] = self._populate_voice_options(text, self._settings.get("voice", ""))
         self._emit()
+
+    def _populate_voice_options(self, engine: str, selected: str) -> str:
+        options = KOKORO_VOICE_OPTIONS if engine == "kokoro" else PIPER_VOICE_OPTIONS
+        valid = {value for value, _label_text in options}
+        if selected not in valid:
+            selected = "Puck — am_puck" if engine == "kokoro" else "Ryan — en_US-ryan-high"
+        blocked = self._voice_combo.blockSignals(True)
+        self._voice_combo.clear()
+        for value, label_text in options:
+            self._voice_combo.addItem(label_text, value)
+        index = self._voice_combo.findData(selected)
+        self._voice_combo.setCurrentIndex(max(0, index))
+        self._voice_combo.blockSignals(blocked)
+        return selected
 
     def _on_voice_changed(self, text):
         data = self._voice_combo.currentData()

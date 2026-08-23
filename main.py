@@ -29,9 +29,6 @@ _ROOT = Path(__file__).resolve().parent
 # are pushed into the environment BEFORE config.settings / brain / ui are
 # imported, so every component built at startup picks them up.
 # ------------------------------------------------------------------ #
-from config.settings import apply_runtime_overrides, PROVIDER_MODEL_FIELD, PROVIDER_API_KEY_FIELD
-from llm.factory import DISPLAY_TO_PROVIDER_KEY
-
 _ENV_VAR_FOR_FIELD = {
     "ollama_model": "OLLAMA_MODEL",
     "gemini_model": "GEMINI_MODEL", "gemini_api_key": "GEMINI_API_KEY",
@@ -42,6 +39,18 @@ _ENV_VAR_FOR_FIELD = {
     "deepseek_model": "DEEPSEEK_MODEL", "deepseek_api_key": "DEEPSEEK_API_KEY",
 }
 
+_EARLY_PROVIDER_MODEL_FIELD = {
+    "ollama": "ollama_model", "gemini": "gemini_model",
+    "openrouter": "openrouter_model", "openai": "openai_model",
+    "anthropic": "anthropic_model", "groq": "groq_model",
+    "deepseek": "deepseek_model",
+}
+_EARLY_PROVIDER_API_KEY_FIELD = {
+    "ollama": None, "gemini": "gemini_api_key", "openrouter": "openrouter_api_key",
+    "openai": "openai_api_key", "anthropic": "anthropic_api_key",
+    "groq": "groq_api_key", "deepseek": "deepseek_api_key",
+}
+
 
 def _apply_provider_to_env(provider_display: str, model: str, api_key: str):
     """Push the selected provider's model/key into the environment using
@@ -50,16 +59,16 @@ def _apply_provider_to_env(provider_display: str, model: str, api_key: str):
     every registered provider (Ollama, OpenRouter, Gemini, OpenAI,
     Anthropic, Groq, DeepSeek) with no per-provider special-casing here.
     """
-    provider_key = DISPLAY_TO_PROVIDER_KEY.get(provider_display, (provider_display or "ollama").lower())
+    provider_key = (provider_display or "ollama").strip().lower().replace(" ", "")
     os.environ["LLM_PROVIDER"] = provider_key
 
     model = (model or "").strip()
-    model_field = PROVIDER_MODEL_FIELD.get(provider_key)
+    model_field = _EARLY_PROVIDER_MODEL_FIELD.get(provider_key)
     if model and model_field and model_field in _ENV_VAR_FOR_FIELD:
         os.environ[_ENV_VAR_FOR_FIELD[model_field]] = model
 
     key = (api_key or "").strip()
-    key_field = PROVIDER_API_KEY_FIELD.get(provider_key)
+    key_field = _EARLY_PROVIDER_API_KEY_FIELD.get(provider_key)
     if key and key_field and key_field in _ENV_VAR_FOR_FIELD:
         os.environ[_ENV_VAR_FOR_FIELD[key_field]] = key
 
@@ -98,8 +107,12 @@ def _apply_persisted_settings_to_env():
     # separator, so take the id after the LAST space instead of matching a
     # specific dash character).
     voice_id = voice.rsplit(" ", 1)[-1].strip() if voice.strip() else ""
+    if voice_engine == "kokoro" and (not voice_id or voice_id.startswith("en_")):
+        voice_id = "am_puck"
+    elif voice_engine == "piper" and voice_id and not voice_id.startswith(("en_", "de_", "fr_", "es_")):
+        voice_id = "en_US-ryan-high"
     if voice_id:
-        os.environ["PIPER_VOICE"] = voice_id
+        os.environ["KOKORO_VOICE" if voice_engine == "kokoro" else "PIPER_VOICE"] = voice_id
     try:
         speed = float(data.get("speed", 1.0))
         os.environ["TTS_SPEED"] = str(speed)
@@ -109,11 +122,26 @@ def _apply_persisted_settings_to_env():
 
 _apply_persisted_settings_to_env()
 
+# Import the frozen settings singleton only after persisted selections have
+# reached the environment.  Importing it earlier silently locked the agent to
+# stale .env values until restart/rebuild.
+from config.settings import (
+    PROVIDER_API_KEY_FIELD,
+    PROVIDER_MODEL_FIELD,
+    apply_runtime_overrides,
+    settings,
+)
+
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer
 
 from brain.agent import Agent
-from ui.nova_window import NovaWindow
+from app.jarvis_widget_backend import JarvisWidgetBackend
+_legacy_ui = os.getenv("JARVIS_LEGACY_UI", "").strip().lower() in {"1", "true", "yes"}
+if _legacy_ui:
+    from ui.nova_window import NovaWindow
+else:
+    from ui.jarvis.window import JarvisWindow
 from backend.bridge import AssistantBridge
 from backend.browser_server import start_bridge, stop_bridge
 
@@ -146,6 +174,7 @@ def _shutdown_bridge():
 atexit.register(_shutdown_bridge)
 
 agent = Agent()
+_widget_backend = JarvisWidgetBackend(agent=agent)
 
 
 # ------------------------------------------------------------------ #
@@ -189,10 +218,20 @@ def _start_voice():
 def _preload_voice_models():
     try:
         logger.info("Voice: preloading models...")
+        if hasattr(window, "runtimeStatus"):
+            window.runtimeStatus.emit({"stt": "Loading speech model…", "tts": "Loading voice…"})
         _voice_manager.warmup()
         logger.info("Voice: models ready")
-    except Exception:
+        if hasattr(window, "runtimeStatus"):
+            window.runtimeStatus.emit({
+                "stt": f"Ready · {settings.voice_model}",
+                "tts": f"Ready · {settings.tts_engine}",
+                "warning": "Voice, agent, and available connectors are wired to this interface.",
+            })
+    except Exception as exc:
         logger.exception("Voice model preloading failed")
+        if hasattr(window, "runtimeStatus"):
+            window.runtimeStatus.emit({"stt": "Unavailable", "tts": "Unavailable", "warning": f"Voice initialization failed: {exc}"})
 
 
 # ------------------------------------------------------------------ #
@@ -212,15 +251,66 @@ def _handle_text_submit(text: str):
     """Text in -> text out. The reply arrives through bridge.responseReady
     (agent's speak hook -> bridge.say -> window.append_assistant)."""
     _mode["value"] = "text"
+    if hasattr(window, "begin_reply"):
+        window.begin_reply()
     threading.Thread(target=agent.run, args=(text,), daemon=True).start()
 
 
-window = NovaWindow()
+window = NovaWindow() if _legacy_ui else JarvisWindow()
 
 # Single speak hook: routed by mode (see _on_agent_speak).
 agent.set_voice_callback(_on_agent_speak)
+if hasattr(window, "agentEvent"):
+    agent.set_event_callback(lambda event_type, payload: window.agentEvent.emit(event_type, payload))
 window.textSubmitted.connect(_handle_text_submit)
 window.voicePressed.connect(_start_voice)
+
+
+def _cancel_current_task():
+    if _voice_manager is not None:
+        _voice_manager.stop()
+    progress = window.widget_manager.find_type("task_progress") if hasattr(window, "widget_manager") else None
+    if progress:
+        window.widget_manager.update(progress.widget_id, data={"status": "cancel_requested", "retry_status": "The current model call will stop at its next safe boundary."}, loading=False)
+    if hasattr(window, "runtimeStatus"):
+        window.runtimeStatus.emit({"task": "Cancellation requested", "warning": "JARVIS will stop at the next safe task boundary."})
+
+
+if hasattr(window, "taskCancelled"):
+    window.taskCancelled.connect(_cancel_current_task)
+
+
+def _handle_widget_action(widget_id: str, action: str, payload: dict):
+    if not hasattr(window, "widget_manager"):
+        return
+    if widget_id == "settings":
+        if action == "test_provider":
+            provider = str((payload or {}).get("provider") or settings.llm_provider)
+            _handle_text_submit(f"Test the active {provider} model connection. Reply with a short status and do not call tools.")
+        return
+    state = window.widget_manager.get(widget_id)
+    if state is None:
+        return
+    if state.widget_type == "file_search" and action == "search":
+        query = str((payload or {}).get("query") or "").strip()
+        if query:
+            window.widget_manager.update(widget_id, loading=True, empty=False, error=None, data={"query": query, "results": []})
+            _handle_text_submit(f"Find my local file or folder matching: {query}")
+        return
+    if state.widget_type == "system_status" and action == "refresh":
+        window.runtimeStatus.emit({"connectors": _connector_summary(), "task": "Idle", "warning": "Runtime status refreshed."})
+        return
+    window.widget_manager.update(widget_id, loading=True, error=None)
+
+    def execute_widget_action():
+        result = _widget_backend.perform(state.widget_type, action, dict(payload or {}), state.data)
+        window.widgetBackendResult.emit(widget_id, result)
+
+    threading.Thread(target=execute_widget_action, daemon=True, name=f"jarvis-widget-{state.widget_type}").start()
+
+
+if hasattr(window, "widgetAction"):
+    window.widgetAction.connect(_handle_widget_action)
 
 
 def _display_response(text: str):
@@ -241,6 +331,31 @@ _voice_manager = VoiceManager(
         "on_idle": bridge.idle,
     },
 )
+
+
+def _connector_summary() -> str:
+    parts = ["Browser bridge ready" if _bridge_started else "Browser bridge unavailable"]
+    try:
+        from youtube_auth import TOKEN_PATH
+        parts.append("Google authorized" if TOKEN_PATH.exists() else "Google sign-in required")
+    except Exception:
+        parts.append("Google status unavailable")
+    return " · ".join(parts)
+
+
+if hasattr(window, "update_system_status"):
+    model_field = PROVIDER_MODEL_FIELD.get(settings.llm_provider)
+    active_model = getattr(settings, model_field, "") if model_field else ""
+    window.update_system_status(
+        model=f"{settings.llm_provider} · {active_model or 'configured'}",
+        mic="Ready · click the core",
+        stt=f"Initializing · {settings.voice_model}",
+        tts=f"Initializing · {settings.tts_engine}",
+        connectors=_connector_summary(),
+        task="Idle",
+        warning="Initializing speech models in the background…",
+        error=None,
+    )
 
 
 def _on_state_changed(state: str):
@@ -299,8 +414,16 @@ def _load_hotkey_from_disk() -> str:
 # ------------------------------------------------------------------ #
 # Live settings application
 # ------------------------------------------------------------------ #
-_prev_backend_sig = None
-_prev_voice_sig = None
+_initial_ui_settings = dict(getattr(window, "_settings", {}) or {})
+_initial_provider = _initial_ui_settings.get("provider") or "Ollama"
+_prev_backend_sig = (
+    _initial_provider,
+    (_initial_ui_settings.get("models") or {}).get(_initial_provider) or "",
+    (_initial_ui_settings.get("api_keys") or {}).get(_initial_provider) or "",
+)
+_initial_engine = str(_initial_ui_settings.get("voice_engine") or "piper").lower()
+_initial_voice = str(_initial_ui_settings.get("voice") or "").rsplit(" ", 1)[-1].strip()
+_prev_voice_sig = (_initial_engine, _initial_voice, float(_initial_ui_settings.get("speed", 1.0)))
 
 
 def _rebuild_agent(provider: str, model: str, api_key: str):
@@ -329,9 +452,14 @@ def _rebuild_agent(provider: str, model: str, api_key: str):
         apply_runtime_overrides(llm_provider=os.environ.get("LLM_PROVIDER", ""), **overrides)
         new_agent = Agent()
         new_agent.set_voice_callback(_on_agent_speak)
+        if hasattr(window, "agentEvent"):
+            new_agent.set_event_callback(lambda event_type, payload: window.agentEvent.emit(event_type, payload))
         _voice_manager.set_agent(new_agent)
         agent = new_agent
+        _widget_backend.agent = new_agent
         logger.info("Agent rebuilt: provider=%s model=%s", provider, model)
+        if hasattr(window, "runtimeStatus"):
+            window.runtimeStatus.emit({"model": f"{provider} · {model or 'configured'}"})
     except Exception:
         logger.exception("Agent rebuild failed; keeping current agent")
     finally:
@@ -361,6 +489,10 @@ def _on_settings_changed_main(settings: dict):
     voice_engine = (settings.get("voice_engine") or "piper").strip().lower()
     voice = settings.get("voice") or ""
     voice_id = voice.rsplit(" ", 1)[-1].strip() if voice.strip() else ""
+    if voice_engine == "kokoro" and (not voice_id or voice_id.startswith("en_")):
+        voice_id = "am_puck"
+    elif voice_engine == "piper" and voice_id and not voice_id.startswith(("en_", "de_", "fr_", "es_")):
+        voice_id = "en_US-ryan-high"
     try:
         speed = float(settings.get("speed", 1.0))
     except (TypeError, ValueError):

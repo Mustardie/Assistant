@@ -1126,6 +1126,7 @@ class AgentLoop:
         track_file_action=None,
         fallback=None,
         runtime=None,
+        emit_event=None,
     ):
         self.brain = brain
         self.speak = speak
@@ -1134,6 +1135,7 @@ class AgentLoop:
         self.track_file_action = track_file_action
         self.fallback = fallback
         self.runtime = runtime or AgentRuntime(TOOLS)
+        self.emit_event = emit_event or (lambda event_type, payload=None: None)
         self.task_state: AgentState | None = None
         self._confirmed_tool: str | None = None
         self._last_response = ""
@@ -2236,6 +2238,13 @@ class AgentLoop:
             confirmed=self._confirmed_tool == tool,
         )
         if assessment.requires_confirmation:
+            self.emit_event("confirmation_required", {
+                "tool": tool,
+                "action": f"Run {tool}",
+                "risk": assessment.reason,
+                "target": str(arguments),
+                "arguments": arguments,
+            })
             return {"success": False, "result": assessment.reason, "stop": False, "needs_user": True}
         if not assessment.allowed:
             raw_result = {"success": False, "error": assessment.reason, "retryable": True}
@@ -2250,11 +2259,37 @@ class AgentLoop:
         arguments = assessment.arguments
         step = {**step, "arguments": arguments}
 
-        raw_success, result = run_tool(tool, arguments)
+        self.emit_event("tool_started", {"tool": tool, "arguments": arguments})
+        try:
+            raw_success, result = run_tool(tool, arguments)
+        except Exception as exc:
+            self.emit_event("tool_failed", {
+                "tool": tool,
+                "arguments": arguments,
+                "error": str(exc),
+                "retryable": True,
+                "verified": False,
+            })
+            raise
         normalized, verification = self.runtime.observe(
             self.task_state, step, raw_success, result
         )
         success = verification.succeeded
+        result_shape = type(normalized.data).__name__
+        if isinstance(normalized.data, (list, tuple, dict, set)):
+            result_shape += f"[{len(normalized.data)}]"
+        self.emit_event(
+            "tool_finished" if success else "tool_failed",
+            {
+                "tool": tool,
+                "arguments": arguments,
+                "error": None if success else str(normalized.error or verification.reason),
+                "retryable": bool(normalized.retryable),
+                "verified": True,
+                "result": normalized.data if tool == "file_search" else None,
+                "detail": f"{verification.reason} · result {result_shape}",
+            },
+        )
 
         if success and self.track_file_action and tool in {"file_rename", "file_move"}:
             self.track_file_action(tool, arguments)
