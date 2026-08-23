@@ -1,6 +1,6 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-22 (Session 10A).
+Context for continuing this work in a new chat. Updated 2026-08-23 (Session 10B).
 
 ---
 
@@ -8,7 +8,7 @@ Context for continuing this work in a new chat. Updated 2026-08-22 (Session 10A)
 
 ```cmd
 cd /d E:\Assistant
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1318 passed
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 1499 passed
 
 REM hear the footage first -- the story layer is blind without this:
 pip install faster-whisper
@@ -30,7 +30,7 @@ Everything below is detail behind that.
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all ten sessions and 1318 passing editing tests.
+This has all eleven sessions and 1499 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -51,7 +51,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in ten sessions
+## What was built, in eleven sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -99,6 +99,7 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
 | 8 | `episode/` | story beats, open loops, retention risks, hooks, suggestions |
 | 9 | `feedback/` | the review queue, the append-only log, preference and training signals |
 | 10A | `transcribe/` | local faster-whisper, the cache, batches, the durable-transcript seam |
+| 10B | `render/` | FFmpeg proxy renders, review notes, the render cache |
 
 ### Session 7 — the auto pipeline
 
@@ -211,6 +212,50 @@ whole story layer silent.
 reads it back: 100% word recovery with `tiny`, and `small` gets "nether" and
 "netherite" right. The transcript reaches the Session 8 episode layer, which
 finds the stated objective and the open loop from it.
+
+### Session 10B -- the FFmpeg proxy render
+
+The second Week 1 feature, and the one that changes how the whole thing is
+used: every pass before this produces a *plan*, and the only way to see one was
+to open Premiere and execute against it. Now a rough cut becomes a watchable
+MP4 in about a minute per ten minutes of video, with no Premiere, no GPU and no
+model.
+
+```
+change a rule -> build the plan -> render -> watch -> change a rule
+```
+
+- `editing/render/`
+  - `schema.py` -- `RenderConfig` and the seven records; the cache-key subset;
+    the quality table, the encoder dialects, and what a flat proxy cannot show
+  - `convert.py` -- `RoughCutPlan` -> `RenderSegment[]`: ordering, speed
+    resolution, truncation, and the unsupported-feature list
+  - `commands.py` -- every FFmpeg invocation, built as pure data. Nothing here
+    shells out
+  - `runner.py` -- the only subprocess in the package, plus the mock runner
+  - `sources.py` -- measuring the footage, and the four-part cache key
+  - `store.py` -- job folders, the cache, artifacts, temp and cleaning
+  - `notes.py` -- `review_notes.md`, the file you write on while watching
+  - `report.py` -- `report.md` and the terminal view
+  - `run.py` -- the orchestration: convert, check, measure, key, build, encode,
+    join, verify, write
+- `editing/config.py` -- `render_dir`
+- `editing/pipeline.py` -- `render_config|status|roughcut`, `render_plan_file`,
+  `render_jobs|job|result|report|notes`, `clean_renders`
+- `editing/cli.py` -- `render roughcut|from-plan|status|list|show|report|
+  notes|open|clean`, and `_feedback_pipeline` generalised to
+  `_run_scoped_pipeline` so `--run` works for both
+- `editing/auto/` -- one more stage, `render_proxy`, after `retention_plan`,
+  opt-in behind `--render-proxy`, plus a `WATCH IT` section in every run report
+  whether or not it ran
+- `tests/editing/test_editing_render.py` -- 169 tests, plus 12 in the auto suite
+
+**Verified against real FFmpeg.** A three-clip cut mixing 1080p60-with-audio
+and 720p30-with-no-audio rendered in 1.2s to a 15.06s file against a planned
+15.0s, joined by stream copy, with a continuous audio track across all three
+segments. `auto run --render-proxy` completed all 23 stages on the same
+footage. The test suite itself needs no FFmpeg: every subprocess goes through
+an injected runner.
 
 ---
 
@@ -428,24 +473,91 @@ in the package to keep it that way.
 ordinary afternoon; the useful outcome is twenty-eight transcripts and an exact
 account of the two, each with the fix attached.
 
+### From Session 10B
+
+**Rendering is not executing.** A proxy is a disposable answer to "does this
+cut work"; an execution is an edit somebody then has to finish or undo. So the
+render path has no gate, no `--yes` and no Premiere -- there is nothing to
+guard, because nothing outside `data/editing/render/` is touched. That is also
+why `render clean --yes` exists and `roughcut execute` has no equivalent: the
+one you can safely delete is the one worth having a delete command for.
+
+**Encode each clip, then join, rather than one filtergraph.** The filtergraph
+version is faster and fails on real footage: a folder of captures mixes
+resolutions, mixes files with and without a microphone track, and has clips
+whose audio starts a few hundred milliseconds late. FFmpeg's answer to that is
+a message about stream layouts, forty seconds into a decode, with nothing on
+disk. Normalising every segment first makes the join a stream copy that cannot
+fail on mismatch, and makes a failure name the clip that caused it.
+
+**Every segment gets an audio stream, even the silent ones.** The concat
+demuxer refuses to join files whose stream layouts differ, so one clip recorded
+without a microphone breaks the entire render. `anullsrc` for those. This is
+the single most common way a naive version of this package fails, and the
+reason each source is probed once before anything encodes.
+
+**The job folder *is* the cache entry.** The job ID is derived from the cache
+key, so re-rendering the same cut with the same settings lands in the same
+folder. A separate cache index would introduce a second place for "there is a
+render for this key" and "there is a video on disk" to disagree, and that
+disagreement is how a tool starts handing back paths to files that were deleted
+to free space.
+
+**The cache key spells its numbers, rather than hashing them.** A plan built in
+memory carries `source_in=1` where the same plan read back from JSON carries
+`1.0`, and `repr` spells those differently -- so the key missed on the one path
+it exists for: build a plan, save it, render it later. Found by rendering the
+same cut twice and watching it re-encode.
+`test_a_plan_fingerprint_survives_a_trip_through_json` pins it.
+
+**The plan fingerprint reads placements and ignores operations.** Re-running
+the style pass rewrites two hundred operations and changes not one frame of the
+V1 assembly. Keying on the whole plan would re-render an hour of footage every
+time somebody changed a caption preset, which would make the cache worthless
+exactly when it matters.
+
+**An impossible speed renders at 1x rather than clamping.** Clamping a 20x
+timelapse to 8x produces a video that looks like the *cut* is wrong. Refusing
+it and saying so does not.
+
+**A mock render is never called a render.** `mocked` is its own status, and
+`rendered` stays False. "Did this complete" and "is there something to watch"
+have different answers for a placeholder, and one field cannot say both. Same
+rule as Session 10A's mock transcript, learned the same way.
+
+**What FFmpeg cannot show is listed, and the cut still renders.** By Session 6 a
+rough cut carries captions, cards, markers, sound effects and graphics.
+Refusing to render it would make this package useless exactly when it became
+valuable; rendering it silently would misrepresent what is being judged. So
+every report carries a `NOT IN THIS VIDEO` list.
+
+**Intermediates are deleted on success and kept on failure.** They are the
+whole render again in disk terms, and the question that follows a failed join
+is always "which clip is wrong" -- which should not cost a second render to
+answer.
+
 ---
 
 ## Current state
 
-- **1318 editing tests**, ~100s, needing no FFmpeg, GPU, model server, Premiere,
+- **1499 editing tests**, ~115s, needing no FFmpeg, GPU, model server, Premiere,
   Whisper or real media
-- `tests/premiere/` passes too (277 there, 1595 across both suites)
+- `tests/premiere/` passes too (277 there, 1776 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
   client) are pre-existing and unrelated
-- `editing/README.md` is the full user documentation (~2950 lines); §0 covers
-  auto mode and §16 covers the feedback collector
+- `editing/README.md` is the full user documentation (~3460 lines); §0 covers
+  auto mode, §16 the feedback collector and §17 the proxy render
 
 **Note on running the tests here:** pytest's default temp root
 (`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
 every test errors in setup. Pass `--basetemp` at a writable path.
 
-**Verified on real footage**: `auto run` completes all stages on three real
-MP4s with real FFmpeg, in mock mode, in about a minute. The full gate chain
+**Verified on real footage**: `auto run` completes all 23 stages on real MP4s
+with real FFmpeg, in mock mode, in about a minute -- including the proxy
+render, which produced a 47s video from a three-clip cut.
+`render roughcut` was verified separately on footage deliberately mixing
+1080p60-with-audio and 720p30-with-no-audio: 15.06s produced against 15.0s
+planned, joined by stream copy, audio continuous across all three segments. The full gate chain
 (execute rough cut → resume → execute layers) is verified against a fake
 engine. Session 9 was verified end to end through the CLI against hand-built
 artifacts -- start, queue, show, rate, note, correct, list, stats, report and
@@ -503,6 +615,19 @@ both export formats -- but **not** yet against a real review of real footage.
     ones are heuristics, marked as such.
 19. **A preference signal is one person's**, and `scope` only distinguishes one
     session from several. There is no notion of multiple reviewers.
+20. **The proxy render shows the cut, not the edit.** V1 only: captions, cards,
+    sound effects, music, graphics and markers are all absent from a video that
+    otherwise looks finished. Every report lists what it could not show, but a
+    person watching still has to remember it.
+21. **Speed changes in the proxy are `setpts`/`atempo`, not Premiere's
+    retime.** The rendered timing is close, not identical -- the report prints
+    the drift, and more than a second or two is worth understanding before
+    trusting a timing read off the proxy.
+22. **The proxy has never been watched by anyone.** It renders correctly on
+    real mixed footage and the numbers check out; nobody has yet sat down with
+    a real episode's proxy and said whether the *cut* was any good. That is the
+    entire point of the feature and is now the cheapest way to find out whether
+    threshold selection produces watchable video.
 
 ---
 
@@ -511,6 +636,21 @@ both export formats -- but **not** yet against a real review of real footage.
 The system is now usable enough that the next steps are about *reality*, not
 features.
 
+- **Render a real episode's rough cut and watch it.** This is now the cheapest
+  way to find out whether anything above the rough cut is worth keeping, and it
+  needs no GPU, no model server and no Premiere:
+
+  ```cmd
+  python -m editing.cli auto run --folder D:\Footage\ep12 --mock --no-premiere ^
+      --transcribe --render-proxy
+  python -m editing.cli auto report
+  python -m editing.cli render open <job_id> --run <run_id>
+  ```
+
+  Then write in `review_notes.md` while it plays, and feed the verdicts back
+  through `feedback rate`. Expect the `usefulness >= 0.40` threshold in
+  `roughcut/select.py` to be the thing that needs changing -- and now there is
+  a way to see it.
 - **Transcribe one real episode and read `episode report`.** This is now the
   cheapest way to find out whether the story layer means anything, and it needs
   no GPU and no model server:
@@ -583,6 +723,8 @@ Useful flags on `auto run`:
 | `--skip-review` / `--skip-assets` / `--skip-episode` | skip a whole pass |
 | `--transcribe` | produce transcripts with local Whisper first (opt-in) |
 | `--transcribe-model` / `--transcribe-language` | Whisper size, and the language |
+| `--render-proxy` | also render a watchable proxy MP4 with FFmpeg (opt-in) |
+| `--render-quality` / `--render-height` | `draft`/`proxy`/`preview`/`high`, and the height |
 | `--feedback` | also open a review session and build its queue (opt-in) |
 | `--asset-library <path>` | a library other than `<model dir>/assets` |
 | `--max-windows N` | cap analysis windows per file |
@@ -632,6 +774,34 @@ Measured on this machine, CPU only: `tiny` ~15x realtime, `small` ~4.3x,
 so a 40-minute episode with `small` is about nine minutes. `torch` here is
 `2.13.0+cpu`, so CUDA auto-detection reports false; `--device cuda` forces it
 if CTranslate2 can use a GPU without torch.
+
+Proxy rendering, which is how you actually see a cut. No Premiere, no GPU:
+
+```cmd
+python -m editing.cli render status                REM is FFmpeg here
+python -m editing.cli render roughcut              REM the current rough cut
+python -m editing.cli render roughcut --quality draft --height 480
+python -m editing.cli render roughcut --max-seconds 90    REM just the opening
+python -m editing.cli render from-plan data\editingoughcut\structure.json
+python -m editing.cli render open                  REM play the most recent
+python -m editing.cli render open --notes          REM the review file instead
+python -m editing.cli render show <job_id>
+python -m editing.cli render list
+python -m editing.cli render clean --temp-only --yes
+```
+
+Every one of these takes `--run <run_id>` to reach an auto run's own render,
+the same way the feedback commands do -- each run is hermetic, so its proxy
+lives in that run's artifacts and a command without `--run` looks in the shared
+directory.
+
+Measured on this machine: a 47-second cut of three clips at 640x360 `draft`
+took 2 seconds (27x realtime); at 1280x720 `proxy`, roughly 10x realtime. So a
+20-minute cut is about two minutes.
+
+Renders are cached on the cut, the sources, the settings and the FFmpeg
+version; `--force` re-encodes anyway. Nothing here executes anything and
+nothing writes outside `data/editing/render/`.
 
 Human review, which trains nothing:
 

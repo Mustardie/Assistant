@@ -86,10 +86,75 @@ def build_report(
             if entry not in report.warnings:
                 report.warnings.append(entry)
 
+    report.render = _render_section(config, state, pipeline)
     report.feedback = _feedback_section(config, state, pipeline)
     report.check_in_premiere = _check_list(state)
     report.next_commands = _next_commands(state, report)
     return report
+
+
+def _render_section(
+    config: EditingConfig, state: AutoRunState, pipeline=None
+) -> dict:
+    """Where the watchable version of this cut is, or how to make one.
+
+    Filled whether or not the render stage ran, because the most useful thing
+    to tell somebody who has just read a page of plans is that a video is four
+    minutes away and here is the command.
+
+    Never raises. A run report that failed because its optional render
+    section could not be built would be strictly worse than one without it.
+    """
+    run_flag = "--render-proxy "
+    # Every command below carries ``--run``: this run's artifacts are its own
+    # directory, and a command without it looks in the shared one, where this
+    # render does not exist. The feedback section learned the same lesson.
+    scope = f"--run {state.run_id}"
+    section = {
+        "enabled": bool(state.config.render_proxy),
+        "rendered": False,
+        "mock": False,
+        "job_id": "",
+        "video": "",
+        "notes": "",
+        "clips": 0,
+        "duration": 0.0,
+        "size_mb": 0.0,
+        "not_shown": 0,
+        "render_command": (
+            f"python -m editing.cli render roughcut {scope} --name "
+            f"{state.config.name}"),
+        "rerender_command": (
+            f"python -m editing.cli render roughcut {scope} --name "
+            f"{state.config.name} --force"),
+        "run_with_render": (
+            "python -m editing.cli auto run --folder "
+            f"{state.config.footage_folder or '<folder>'} {run_flag}"
+            f"--style {state.config.style} --no-premiere"),
+        "note": ("A proxy is for judging the cut. Captions, sound effects, "
+                 "music and graphics are planned by other passes and are not "
+                 "in it."),
+    }
+
+    result = state.stage("render_proxy")
+    if result is not None and result.summary:
+        for key in ("job_id", "clips", "duration", "size_mb", "mock",
+                    "rendered", "not_shown"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+        section["video"] = result.summary.get("video", "")
+        section["notes"] = result.summary.get("notes", "")
+        section["cached"] = result.summary.get("cached", False)
+    if result is not None and result.status in ("blocked", "failed"):
+        section["blocked_reason"] = (
+            result.failure.why if result.failure else result.note)
+
+    if section["job_id"]:
+        section["open_command"] = (
+            f"python -m editing.cli render open {section['job_id']} {scope}")
+        section["report_command"] = (
+            f"python -m editing.cli render show {section['job_id']} {scope}")
+    return section
 
 
 def _feedback_section(
@@ -275,6 +340,7 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
             ("mock", run.mock), ("no-premiere", run.no_premiere),
             ("markers-only", run.markers_only),
             ("skip-review", run.skip_review), ("skip-assets", run.skip_assets),
+            ("render-proxy", run.render_proxy), ("transcribe", run.transcribe),
         ) if on
     ]
     add(f"modes      : {', '.join(modes) if modes else 'none'}")
@@ -348,6 +414,39 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
         for line in gate.render().splitlines():
             add(f"  {line}")
         add("")
+
+    # -- the watchable version ---------------------------------------------
+    render_section = report.render or {}
+    add(_THIN)
+    add("WATCH IT")
+    add(_THIN)
+    if render_section.get("rendered"):
+        add(f"  video   : {render_section.get('video', '')}")
+        add(f"  notes   : {render_section.get('notes', '')}")
+        add(f"  {render_section.get('clips', 0)} clip(s), "
+            f"{render_section.get('duration', 0):.0f}s, "
+            f"{render_section.get('size_mb', 0)} MB"
+            + ("   (reused an earlier render)"
+               if render_section.get("cached") else ""))
+        if render_section.get("not_shown"):
+            add(f"  {render_section['not_shown']} planned feature(s) are not "
+                "in the video; render show has the list.")
+        add(f"  open    : {render_section.get('open_command', '')}")
+    elif render_section.get("mock"):
+        add("  A MOCK render ran: the file it wrote is a placeholder and no")
+        add("  video was produced. Nothing here is watchable.")
+    elif render_section.get("blocked_reason"):
+        add(f"  No proxy was rendered: "
+            f"{str(render_section['blocked_reason'])[:150]}")
+        add(f"  retry   : {render_section.get('render_command', '')}")
+    else:
+        add("  Nothing was rendered. A watchable proxy of this cut is one")
+        add("  command away and needs no Premiere:")
+        add(f"    {render_section.get('render_command', '')}")
+        add("  Or on the next run:")
+        add(f"    {render_section.get('run_with_render', '')}")
+    add(f"  {render_section.get('note', '')}")
+    add("")
 
     # -- review ------------------------------------------------------------
     feedback = report.feedback or {}
@@ -469,6 +568,24 @@ def _headlines(state: AutoRunState, report: AutoRunReport) -> list[str]:
                 "Asset library empty or nothing matched; every placeholder is "
                 "a marker. `auto report` lists what to go and find."
             )
+
+    render_section = report.render or {}
+    if render_section.get("rendered"):
+        out.append(
+            f"A watchable proxy was rendered ({render_section.get('clips', 0)}"
+            f" clip(s), {render_section.get('duration', 0):.0f}s): "
+            f"{render_section.get('video', '')}"
+        )
+    elif render_section.get("mock"):
+        out.append(
+            "The render stage ran in MOCK mode: a placeholder was written and "
+            "no video exists."
+        )
+    elif not run.render_proxy:
+        out.append(
+            "No video was rendered (--render-proxy was not set), so nothing "
+            "here has been watched."
+        )
 
     if run.no_premiere:
         out.append(

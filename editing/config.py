@@ -435,6 +435,19 @@ class EditingConfig:
         return self.output_dir / "feedback"
 
     @property
+    def render_dir(self) -> Path:
+        """Proxy renders: job folders, the videos, and their review notes.
+
+        Its own directory because what lives here is *large* and disposable in
+        a way nothing else in this layer is. A render is tens or hundreds of
+        megabytes and can be rebuilt from the plan in minutes, so "delete this
+        folder to get the disk back" has to be a safe sentence -- which it is
+        only if renders never share a directory with something that cannot be
+        regenerated.
+        """
+        return self.output_dir / "render"
+
+    @property
     def frames_dir(self) -> Path:
         return self.output_dir / "frames"
 
@@ -449,7 +462,7 @@ class EditingConfig:
             self.audio_dir, self.recommendations_dir, self.plans_dir,
             self.roughcut_dir, self.review_dir, self.critic_dir,
             self.layers_dir, self.asset_library_dir, self.episode_dir,
-            self.feedback_dir,
+            self.feedback_dir, self.render_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

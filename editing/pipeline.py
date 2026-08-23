@@ -58,6 +58,12 @@ from editing.recommend import report as report_module
 from editing.recommend.planner import PlannerOptions, plan_recommendations
 from editing.recommend.premiere_plan import DraftPlan, build_and_dry_run
 from editing.recommend.schema import RecommendationSet
+from editing.render import notes as render_notes
+from editing.render import report as render_report
+from editing.render import run as render_run
+from editing.render import runner as render_runner
+from editing.render import store as render_store
+from editing.render.schema import RenderConfig, RenderJob, RenderResult
 from editing.roughcut import execute as roughcut_execute, review as review_module
 from editing.assets import compile as asset_compile
 from editing.assets import execute as asset_execute
@@ -2173,6 +2179,113 @@ class Pipeline:
         """
         return feedback_queue_module.estimate(
             self.feedback_artifacts(name=name))
+
+    # ------------------------------------------------------------------
+    # Proxy renders
+    # ------------------------------------------------------------------
+    #
+    # The iteration loop. Everything above produces plans; this turns one into
+    # a video somebody can watch, without Premiere and without executing
+    # anything. It reads the rough cut and writes only under
+    # ``render/jobs/<job_id>/``.
+
+    def render_config(self, **overrides) -> RenderConfig:
+        """Render settings from the environment, overridden by kwargs."""
+        base = RenderConfig.from_env()
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if clean:
+            from dataclasses import replace
+            base = replace(base, **clean)
+        return base.validated()
+
+    def render_status(self, settings: Optional[RenderConfig] = None) -> dict:
+        """Whether a render could run right now. Runs nothing."""
+        settings = settings or self.render_config()
+        health = render_runner.check(self.config, backend=settings.backend)
+        health["config_warnings"] = settings.warnings
+        health.update(render_store.usage(self.config))
+        return health
+
+    def render_roughcut(
+        self,
+        *,
+        name: str = "structure",
+        plan: Optional[RoughCutPlan] = None,
+        settings: Optional[RenderConfig] = None,
+        runner=None,
+        force: bool = False,
+        dry_run: bool = False,
+        muted_placements: Optional[Sequence[str]] = None,
+    ) -> RenderJob:
+        """Render the rough cut this pipeline's output directory holds."""
+        if plan is None:
+            plan = self.load_rough_cut(name=name)
+        return render_run.render_plan(
+            self.config, plan,
+            settings=settings or self.render_config(),
+            plan_name=name,
+            plan_path=str(self.config.roughcut_dir / f"{name}.json"),
+            runner=runner,
+            force=force,
+            dry_run=dry_run,
+            muted_placements=muted_placements,
+            say=self.say,
+        )
+
+    def render_plan_file(
+        self,
+        path: str,
+        *,
+        settings: Optional[RenderConfig] = None,
+        runner=None,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> RenderJob:
+        """Render a rough cut plan from any JSON file on disk."""
+        return render_run.render_from_file(
+            self.config, path,
+            settings=settings or self.render_config(),
+            runner=runner, force=force, dry_run=dry_run, say=self.say,
+        )
+
+    def render_jobs(self, *, limit: int = 50) -> list[RenderJob]:
+        return render_store.list_jobs(self.config, limit=limit)
+
+    def render_job(self, job_id: str = "") -> RenderJob:
+        """One render by ID, or the most recent one."""
+        return render_store.resolve_job(self.config, job_id)
+
+    def render_result(self, job_id: str) -> RenderResult:
+        return render_store.load_result(self.config, job_id)
+
+    def render_report(self, job_id: str = "", *, save: bool = True):
+        """The report for one render, regenerated from the job on disk."""
+        job = self.render_job(job_id)
+        report = render_report.build_report(job)
+        if save and job.output_dir:
+            render_report.write_report(job)
+        return job, report
+
+    def render_notes(self, job_id: str = "") -> Path:
+        """Rewrite one render's review notes. Returns the path.
+
+        Separate from the render so a person who has scribbled over the notes
+        and wants a clean copy does not have to re-encode the video to get one.
+        """
+        job = self.render_job(job_id)
+        return render_store.write_text(
+            render_store.notes_path(job.output_dir),
+            render_notes.render_notes(job, interval=job.config.notes_interval),
+        )
+
+    def clean_renders(
+        self, *, job_id: str = "", temp_only: bool = False,
+        keep_latest: int = 0,
+    ) -> dict:
+        return render_store.clean(
+            self.config, job_id=job_id, temp_only=temp_only,
+            keep_latest=keep_latest,
+        )
 
     # ------------------------------------------------------------------
     # Whole run

@@ -56,6 +56,7 @@ STAGE_ORDER = (
     "assets_dry_run",
     "episode_memory",
     "retention_plan",
+    "render_proxy",
     "feedback_start",
     "feedback_queue",
     "feedback_report",
@@ -192,6 +193,17 @@ class AutoRunConfig:
     transcribe_backend: str = ""
     #: ISO language code, or empty to auto-detect.
     transcribe_language: str = ""
+
+    #: Render a watchable proxy of the rough cut with FFmpeg. Off by default
+    #: because it is the only stage that costs minutes of CPU and produces
+    #: hundreds of megabytes -- but it is also the only stage that produces
+    #: something a person can *watch*, so the run report says how to get one
+    #: when it was skipped.
+    render_proxy: bool = False
+    #: Quality preset for that render. Empty means the configured default.
+    render_quality: str = ""
+    #: Output height. 0 means the configured default (720).
+    render_height: int = 0
 
     #: Open a feedback session and build its review queue at the end of the
     #: run. Off by default, and the *only* pass in this pipeline that defaults
@@ -624,6 +636,11 @@ class AutoRunReport:
     critic: dict = field(default_factory=dict)
     layers: dict = field(default_factory=dict)
     assets: dict = field(default_factory=dict)
+    #: The proxy render: where the video is, where the notes are, and the
+    #: exact command to make another. Always filled, whether or not the
+    #: render stage ran -- "you could watch this" is worth saying to somebody
+    #: who has just read a page of plans.
+    render: dict = field(default_factory=dict)
     #: How much of this run is worth a human review, and how to start one.
     #: Always filled, whether or not the feedback stages ran.
     feedback: dict = field(default_factory=dict)

@@ -2,7 +2,7 @@
 
     AutoRunConfig -> stage sequence -> checkpointed results -> AutoRunReport
 
-Runs the twenty-one stages in order, reuses what it can prove is still valid, and
+Runs the twenty-three stages in order, reuses what it can prove is still valid, and
 stops on the first failure that matters with the exact command to try next.
 It makes no editing decisions of its own.
 
@@ -499,7 +499,11 @@ class AutoRunner:
         # loads a speech model and takes minutes per episode.
         if not run.transcribe and name in stages_module.TRANSCRIBE_STAGES:
             return "--transcribe was not set"
-        # Inverted, and the only stage group that is: feedback is opt-in
+        # Inverted too: rendering is opt-in because it is the only stage
+        # that costs minutes of CPU and hundreds of megabytes of disk.
+        if not run.render_proxy and name in stages_module.RENDER_STAGES:
+            return "--render-proxy was not set"
+        # Inverted as well: feedback is opt-in
         # because it starts a review a person has to finish.
         if not run.feedback and name in stages_module.FEEDBACK_STAGES:
             return "--feedback was not set"

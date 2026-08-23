@@ -1324,3 +1324,249 @@ def test_the_transcription_model_reaches_the_stage(runner, auto_config):
     assert summary["backend"] == "mock"
     assert summary["mock"] is True, (
         "a run built on fabricated transcripts must say so in its report")
+
+
+# ---------------------------------------------------------------------------
+# Session 10B -- the proxy render stage
+# ---------------------------------------------------------------------------
+
+class FakeFFmpeg:
+    """Stands in for FFmpeg. Writes real files, runs nothing.
+
+    Defined here rather than imported from the render suite because ``tests/``
+    deliberately has no ``__init__.py`` -- that is what puts the repo root on
+    sys.path -- so test modules cannot import from each other.
+    """
+
+    name = "fake"
+
+    def __init__(self, *, available=True):
+        self.ffmpeg = "ffmpeg"
+        self.ffprobe = "ffprobe"
+        self.commands: list = []
+        self._available = available
+
+    def available(self):
+        return self._available
+
+    def version(self):
+        return "6.1-fake"
+
+    def encoders(self):
+        return {"libx264", "aac"}
+
+    def run(self, command, *, timeout=1800.0, log_path=None):
+        from editing.render.runner import CommandResult
+
+        parts = [str(part) for part in command]
+        self.commands.append(parts)
+        target = Path(parts[-1])
+        if target.suffix:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"fake video" * 64)
+        return CommandResult(command=parts, returncode=0)
+
+    def probe(self, path, *, timeout=120.0):
+        return {"duration": 0.0, "width": 1280, "height": 720, "fps": 30.0,
+                "has_audio": True}
+
+    def health(self):
+        from editing.render.schema import INSTALL_HINT
+
+        return {"backend": self.name, "ready": self._available,
+                "version": "6.1-fake",
+                "hint": "" if self._available else INSTALL_HINT}
+
+
+@pytest.fixture
+def fake_ffmpeg(monkeypatch):
+    """Wire the render stage to a fake encoder, and hand it back.
+
+    The stage itself is untouched: it still asks the pipeline for a render,
+    which still keys, caches and writes exactly as it does in production.
+    Only the subprocess is replaced.
+    """
+    from editing.pipeline import Pipeline
+    from editing.render import runner as render_runner
+
+    fake = FakeFFmpeg()
+    monkeypatch.setattr(
+        render_runner, "build_runner", lambda config, backend="ffmpeg": fake)
+
+    original = Pipeline.render_roughcut
+    monkeypatch.setattr(
+        Pipeline, "render_roughcut",
+        lambda self, **kwargs: original(self, runner=fake, **kwargs))
+    return fake
+
+
+def test_rendering_is_off_unless_it_is_asked_for(runner, auto_config):
+    """It is the only stage that costs minutes of CPU and hundreds of MB."""
+    state = run_once(runner, auto_config)
+    result = state.stage("render_proxy")
+
+    assert result is not None and result.status == "skipped"
+    assert "--render-proxy" in result.note
+
+
+def test_a_skipped_render_still_tells_you_how_to_get_one(runner, auto_config):
+    state = run_once(runner, auto_config)
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    assert report.render["enabled"] is False
+    assert report.render["rendered"] is False
+    assert "render roughcut" in report.render["render_command"]
+    assert "--render-proxy" in report.render["run_with_render"]
+
+    text = auto_report.render(state, report)
+    assert "WATCH IT" in text
+    assert "command away" in text
+
+
+def test_the_render_stage_runs_after_the_rough_cut_exists():
+    """A render of a cut that has not been built yet is nothing."""
+    assert STAGE_ORDER.index("roughcut_build") < \
+        STAGE_ORDER.index("render_proxy")
+    assert STAGE_ORDER.index("render_proxy") < STAGE_ORDER.index("report")
+
+
+def test_the_render_stage_produces_a_video_and_review_notes(
+    runner, auto_config, fake_ffmpeg
+):
+    state = run_once(runner, replace(auto_config, render_proxy=True))
+    result = state.stage("render_proxy")
+    assert result is not None and result.ok, result.note
+
+    summary = result.summary
+    assert summary["rendered"] is True
+    assert summary["mock"] is False
+    assert summary["clips"] > 0
+    assert Path(summary["video"]).exists()
+    assert Path(summary["notes"]).exists()
+    assert "# Review Notes" in Path(summary["notes"]).read_text("utf-8")
+
+
+def test_the_render_lands_inside_the_run(runner, auto_config, fake_ffmpeg):
+    """Each run is hermetic, and a render is the biggest thing one produces."""
+    state = run_once(runner, replace(auto_config, render_proxy=True))
+    video = Path(state.stage("render_proxy").summary["video"])
+    assert str(state.run_id) in str(video)
+
+
+def test_the_run_report_says_where_to_watch_it(
+    runner, auto_config, fake_ffmpeg
+):
+    state = run_once(runner, replace(auto_config, render_proxy=True))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    assert report.render["rendered"] is True
+    assert report.render["job_id"]
+    assert "render open" in report.render["open_command"]
+
+    text = auto_report.render(state, report)
+    assert "WATCH IT" in text
+    assert report.render["video"] in text
+    assert "A watchable proxy was rendered" in text
+
+
+def test_the_render_settings_reach_the_stage(runner, auto_config, fake_ffmpeg):
+    state = run_once(runner, replace(
+        auto_config, render_proxy=True, render_quality="draft",
+        render_height=480))
+    summary = state.stage("render_proxy").summary
+
+    assert summary["quality"] == "draft"
+    assert summary["height"] == 480
+
+
+def test_a_resume_reuses_the_render_rather_than_re_encoding(
+    runner, auto_config, fake_ffmpeg
+):
+    """The renderer's own cache does the work a checkpoint would."""
+    first = run_once(runner, replace(auto_config, render_proxy=True))
+    assert first.stage("render_proxy").summary["rendered"]
+    encoded = len(fake_ffmpeg.commands)
+    assert encoded > 0
+
+    resumed = runner.resume(first)
+    summary = resumed.stage("render_proxy").summary
+    assert summary["cached"] is True
+    assert summary["rendered"] is True
+    assert len(fake_ffmpeg.commands) == encoded, "nothing was re-encoded"
+
+
+def test_a_missing_ffmpeg_blocks_the_render_and_not_the_run(
+    runner, auto_config, monkeypatch
+):
+    from editing.render import runner as render_runner
+
+    monkeypatch.setattr(
+        render_runner, "build_runner",
+        lambda config, backend="ffmpeg": FakeFFmpeg(available=False))
+
+    state = run_once(runner, replace(auto_config, render_proxy=True))
+    result = state.stage("render_proxy")
+
+    assert result.status == "blocked", result.status
+    assert "FFmpeg is not installed" in (
+        result.failure.why if result.failure else "")
+    assert "winget install" in (
+        result.failure.next_command if result.failure else "")
+
+    assert state.stage("layers_build").ok, "every plan is unaffected"
+    assert state.stage("report").ok
+    assert state.status != "failed"
+
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    assert "FFmpeg is not installed" in report.render["blocked_reason"]
+    assert "No proxy was rendered" in auto_report.render(state, report)
+
+
+def test_a_render_that_fails_part_way_is_blocked_with_its_job_id(
+    runner, auto_config, monkeypatch
+):
+    from editing.render import runner as render_runner
+    from editing.render.runner import CommandResult
+
+    class Refusing(FakeFFmpeg):
+        def run(self, command, *, timeout=1800.0, log_path=None):
+            parts = [str(part) for part in command]
+            self.commands.append(parts)
+            return CommandResult(command=parts, returncode=1,
+                                 stderr="fake encoder failure")
+
+    monkeypatch.setattr(
+        render_runner, "build_runner",
+        lambda config, backend="ffmpeg": Refusing())
+
+    state = run_once(runner, replace(auto_config, render_proxy=True))
+    result = state.stage("render_proxy")
+
+    assert result.status == "blocked"
+    assert result.failure is not None
+    assert result.failure.detail.get("job_id")
+    assert state.stage("report").ok
+
+
+def test_the_render_flags_reach_the_run_config():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args([
+        "auto", "run", "--folder", "D:/clips", "--render-proxy",
+        "--render-quality", "preview", "--render-height", "1080",
+    ])
+    run = _auto_config(args)
+
+    assert run.render_proxy is True
+    assert run.render_quality == "preview"
+    assert run.render_height == 1080
+
+
+def test_rendering_defaults_to_off_in_the_run_config():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args(["auto", "run", "--folder", "D:/clips"])
+    assert _auto_config(args).render_proxy is False

@@ -33,6 +33,9 @@ Commands, in the order a session normally uses them::
     feedback    start | queue | show | rate | note | correct | list |
                 report | export | stats   -- structured human review of an
                 edit, appended to a log that is never rewritten
+    render      roughcut | from-plan | show | list | report | notes | open |
+                clean   -- a watchable proxy MP4 of a rough cut, made with
+                FFmpeg. No Premiere, and nothing is executed
 
 Every command accepts ``--json`` and then prints one machine-readable object on
 stdout and nothing else, so this is usable as a subprocess. Progress messages
@@ -79,6 +82,9 @@ from editing.assets.compile import AssetOptions
 from editing.assets.place import PlacementLimits
 from editing.style import presets as style_presets, report as layers_report
 from editing.style.compile import CompileOptions
+from editing.render import report as render_report
+from editing.render import schema as render_schema
+from editing.render import store as render_store
 from editing.transcribe import formats as transcribe_formats
 from editing.transcribe import schema as transcribe_schema
 from editing.transcribe import store as transcribe_store
@@ -167,13 +173,14 @@ def _pipeline(args) -> Pipeline:
     )
 
 
-def _feedback_pipeline(args) -> Pipeline:
-    """The pipeline a ``feedback`` command should use.
+def _run_scoped_pipeline(args) -> Pipeline:
+    """A pipeline scoped to one auto run's artifacts, if ``--run`` was given.
 
-    ``--run <id>`` scopes it to that run's own artifacts, because each auto run
-    is hermetic and its review belongs beside the plans it is about. Without a
-    run, the shared output directory is reviewed, which is what the
-    stage-by-stage commands write to.
+    Used by ``feedback`` and ``render``, which are the two commands that read
+    or write things an auto run produces. Each run is hermetic, so its review
+    and its proxy live beside the plans they are about; without a run, the
+    shared output directory is used, which is what the stage-by-stage commands
+    write to.
     """
     pipeline = _pipeline(args)
     run_id = getattr(args, "run", "") or ""
@@ -185,7 +192,7 @@ def _feedback_pipeline(args) -> Pipeline:
         raise EditingError(
             f"No auto run called '{run_id}'",
             hint="List them with `python -m editing.cli auto list-runs`, or "
-                 "drop --run to review the shared output directory.",
+                 "drop --run to use the shared output directory.",
             detail={"path": str(directory)},
         )
     return build_pipeline(
@@ -1669,6 +1676,9 @@ def _auto_config(args) -> AutoRunConfig:
         transcribe_model=getattr(args, "transcribe_model", "") or "",
         transcribe_language=getattr(args, "transcribe_language", "") or "",
         transcribe_backend=getattr(args, "transcribe_backend", "") or "",
+        render_proxy=getattr(args, "render_proxy", False),
+        render_quality=getattr(args, "render_quality", "") or "",
+        render_height=int(getattr(args, "render_height", 0) or 0),
     )
 
 
@@ -2250,6 +2260,225 @@ def _render_batch(batch, *, limit: int = 40) -> str:
     return "\n".join(lines)
 
 
+def cmd_render(args) -> int:
+    """Render a rough cut to a watchable proxy with FFmpeg.
+
+    Eight subcommands. None of them touches Premiere, executes an operation,
+    or writes anything outside ``data/editing/render/``.
+    """
+    pipeline = _run_scoped_pipeline(args)
+    command = args.render_command
+
+    settings = pipeline.render_config(
+        backend=("mock" if getattr(args, "mock", False) else None),
+        quality=getattr(args, "quality", None),
+        height=getattr(args, "height", None),
+        fps=getattr(args, "fps", None),
+        video_encoder=getattr(args, "encoder", None),
+        crf=getattr(args, "crf", None),
+        scale_mode=getattr(args, "scale_mode", None),
+        include_audio=(False if getattr(args, "no_audio", False) else None),
+        max_seconds=getattr(args, "max_seconds", None),
+        max_segments=getattr(args, "max_segments", None),
+        keep_temp=(True if getattr(args, "keep_temp", False) else None),
+        use_cache=(False if getattr(args, "no_cache", False) else None),
+        notes_interval=getattr(args, "notes_interval", None),
+    )
+
+    if command == "status":
+        health = pipeline.render_status(settings)
+        if args.json:
+            _emit({"success": True, "health": health,
+                   "settings": settings.to_dict()})
+            return EXIT_OK
+        print(_render_render_status(health, settings))
+        return EXIT_OK
+
+    if command in ("roughcut", "from-plan"):
+        if command == "from-plan":
+            job = pipeline.render_plan_file(
+                args.path, settings=settings,
+                force=getattr(args, "force", False),
+                dry_run=getattr(args, "dry_run", False),
+            )
+        elif getattr(args, "plan", ""):
+            job = pipeline.render_plan_file(
+                args.plan, settings=settings,
+                force=getattr(args, "force", False),
+                dry_run=getattr(args, "dry_run", False),
+            )
+        else:
+            job = pipeline.render_roughcut(
+                name=args.name, settings=settings,
+                force=getattr(args, "force", False),
+                dry_run=getattr(args, "dry_run", False),
+            )
+        if args.json:
+            _emit({"success": job.ok, **job.to_dict()})
+        else:
+            print(render_report.render_text(job))
+        # A failed render exits non-zero: it is the one command here that can
+        # be part of a script, and "there is no video" must be detectable
+        # without parsing the report.
+        return EXIT_OK if job.ok else EXIT_ERROR
+
+    if command == "list":
+        jobs = pipeline.render_jobs(limit=args.limit)
+        if args.json:
+            _emit({"success": True, "count": len(jobs),
+                   "usage": render_store.usage(pipeline.config),
+                   "jobs": [job.to_dict() for job in jobs]})
+            return EXIT_OK
+        print(render_report.render_job_list(jobs, limit=args.limit))
+        return EXIT_OK
+
+    if command == "show":
+        job = pipeline.render_job(getattr(args, "job_id", "") or "")
+        if args.json:
+            _emit({"success": job.ok, **job.to_dict()})
+            return EXIT_OK
+        print(render_report.render_text(job))
+        return EXIT_OK
+
+    if command == "report":
+        job, report = pipeline.render_report(
+            getattr(args, "job_id", "") or "",
+            save=not getattr(args, "no_save", False),
+        )
+        if args.json:
+            _emit({"success": True, **report.to_dict()})
+            return EXIT_OK
+        print(render_report.render_markdown(job, report))
+        return EXIT_OK
+
+    if command == "notes":
+        target = pipeline.render_notes(getattr(args, "job_id", "") or "")
+        if args.json:
+            _emit({"success": True, "path": str(target)})
+            return EXIT_OK
+        print(f"Wrote {target}")
+        return EXIT_OK
+
+    if command == "open":
+        job = pipeline.render_job(getattr(args, "job_id", "") or "")
+        wants_notes = getattr(args, "notes", False)
+        if not wants_notes and not job.rendered:
+            # A mocked or planned job has a file where the video would be, and
+            # handing it to a player would be the one thing this package
+            # promises never to do: present something that is not a render as
+            # though it were one.
+            raise EditingError(
+                f"Render '{job.job_id}' produced no video to open "
+                f"(status: {job.status})",
+                hint=("The mock backend writes a placeholder, not a video. "
+                      "Re-run without --mock."
+                      if job.status == "mocked" else
+                      f"`render show {job.job_id}` says what happened. "
+                      f"`render open {job.job_id} --notes` opens the review "
+                      "notes, which exist either way."),
+                detail={"status": job.status, "path": job.output_path},
+            )
+        target = Path(job.notes_path if wants_notes else job.output_path)
+        if not target.exists():
+            raise EditingError(
+                f"Render '{job.job_id}' has no file to open at {target}",
+                hint="It may have failed, or been rendered with --dry-run. "
+                     f"`render show {job.job_id}` says which.",
+                detail={"path": str(target), "status": job.status},
+            )
+        opened = _open_file(target)
+        if args.json:
+            _emit({"success": True, "path": str(target), "opened": opened})
+            return EXIT_OK
+        print(str(target) if opened
+              else f"Could not open it here. The file is at:\n  {target}")
+        return EXIT_OK
+
+    if command == "clean":
+        if not getattr(args, "yes", False):
+            raise EditingError(
+                "Deleting renders needs --yes",
+                hint="Re-run with `render clean --yes`. Add --temp-only to "
+                     "drop just the per-clip intermediates and keep every "
+                     "video.",
+            )
+        result = pipeline.clean_renders(
+            job_id=getattr(args, "job", "") or "",
+            temp_only=getattr(args, "temp_only", False),
+            keep_latest=getattr(args, "keep_latest", 0) or 0,
+        )
+        if args.json:
+            _emit({"success": True, **result})
+            return EXIT_OK
+        freed = result["freed_bytes"] / (1024 * 1024)
+        what = "intermediate(s)" if result["temp_only"] else "render(s)"
+        print(f"Cleaned {len(result['removed'])} {what}, freeing "
+              f"{freed:.0f} MB.")
+        return EXIT_OK
+
+    raise EditingError("Unknown render command")
+
+
+def _open_file(path: Path) -> bool:
+    """Hand a file to whatever the desktop uses. False when there is none.
+
+    Deliberately best-effort: on a headless machine or over SSH there is no
+    player, and printing the path is a better outcome than an exception.
+    """
+    import subprocess
+    import sys as _sys
+
+    try:
+        if _sys.platform.startswith("win"):
+            import os
+            os.startfile(str(path))  # noqa: S606 - a file this tool wrote
+            return True
+        opener = "open" if _sys.platform == "darwin" else "xdg-open"
+        subprocess.Popen(  # noqa: S603
+            [opener, str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:  # noqa: BLE001 - no desktop is a normal condition
+        return False
+
+
+def _render_render_status(health: dict, settings) -> str:
+    lines = ["=" * 78, "PROXY RENDERING", "=" * 78, ""]
+    ready = health.get("ready")
+    lines.append(f"  backend   : {health.get('backend')} "
+                 f"{'[ready]' if ready else '[FFMPEG NOT FOUND]'}")
+    lines.append(f"  version   : {health.get('version') or '(unknown)'}")
+    lines.append(f"  quality   : {settings.quality} "
+                 f"(crf {settings.crf}, preset {settings.preset})")
+    lines.append(f"  output    : {settings.width}x{settings.height} @ "
+                 f"{settings.fps:g}fps, {settings.resolved_encoder}")
+    lines.append(f"  audio     : "
+                 f"{'on' if settings.include_audio else 'OFF'}"
+                 f"   ({settings.audio_encoder} {settings.audio_bitrate})")
+    lines.append("")
+    if not ready:
+        lines.append("  Rendering cannot run yet. To fix:")
+        lines.append(f"    {health.get('hint') or render_schema.INSTALL_HINT}")
+        lines.append("")
+    for warning in health.get("config_warnings", []):
+        lines.append(f"  ! {warning}")
+    if health.get("config_warnings"):
+        lines.append("")
+    lines.append("-" * 78)
+    lines.append("ON DISK")
+    lines.append("-" * 78)
+    lines.append(f"  {health.get('jobs', 0)} render(s) in {health.get('root')}")
+    lines.append(f"  {health.get('total_bytes', 0) / (1024 * 1024):.0f} MB "
+                 f"total, of which "
+                 f"{health.get('temp_bytes', 0) / (1024 * 1024):.0f} MB is "
+                 "intermediates")
+    if health.get("temp_bytes"):
+        lines.append("  Drop the intermediates with "
+                     "`render clean --temp-only --yes`.")
+    return "\n".join(lines)
+
+
 def cmd_feedback(args) -> int:
     """Collect structured human review of an edit.
 
@@ -2257,7 +2486,7 @@ def cmd_feedback(args) -> int:
     rewrites a single line of an existing log. Everything that records
     something appends; everything else reads or derives.
     """
-    pipeline = _feedback_pipeline(args)
+    pipeline = _run_scoped_pipeline(args)
     command = args.feedback_command
     name = getattr(args, "name", "structure")
     session_id = getattr(args, "session", "") or ""
@@ -3596,6 +3825,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="mock fabricates transcripts and stamps every artifact as fake; "
              "for exercising the pipeline, never for an edit")
     au_run.add_argument(
+        "--render-proxy", dest="render_proxy", action="store_true",
+        help="render a watchable proxy MP4 of the rough cut with FFmpeg "
+             "(off by default: minutes of CPU and hundreds of MB)")
+    au_run.add_argument(
+        "--render-quality", dest="render_quality", default="",
+        choices=[""] + list(render_schema.QUALITIES),
+        help="quality preset for that render (default proxy)")
+    au_run.add_argument(
+        "--render-height", dest="render_height", type=int, default=0,
+        help="output height for that render (default 720)")
+    au_run.add_argument(
         "--feedback", action="store_true",
         help="open a review session and build its queue at the end of the run "
              "(off by default: it starts a review a person has to finish)")
@@ -3893,6 +4133,137 @@ def build_parser() -> argparse.ArgumentParser:
     for transcribe_parser in (tr_file, tr_folder, tr_status, tr_show,
                               tr_export, tr_clear):
         transcribe_parser.set_defaults(func=cmd_transcribe)
+
+    # -- render -----------------------------------------------------------
+    render = subparsers.add_parser(
+        "render",
+        help="render a rough cut to a watchable proxy MP4 with FFmpeg "
+             "(no Premiere, executes nothing)",
+    )
+    render_subs = render.add_subparsers(dest="render_command", required=True)
+
+    def _add_render_args(parser: argparse.ArgumentParser) -> None:
+        group = parser.add_argument_group("render settings")
+        group.add_argument(
+            "--quality", default=None,
+            choices=list(render_schema.QUALITIES),
+            help="proxy is the default: fast, 720p, good enough to judge "
+                 "pacing. draft is quicker and looks it")
+        group.add_argument(
+            "--height", type=int, default=None,
+            help="output height (default 720). 0 keeps each source's own "
+                 "size, which cannot be joined if they differ")
+        group.add_argument(
+            "--fps", type=float, default=None,
+            help="one frame rate for the whole render (default 30)")
+        group.add_argument(
+            "--encoder", default=None,
+            choices=list(render_schema.VIDEO_ENCODERS),
+            help="auto is libx264. A hardware encoder is much faster and "
+                 "softer; it falls back if this FFmpeg lacks it")
+        group.add_argument("--crf", type=int, default=None,
+                           help="override the quality preset's CRF")
+        group.add_argument(
+            "--scale-mode", dest="scale_mode", default=None,
+            choices=list(render_schema.SCALE_MODES),
+            help="how a differently-shaped source is fitted (default pad)")
+        group.add_argument("--no-audio", action="store_true",
+                           help="render silent (you will judge it wrong)")
+        group.add_argument(
+            "--max-seconds", dest="max_seconds", type=float, default=None,
+            help="render only the first N seconds of the cut")
+        group.add_argument(
+            "--max-segments", dest="max_segments", type=int, default=None,
+            help="refuse a cut with more clips than this (default 600)")
+        group.add_argument(
+            "--notes-interval", dest="notes_interval", type=float,
+            default=None,
+            help="seconds per review-note section (default: one per clip)")
+        group.add_argument("--keep-temp", dest="keep_temp",
+                           action="store_true",
+                           help="keep the per-clip intermediates")
+        group.add_argument("--force", action="store_true",
+                           help="re-render even if nothing changed")
+        # ``--no-cache`` is not declared here: ``_add_common`` already has it,
+        # and turning off the analysis cache and the render cache with one
+        # flag is what a person means by it.
+        group.add_argument(
+            "--dry-run", dest="dry_run", action="store_true",
+            help="build every FFmpeg command and run none of them")
+        group.add_argument(
+            "--mock", action="store_true",
+            help="write a placeholder instead of a video, and say so "
+                 "everywhere. For exercising the pipeline, never for watching")
+
+    rn_rough = render_subs.add_parser(
+        "roughcut", help="render the current rough cut")
+    rn_rough.add_argument("--name", default="structure",
+                          help="which rough cut (default: structure)")
+    rn_rough.add_argument("--plan", default="",
+                          help="render a plan file instead of the named one")
+    _add_render_args(rn_rough)
+    _add_common(rn_rough)
+
+    rn_plan = render_subs.add_parser(
+        "from-plan", help="render a rough cut plan from a JSON file")
+    rn_plan.add_argument("path", help="the plan written by `roughcut build`")
+    _add_render_args(rn_plan)
+    _add_common(rn_plan)
+
+    rn_status = render_subs.add_parser(
+        "status", help="is FFmpeg there, and what have renders used")
+    _add_render_args(rn_status)
+    _add_common(rn_status)
+
+    rn_list = render_subs.add_parser("list", help="every render, newest first")
+    rn_list.add_argument("--limit", type=int, default=20)
+    _add_common(rn_list)
+
+    rn_show = render_subs.add_parser(
+        "show", help="one render in full (default: the most recent)")
+    rn_show.add_argument("job_id", nargs="?", default="")
+    _add_common(rn_show)
+
+    rn_report = render_subs.add_parser(
+        "report", help="the render's report.md, regenerated")
+    rn_report.add_argument("job_id", nargs="?", default="")
+    rn_report.add_argument("--no-save", action="store_true",
+                           help="print it without rewriting report.md")
+    _add_common(rn_report)
+
+    rn_notes = render_subs.add_parser(
+        "notes", help="rewrite a render's review notes, blank again")
+    rn_notes.add_argument("job_id", nargs="?", default="")
+    _add_common(rn_notes)
+
+    rn_open = render_subs.add_parser(
+        "open", help="open the render in whatever plays video here")
+    rn_open.add_argument("job_id", nargs="?", default="")
+    rn_open.add_argument("--notes", action="store_true",
+                         help="open the review notes instead of the video")
+    _add_common(rn_open)
+
+    rn_clean = render_subs.add_parser(
+        "clean", help="delete renders, or just their intermediates")
+    rn_clean.add_argument("--job", default="", help="only this one")
+    rn_clean.add_argument("--temp-only", dest="temp_only",
+                          action="store_true",
+                          help="keep the videos, drop the per-clip files")
+    rn_clean.add_argument("--keep-latest", dest="keep_latest", type=int,
+                          default=0, help="keep the N most recent renders")
+    rn_clean.add_argument("--yes", action="store_true",
+                          help="required: this deletes files")
+    _add_common(rn_clean)
+
+    for render_parser in (rn_rough, rn_plan, rn_status, rn_list, rn_show,
+                          rn_report, rn_notes, rn_open, rn_clean):
+        # On every subcommand rather than only the ones that render: an auto
+        # run's proxy lives inside that run's artifacts, so finding it again
+        # needs the same scoping that making it did.
+        render_parser.add_argument(
+            "--run", default="",
+            help="scope to one auto run's artifacts and its renders")
+        render_parser.set_defaults(func=cmd_render)
 
     # -- feedback ---------------------------------------------------------
     feedback = subparsers.add_parser(

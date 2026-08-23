@@ -1,8 +1,8 @@
 """The pipeline, as a table.
 
-Twenty-one stages, each declared with what it needs, what it produces, and what
+Twenty-three stages, each declared with what it needs, what it produces, and what
 happens when it fails. Keeping it as data rather than as a function with
-twenty-one sections buys three things:
+twenty-three sections buys three things:
 
 * ``auto status`` can describe a stage that has not run yet — its
   requirements, its artifacts, the command to run it by hand;
@@ -218,6 +218,21 @@ STAGES = (
         manual_command="python -m editing.cli episode plan-retention",
     ),
     AutoStage(
+        name="render_proxy",
+        summary="Render a watchable proxy of the rough cut with FFmpeg",
+        requires=("roughcut_build",),
+        config_keys=("name", "render_quality", "render_height"),
+        # Not resumable, and cheap to re-reach anyway: the renderer keys on
+        # the cut, the sources and the settings, so a resume over an unchanged
+        # cut hands back the existing video in a fraction of a second. Naming
+        # artifacts here instead would mean guessing the job ID, which is
+        # derived from that key and therefore not knowable in advance.
+        resumable=False,
+        requires_ffmpeg=True,
+        critical=False,
+        manual_command="python -m editing.cli render roughcut",
+    ),
+    AutoStage(
         name="feedback_start",
         summary="Open a review session over everything this run produced",
         requires=("roughcut_build",),
@@ -278,6 +293,11 @@ ASSET_STAGES = ("assets_index", "assets_plan", "assets_dry_run")
 #: Stages the episode pass owns. Skipped as a group by ``--skip-episode``.
 #: Neither executes anything, so neither has a dry run or a gate.
 EPISODE_STAGES = ("episode_memory", "retention_plan")
+
+#: The proxy render, on its own. Opt-in via ``--render-proxy``: it is the
+#: only stage that produces a file measured in hundreds of megabytes, and a
+#: pipeline that quietly filled a disk would be a bad neighbour.
+RENDER_STAGES = ("render_proxy",)
 
 #: Stages the feedback collector owns. These are opt-*in* -- ``--feedback`` --
 #: rather than opt-out, because they start something a person has to finish.
@@ -1118,6 +1138,84 @@ def run_feedback_report(pipeline, run, context) -> tuple:
     )
 
 
+def run_render_proxy(pipeline, run, context) -> tuple:
+    """Render the rough cut to a proxy MP4. Touches no host application.
+
+    Non-critical, like the review pass and for the same reason: a machine with
+    no FFmpeg still produced every plan, and losing the video costs the
+    watching, not the run.
+
+    The renderer's own cache does the work a checkpoint would: it keys on the
+    cut, the source files and the settings, so reaching this stage again after
+    a resume hands back the existing video instead of re-encoding it.
+    """
+    from editing.errors import ToolMissingError as _ToolMissing
+    from editing.render.schema import INSTALL_HINT
+
+    settings = pipeline.render_config(
+        quality=run.render_quality or None,
+        height=(run.render_height or None),
+    )
+    health = pipeline.render_status(settings)
+    if not health.get("ready"):
+        raise StageBlocked(
+            "could not render a proxy",
+            "FFmpeg is not installed, so no video could be made. Every plan "
+            "this run produced is unaffected.",
+            code="ffmpeg_missing",
+            next_command=str(health.get("hint") or INSTALL_HINT),
+            detail={"health": health},
+        )
+
+    roughcut = context.get("roughcut")
+    try:
+        job = pipeline.render_roughcut(
+            name=run.name, plan=roughcut, settings=settings)
+    except _ToolMissing as exc:
+        raise StageBlocked(
+            "could not render a proxy",
+            f"{exc.message}.",
+            code="ffmpeg_missing",
+            next_command=INSTALL_HINT,
+        ) from None
+
+    context["render"] = job
+    if job.failure is not None:
+        raise StageBlocked(
+            "could not render a proxy",
+            job.failure.message,
+            code=job.failure.code,
+            next_command=job.failure.hint
+            or f"python -m editing.cli render show {job.job_id}",
+            detail={"job_id": job.job_id, "stage": job.failure.stage},
+        )
+
+    result = job.result
+    return (
+        [job.output_path, job.notes_path],
+        {
+            "job_id": job.job_id,
+            "video": job.output_path,
+            "notes": job.notes_path,
+            "clips": len(job.segments),
+            "duration": job.duration,
+            "quality": settings.quality,
+            "height": settings.height,
+            # Loud, for the same reason the transcription stage is: a run
+            # whose "render" is a placeholder must never read as a run you
+            # could watch.
+            "mock": bool(result and result.mock),
+            "rendered": bool(result and result.rendered),
+            "cached": bool(result and result.from_cache),
+            "size_mb": result.size_mb if result else 0.0,
+            "elapsed": round(result.elapsed, 1) if result else 0.0,
+            "not_shown": len(job.unsupported),
+        },
+        list(job.warnings),
+    )
+
+
+RUNNERS["render_proxy"] = run_render_proxy
 RUNNERS["feedback_start"] = run_feedback_start
 RUNNERS["feedback_queue"] = run_feedback_queue
 RUNNERS["feedback_report"] = run_feedback_report
