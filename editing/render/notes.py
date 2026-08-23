@@ -222,7 +222,21 @@ def _footer(job: RenderJob) -> list[str]:
         "To re-render after changing something:",
         "",
         "```",
-        f"python -m editing.cli render roughcut --name {job.plan_name}",
+        f"python -m editing.cli render {_source_of(job)}",
         "```",
         "",
     ]
+
+
+def _source_of(job: RenderJob) -> str:
+    """How to ask for this same cut again.
+
+    A job rendered from a plan file lives nowhere ``--name`` can look, so
+    printing ``roughcut --name <stem>`` there would hand somebody a command
+    that renders a different cut, or nothing at all.
+    """
+    from editing.render.report import _is_named_plan
+
+    if job.plan_path and not _is_named_plan(job):
+        return f'from-plan "{job.plan_path}"'
+    return f"roughcut --name {job.plan_name}"

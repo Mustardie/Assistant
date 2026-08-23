@@ -1498,6 +1498,23 @@ def test_review_notes_carry_the_shorthand_and_the_overall_questions(
     assert "feedback rate" in text, "an opinion nothing reads is decoration"
 
 
+def test_the_notes_tell_you_how_to_render_this_same_cut_again(
+        config, plan, tmp_path):
+    """A command that renders a different cut is worse than no command."""
+    named = render(config, plan, FakeRunner())
+    assert "render roughcut --name structure" in Path(
+        named.notes_path).read_text("utf-8")
+
+    target = tmp_path / "exported.json"
+    target.write_text(json.dumps(plan.to_dict()), encoding="utf-8")
+    from_file = run_module.render_from_file(
+        config, target, settings=RenderConfig().validated(),
+        runner=FakeRunner())
+    text = Path(from_file.notes_path).read_text("utf-8")
+    assert "render from-plan" in text
+    assert "roughcut --name exported" not in text
+
+
 def test_review_notes_can_be_written_at_a_fixed_interval(config, plan):
     job = render(config, plan, FakeRunner(),
                  settings=RenderConfig(notes_interval=10.0))

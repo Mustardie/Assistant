@@ -782,7 +782,7 @@ python -m editing.cli render status                REM is FFmpeg here
 python -m editing.cli render roughcut              REM the current rough cut
 python -m editing.cli render roughcut --quality draft --height 480
 python -m editing.cli render roughcut --max-seconds 90    REM just the opening
-python -m editing.cli render from-plan data\editingoughcut\structure.json
+python -m editing.cli render from-plan data\editing\roughcut\structure.json
 python -m editing.cli render open                  REM play the most recent
 python -m editing.cli render open --notes          REM the review file instead
 python -m editing.cli render show <job_id>
