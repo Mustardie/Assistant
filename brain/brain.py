@@ -12,7 +12,27 @@ logger = logging.getLogger(__name__)
 
 
 TOOLS = """
-launch_app(query)
+Windows Desktop / Applications (plan, act, verify):
+- desktop_plan(request, target_path) <- always use first for natural-language desktop requests
+- desktop_get_state()
+- desktop_active_window()
+- desktop_list_windows(app)
+- app_find(query)
+- app_open(query, path, working_directory) <- focuses an existing app instead of duplicating it
+- app_focus(query)
+- app_open_file(path, app, confirmation_id, confirm)
+- app_open_folder(path)
+- app_show_in_folder(path)
+- app_minimize(query, window_handle)
+- app_maximize(query, window_handle)
+- app_restore(query, window_handle)
+- app_close_plan(query, close_all) <- never closes anything
+- app_close_confirmed(confirmation_id, confirm) <- only after the user confirms the exact plan
+- process_kill_plan(query, process_id) <- never kills anything
+- process_kill_confirmed(confirmation_id, confirm) <- only after the user confirms the exact PID
+Use launch_app(query) only as a legacy compatibility tool. Prefer app_open.
+Never claim an app/file opened when status is uncertain or verified is false.
+Never use desktop mouse/keyboard tools to send messages or email.
 
 File Management (search first, then act):
 - file_search(query, limit)   <- handles ALL of: open file, open folder,
@@ -390,8 +410,10 @@ using observations from previous tool results.
 6. If youtube_recommend fails due to missing YOUTUBE_API_KEY, report the error and stop.
    Do not attempt browser workarounds.
 
-7. launch_app is ONLY for executable applications (Chrome, Spotify, VS Code, etc.).
-   For documents, images, videos, folders, use file_search + file_open.
+7. app_open is ONLY for executable applications (Chrome, Spotify, VS Code, etc.).
+   For documents, images, videos, folders, search/profile first, then use
+   app_open_file/app_open_folder so file type, risk, app choice, and verification
+   are explicit. Executables/installers require a confirmation plan.
 
 8. NEVER use a raw CSS selector or XPath anywhere. browser_click/browser_type/etc.
    take a plain-language description of the element (its visible text or

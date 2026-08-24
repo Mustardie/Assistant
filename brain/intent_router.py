@@ -91,7 +91,7 @@ class IntentRouter:
         r"\b(file|folder|directory|document|pdf|docx|spreadsheet|workbook|image|photo|"
         r"archive|zip|downloads?|desktop|path|project files?|screenshot|assignment|homework|"
         r"notes?|videos?|audio|recording|logs?|crash report|settings|config(?:uration)?|"
-        r"build artifacts?|model weights?)\b",
+        r"build artifacts?|renders?|replays?|model weights?)\b",
         re.I,
     )
     _LOCAL_ACTION = re.compile(
@@ -101,8 +101,13 @@ class IntentRouter:
         re.I,
     )
     _APP = re.compile(
-        r"\b(open|launch|close|switch to|click|type|press|scroll in)\b.*\b(app|application|"
-        r"browser|chrome|edge|spotify|calculator|notepad|settings|youtube|website|site)\b",
+        r"\b(open|launch|start|focus|close|kill|minimize|maximize|restore|switch to|bring)\b.*\b(app|application|"
+        r"chrome|edge|discord|whatsapp|spotify|code|vscode|premiere|resolve|minecraft|explorer|"
+        r"notepad|calculator|terminal|powershell|lm studio|obs|blender)\b",
+        re.I,
+    )
+    _DESKTOP_STATE = re.compile(
+        r"\b(active|current|foreground|open|visible)\s+window\b|\bwhat app am i (?:using|in)\b|\blist (?:my )?windows\b",
         re.I,
     )
     _CODING = re.compile(
@@ -110,7 +115,7 @@ class IntentRouter:
         r"python|javascript|typescript|api|function|class|module)\b",
         re.I,
     )
-    _DESTRUCTIVE = re.compile(r"\b(delete|remove|erase|send|submit|purchase|buy|shutdown|restart)\b", re.I)
+    _DESTRUCTIVE = re.compile(r"\b(delete|remove|erase|send|submit|purchase|buy|shutdown|restart|close|kill)\b", re.I)
     _VAGUE = re.compile(r"^(do it|fix it|open it|that one|the thing|help)$", re.I)
     _INBOX_ASSIGNMENT = re.compile(
         r"(?:\b(?:teacher|school|class|client|coworker)\b.*\b(?:sent|shared|assignment|worksheet)\b|"
@@ -188,6 +193,18 @@ class IntentRouter:
                 safety_notes=["never claim chat access beyond configured bot/API/import sources", "review generated output before submission"],
             )
 
+        if self._DESKTOP_STATE.search(text) or self._APP.search(text):
+            risky = bool(re.search(r"\b(close|kill)\b", text, re.I))
+            return IntentDecision(
+                Intent.APP_CONTROL,
+                0.97 if self._DESKTOP_STATE.search(text) else 0.94,
+                likely_required_tools=["desktop_plan"],
+                safety_notes=[
+                    "inspect current app/window state and verify the result",
+                    *( ["closing or killing requires a target-bound confirmation plan"] if risky else [] ),
+                ],
+            )
+
         lowered = text.lower()
         connector = next((name for name in self._CONNECTORS if re.search(rf"\b{re.escape(name)}\b", lowered)), None)
         if connector:
@@ -240,14 +257,6 @@ class IntentRouter:
                 ) else ["file_search"],
                 memory_relevant=True,
                 safety_notes=notes,
-            )
-
-        if self._APP.search(text):
-            return IntentDecision(
-                Intent.APP_CONTROL,
-                0.88,
-                likely_required_tools=["launch_app", "browser_open"],
-                safety_notes=["inspect current app state before interaction when uncertain"],
             )
 
         if "?" in text or re.match(r"^(what|why|how|who|when|where|which|explain|tell me)\b", text, re.I):

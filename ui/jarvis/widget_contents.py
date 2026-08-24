@@ -219,7 +219,7 @@ class SystemStatusWidget(WidgetContent):
         self.form = QFormLayout(self)
         self.form.setContentsMargins(14, 10, 14, 14)
         self.rows = {}
-        for name in ("MODEL", "MIC", "SPEECH TO TEXT", "VOICE", "CONNECTORS", "ACTIVE TASK"):
+        for name in ("MODEL", "MIC", "SPEECH TO TEXT", "VOICE", "CONNECTORS", "DESKTOP", "ACTIVE APP", "ACTIVE TASK"):
             value = _label(soft=True, wrap=False)
             self.rows[name] = value
             heading = _label(name, soft=True, wrap=False)
@@ -241,9 +241,11 @@ class SystemStatusWidget(WidgetContent):
             "SPEECH TO TEXT": "Not connected",
             "VOICE": "Not connected",
             "CONNECTORS": "No live status",
+            "DESKTOP": "Checking…",
+            "ACTIVE APP": "Unknown",
             "ACTIVE TASK": "Idle",
         }
-        keys = {"MODEL": "model", "MIC": "mic", "SPEECH TO TEXT": "stt", "VOICE": "tts", "CONNECTORS": "connectors", "ACTIVE TASK": "task"}
+        keys = {"MODEL": "model", "MIC": "mic", "SPEECH TO TEXT": "stt", "VOICE": "tts", "CONNECTORS": "connectors", "DESKTOP": "desktop", "ACTIVE APP": "active_app", "ACTIVE TASK": "task"}
         for label, key in keys.items():
             self.rows[label].setText(str(data.get(key, defaults[label])))
         self.warning.setText(str(data.get("warning") or "Unavailable services are never reported as connected."))

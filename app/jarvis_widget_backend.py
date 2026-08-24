@@ -8,7 +8,6 @@ confirmation request instead of executing.
 from __future__ import annotations
 
 import json
-import os
 import platform
 import shutil
 from datetime import datetime
@@ -19,8 +18,9 @@ from config.paths import get_nova_app_file
 
 
 class JarvisWidgetBackend:
-    def __init__(self, *, agent=None):
+    def __init__(self, *, agent=None, desktop_service=None):
         self.agent = agent
+        self.desktop_service = desktop_service
         self.notes_file = get_nova_app_file("jarvis_notes.json")
         self.reminders_file = get_nova_app_file("jarvis_reminders.json")
         self.calendar_file = get_nova_app_file("jarvis_calendar.json")
@@ -144,22 +144,65 @@ class JarvisWidgetBackend:
         selected = self._selected(payload)
         return self._ok({"selected": selected})
 
+    def _desktop(self):
+        if self.desktop_service is not None:
+            return self.desktop_service
+        from tools.desktop_control import get_desktop_service
+        return get_desktop_service()
+
+    def _system_status(self, action, payload, state):
+        desktop = self._desktop().get_state().to_dict()
+        active = desktop.get("active_window") or {}
+        values = {
+            **state,
+            "desktop": "Ready" if desktop.get("supported") else "Unavailable",
+            "active_app": active.get("app_name") or "No visible foreground app",
+            "active_window": active,
+            "windows": desktop.get("windows") or [],
+            "desktop_error": desktop.get("error"),
+        }
+        warning = desktop.get("error") or f"Desktop awareness · {len(values['windows'])} visible window(s)"
+        values["warning"] = warning
+        return self._ok(values, notice=warning)
+
+    def _file_search(self, action, payload, state):
+        path = payload.get("path") or payload.get("selected")
+        if isinstance(path, dict):
+            path = path.get("path")
+        if action == "open":
+            result = self._desktop().open_file(str(path or "")).to_dict()
+        elif action == "reveal":
+            result = self._desktop().show_in_folder(str(path or "")).to_dict()
+        else:
+            return self._ok(state)
+        data = {**state, "app_action": result, "status": result.get("status"), "path": path}
+        if result.get("requires_confirmation"):
+            confirmation = dict(result.get("confirmation") or {})
+            return {"success": False, "error": result.get("error"), "data": data,
+                    "confirmation": confirmation,
+                    "pending_prompt": (
+                        f"The user approved the exact desktop file-open plan. Call app_open_file "
+                        f"with path={path!r}, confirmation_id={confirmation.get('confirmation_id')!r}, "
+                        "and confirm=true; then report only the verified result."
+                    )}
+        return self._ok(data, notice=f"{action.title()} verified") if result.get("success") else {
+            "success": False, "error": result.get("error") or "Desktop action was not verified", "data": data,
+        }
+
     def _app_launcher(self, action, payload, state):
-        from tools.app_launcher import launch_app, load_apps
         if action == "launch":
             selected = self._selected(payload)
             query = selected.get("name") if isinstance(selected, dict) else str(selected or payload.get("query") or "")
-            success, name = launch_app(query)
-            return self._ok({"status": f"Opened {name}"}, notice=f"Opened {name}") if success else self._error(f"Application not found: {query}")
-        try:
-            apps = list(load_apps().values())
-        except FileNotFoundError:
-            from tools.app_discovery import build_database
-            build_database()
-            apps = list(load_apps().values())
+            from tools.desktop_models import AppLaunchRequest
+            result = self._desktop().open_app(AppLaunchRequest(query)).to_dict()
+            data = {"app_action": result, "status": result.get("status"), "target_app": query}
+            return self._ok(data, notice=f"{result.get('status')}: {query}") if result.get("success") else {
+                "success": False, "error": result.get("error") or f"Application not opened: {query}", "data": data,
+            }
+        apps = [item.to_dict() for item in self._desktop().discovery.discover()]
         query = str(payload.get("query") or "").lower().strip()
         if query:
-            apps = [item for item in apps if query in str(item.get("name", "")).lower()]
+            apps = [item for item in apps if query in str(item.get("name", "")).lower() or query in " ".join(item.get("aliases") or []).lower()]
         return self._ok({"apps": apps[:60]}, notice=f"{len(apps[:60])} application(s)")
 
     def _transfers(self, action, payload, state):
@@ -288,6 +331,23 @@ class JarvisWidgetBackend:
         query = str(payload.get("query") or "").strip()
         if action == "run_tests":
             return {"success": True, "prompt": f"Inspect the current development task and run the relevant safe tests. {query}".strip()}
+        if action in {"open", "open_file"}:
+            selected = payload.get("selected")
+            path = payload.get("path") or (selected.get("path") if isinstance(selected, dict) else selected)
+            result = self._desktop().open_file(str(path or "")).to_dict()
+            data = {**state, "app_action": result, "status": result.get("status"), "path": path}
+            if result.get("requires_confirmation"):
+                confirmation = dict(result.get("confirmation") or {})
+                return {"success": False, "error": result.get("error"), "data": data,
+                        "confirmation": confirmation,
+                        "pending_prompt": (
+                            f"The user approved the exact desktop file-open plan. Call app_open_file "
+                            f"with path={path!r}, confirmation_id={confirmation.get('confirmation_id')!r}, "
+                            "and confirm=true; then report only the verified result."
+                        )}
+            return self._ok(data, notice="File open verified") if result.get("success") else {
+                "success": False, "error": result.get("error") or "File open was not verified", "data": data,
+            }
         return self._ok({"files": state.get("files") or []})
 
     def _activity(self, action, payload, state):
@@ -420,8 +480,18 @@ class JarvisWidgetBackend:
             target = Path(str(path or ""))
             if not target.is_file():
                 return self._error("Choose an existing local source file.")
-            if target.suffix.lower() in {".exe", ".msi", ".msix", ".bat", ".cmd", ".ps1"}:
-                return {"success": True, "confirmation": {"action": "Open executable source", "risk": "This can execute downloaded code", "target": str(target)}, "pending_prompt": f"Open {target} only after explicit confirmation."}
-            os.startfile(str(target))
-            return self._ok({"files": state.get("files") or [], "opened": str(target)}, notice="Source opened")
+            result = self._desktop().open_file(str(target)).to_dict()
+            data = {"files": state.get("files") or [], "app_action": result, "opened": str(target) if result.get("success") else None}
+            if result.get("requires_confirmation"):
+                confirmation = dict(result.get("confirmation") or {})
+                return {"success": False, "error": result.get("error"), "data": data,
+                        "confirmation": confirmation,
+                        "pending_prompt": (
+                            f"The user approved the exact desktop file-open plan. Call app_open_file "
+                            f"with path={str(target)!r}, confirmation_id={confirmation.get('confirmation_id')!r}, "
+                            "and confirm=true; then report only the verified result."
+                        )}
+            return self._ok(data, notice="Source open verified") if result.get("success") else {
+                "success": False, "error": result.get("error") or "Source open was not verified", "data": data,
+            }
         return self._ok({"files": state.get("files") or state.get("attachments") or []}, notice="Assignment sources synchronized")

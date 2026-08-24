@@ -1057,10 +1057,114 @@ def hotkey(keys):
     return _hotkey_variadic(*keys)
 
 
+# ---------------- Safe desktop awareness and app control ---------------- #
+
+def _desktop_service():
+    from tools.desktop_control import get_desktop_service
+    return get_desktop_service()
+
+
+def desktop_get_state():
+    return _desktop_service().get_state().to_dict()
+
+
+def desktop_active_window():
+    return _desktop_service().active_window().to_dict()
+
+
+def desktop_list_windows(app=None):
+    return _desktop_service().list_windows(app).to_dict()
+
+
+def desktop_plan(request, target_path=None):
+    return {"success": True, "plan": _desktop_service().plan(request, target_path=target_path).to_dict()}
+
+
+def app_find(query):
+    identity = _desktop_service().find_app(query)
+    if identity is None:
+        error, fixes = _desktop_service().discovery.explain_not_found(query)
+        return {"success": False, "status": "not_found", "query": query, "error": error, "suggested_fixes": list(fixes)}
+    return {"success": True, "status": "success", "app": identity.to_dict()}
+
+
+def app_open(query, path=None, working_directory=None, confirmation_id=None, confirm=False):
+    from tools.desktop_models import AppLaunchRequest
+    arguments = (str(path),) if path and not Path(path).exists() else ()
+    file_path = str(path) if path and Path(path).exists() else None
+    workdir = str(path) if path and Path(path).is_dir() else working_directory
+    request = AppLaunchRequest(str(query), file_path=file_path, working_directory=workdir,
+                               arguments=arguments, focus_existing=not bool(path),
+                               confirmation_id=confirmation_id, confirmed=bool(confirm))
+    return _desktop_service().open_app(request).to_dict()
+
+
+def app_focus(query):
+    return _desktop_service().focus_app(query).to_dict()
+
+
+def app_open_file(path, app=None, confirmation_id=None, confirm=False):
+    return _desktop_service().open_file(path, app, confirmation_id=confirmation_id, confirm=confirm).to_dict()
+
+
+def app_open_folder(path):
+    return _desktop_service().open_folder(path).to_dict()
+
+
+def app_show_in_folder(path):
+    return _desktop_service().show_in_folder(path).to_dict()
+
+
+def app_minimize(query=None, window_handle=None):
+    return _desktop_service().minimize(query, window_handle).to_dict()
+
+
+def app_maximize(query=None, window_handle=None):
+    return _desktop_service().maximize(query, window_handle).to_dict()
+
+
+def app_restore(query=None, window_handle=None):
+    return _desktop_service().restore(query, window_handle).to_dict()
+
+
+def app_close_plan(query, close_all=False):
+    return {"success": True, "plan": _desktop_service().close_plan(query, close_all=close_all).to_dict()}
+
+
+def app_close_confirmed(confirmation_id, confirm=False):
+    return _desktop_service().close_confirmed(confirmation_id, confirm=confirm).to_dict()
+
+
+def process_kill_plan(query=None, process_id=None):
+    return {"success": True, "plan": _desktop_service().kill_plan(query, process_id=process_id).to_dict()}
+
+
+def process_kill_confirmed(confirmation_id, confirm=False):
+    return _desktop_service().kill_confirmed(confirmation_id, confirm=confirm).to_dict()
+
+
 # ---------------- Tool Registry ---------------- #
 
 TOOLS = {
     "launch_app": launch_app,
+
+    "desktop_get_state": desktop_get_state,
+    "desktop_active_window": desktop_active_window,
+    "desktop_list_windows": desktop_list_windows,
+    "desktop_plan": desktop_plan,
+    "app_find": app_find,
+    "app_open": app_open,
+    "app_focus": app_focus,
+    "app_open_file": app_open_file,
+    "app_open_folder": app_open_folder,
+    "app_show_in_folder": app_show_in_folder,
+    "app_minimize": app_minimize,
+    "app_maximize": app_maximize,
+    "app_restore": app_restore,
+    "app_close_plan": app_close_plan,
+    "app_close_confirmed": app_close_confirmed,
+    "process_kill_plan": process_kill_plan,
+    "process_kill_confirmed": process_kill_confirmed,
 
     "browser_open": browser_open,
     "youtube_recommend": youtube_recommend,

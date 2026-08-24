@@ -282,29 +282,28 @@ class JarvisWindow(QWidget):
             path = values.get("path") or values.get("selected")
             if isinstance(path, dict):
                 path = path.get("path")
-            if path and Path(path).exists():
-                os.startfile(str(path))
-            else:
+            if not path or not Path(path).exists():
                 self.widget_manager.update(widget_id, error=f"Path not found: {path}")
-            return
+                return
+            values["path"] = str(path)
         if action == "reveal" and widget_type == "file_search":
             path = values.get("path") or values.get("selected")
             if isinstance(path, dict):
                 path = path.get("path")
             target = Path(path) if path else None
-            if target and target.exists():
-                os.startfile(str(target if target.is_dir() else target.parent))
-            else:
+            if not target or not target.exists():
                 self.widget_manager.update(widget_id, error=f"Path not found: {path}")
-            return
+                return
+            values["path"] = str(target)
         if action in {"open", "open_file"} and widget_type in {"web_results", "email", "code_task"}:
             selected = values.get("selected")
             if widget_type == "code_task":
                 path = selected.get("path") if isinstance(selected, dict) else selected
-                if path and Path(path).exists():
-                    os.startfile(str(path))
-                else:
+                if not path or not Path(path).exists():
                     self.widget_manager.update(widget_id, error="Choose an existing file first.")
+                    return
+                values["path"] = str(path)
+                self.widgetAction.emit(widget_id, action, values)
                 return
             url = selected.get("url") if isinstance(selected, dict) else selected
             if widget_type == "email" and not url:
@@ -336,13 +335,11 @@ class JarvisWindow(QWidget):
         if state is None:
             return
         result = dict(result or {})
-        if not result.get("success"):
-            self.widget_manager.update(widget_id, loading=False, error=str(result.get("error") or "Widget backend failed"))
-            return
         data = dict(result.get("data") or {})
         if result.get("notice"):
             data["notice"] = result["notice"]
-        self.widget_manager.update(widget_id, loading=False, empty=False, error=None, data=data)
+        error = None if result.get("success") else str(result.get("error") or "Widget backend failed")
+        self.widget_manager.update(widget_id, loading=False, empty=False, error=error, data=data)
         if result.get("open_settings"):
             self.open_settings()
         confirmation = result.get("confirmation")

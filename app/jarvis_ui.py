@@ -165,9 +165,6 @@ def _wire_runtime(window: JarvisWindow) -> None:
                 window.widget_manager.update(widget_id, loading=True, empty=False, error=None, data={"query": query, "results": []})
                 run_text(f"Find my local file or folder matching: {query}")
             return
-        if state.widget_type == "system_status" and action == "refresh":
-            window.update_system_status(task="Idle", warning="Runtime status refreshed.")
-            return
         window.widget_manager.update(widget_id, loading=True, error=None)
 
         def execute_widget_action():

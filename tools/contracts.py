@@ -42,8 +42,13 @@ class ToolResult:
         error = None
         stale = False
         retryable = False
+        confirmation_required = False
         if isinstance(result, dict):
             status = str(result.get("status") or "").lower()
+            confirmation_required = bool(
+                result.get("requires_confirmation")
+                or status == "confirmation_required"
+            )
             error_shaped = bool(result.get("error") or result.get("error_message")) and result.get("success") is not True
             partial = bool(result.get("partial") or status == "partial")
             if result.get("success") is False or status in {"error", "failed", "failure"} or error_shaped or partial:
@@ -51,6 +56,12 @@ class ToolResult:
             error = (result.get("error") or result.get("error_message") or result.get("message")) if not reported_success else None
             stale = bool(result.get("stale"))
             retryable = bool(result.get("retryable"))
+        if confirmation_required:
+            return cls(
+                tool, ToolStatus.BLOCKED, False, result,
+                str(error or "Explicit confirmation is required before this action."),
+                False, {"requires_confirmation": True},
+            )
         if stale:
             return cls(tool, ToolStatus.STALE, False, result, error or "Tool returned stale data", True)
         if not reported_success:
@@ -84,6 +95,9 @@ class ToolDecisionLayer:
     _HIGH_RISK = {
         "file_delete", "delete_file", "delete_folder", "gmail_delete",
         "gmail_send", "shutdown", "restart", "purchase", "submit",
+        "app_close_confirmed", "process_kill_confirmed",
+        "type_text", "press_key", "hotkey", "left_click", "double_click",
+        "right_click", "scroll", "move_mouse",
     }
     _CONFIRMATION_KEYS = ("confirm", "confirmed", "user_confirmed")
 
@@ -157,6 +171,8 @@ class ToolDecisionLayer:
 
 class ToolResultVerifier:
     def verify(self, result: ToolResult, *, expected_output: str = "") -> Verification:
+        if result.status == ToolStatus.BLOCKED:
+            return Verification(False, False, False, result.error or "Confirmation required", False)
         if result.status == ToolStatus.STALE:
             return Verification(False, False, True, "The result is stale", True)
         if result.status == ToolStatus.ERROR:
