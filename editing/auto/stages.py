@@ -232,6 +232,47 @@ STAGES = (
         manual_command="python -m editing.cli episode plan-retention",
     ),
     AutoStage(
+        name="retention_cut",
+        summary="Reshape the cut around the retention findings",
+        # Needs the retention plan it consumes and the cut it reshapes.
+        requires=("retention_plan", "roughcut_build"),
+        config_keys=("name", "style", "retention_mode", "cold_open",
+                     "max_cold_open_seconds", "dead_air_aggressiveness",
+                     "director", "director_mode"),
+        artifacts=("retention/structure.plan.json",),
+        critical=False,
+        manual_command="python -m editing.cli retention plan",
+    ),
+    AutoStage(
+        name="caption_polish",
+        summary="Choose the few lines worth putting on screen",
+        # Reads the cut this run produced, so it waits for the retention pass
+        # when there is one. ``retention_cut`` is non-critical and often
+        # skipped, so the requirement is the rough cut and the runner reads
+        # the retention variant when it exists.
+        requires=("roughcut_build",),
+        config_keys=("name", "style", "captions", "max_captions_per_minute",
+                     "max_caption_seconds", "max_caption_words",
+                     "min_caption_confidence", "require_caption_confidence",
+                     "retention_cut", "retention_mode"),
+        artifacts=("polish/structure.captions.json",),
+        critical=False,
+        manual_command="python -m editing.cli polish captions "
+                       "--captions key_moments",
+    ),
+    AutoStage(
+        name="audio_polish",
+        summary="Mark the few moments that earn a sound",
+        requires=("roughcut_build",),
+        config_keys=("name", "style", "audio_polish", "max_sfx_per_minute",
+                     "music_bed", "ducking", "asset_library",
+                     "retention_cut", "retention_mode"),
+        artifacts=("polish/structure.audio.json",),
+        critical=False,
+        manual_command="python -m editing.cli polish audio "
+                       "--audio-polish placeholders",
+    ),
+    AutoStage(
         name="render_proxy",
         summary="Render a watchable proxy of the rough cut with FFmpeg",
         requires=("roughcut_build",),
@@ -245,6 +286,22 @@ STAGES = (
         requires_ffmpeg=True,
         critical=False,
         manual_command="python -m editing.cli render roughcut",
+    ),
+    AutoStage(
+        name="reliability_gates",
+        summary="Check whether this run produced something usable",
+        # Requires only the cut: a run whose render was blocked still deserves
+        # its checks, and the render gates report ``skipped`` rather than
+        # inventing a judgement about a video nobody made.
+        requires=("roughcut_build",),
+        config_keys=(),
+        # Always re-run: the checks read files that can change between two
+        # looks, and a cached "everything passed" over a deleted video is the
+        # one answer this stage must never give.
+        resumable=False,
+        critical=False,
+        manual_command="python -m editing.cli auto show-checks "
+                       "--run <run_id>",
     ),
     AutoStage(
         name="feedback_start",
@@ -275,6 +332,17 @@ STAGES = (
         resumable=False,
         critical=False,
         manual_command="python -m editing.cli feedback report --run <run_id>",
+    ),
+    AutoStage(
+        name="review_package",
+        summary="Gather the run into one review folder with an index",
+        requires=("roughcut_build",),
+        config_keys=(),
+        # Always rebuilt, like the report: it is a *view* over everything
+        # else, and a cached view is a view of something that has changed.
+        resumable=False,
+        critical=False,
+        manual_command="python -m editing.cli review package --run <run_id>",
     ),
     AutoStage(
         name="report",
@@ -313,6 +381,10 @@ EPISODE_STAGES = ("episode_memory", "retention_plan")
 #: every machine that has not set one up.
 DIRECTOR_STAGES = ("director_plan",)
 
+#: The retention wiring, on its own. Opt-in via ``--retention-cut``: it
+#: reshapes the episode, and reshaping somebody's episode is not a default.
+RETENTION_STAGES = ("retention_cut",)
+
 #: The proxy render, on its own. Opt-in via ``--render-proxy``: it is the
 #: only stage that produces a file measured in hundreds of megabytes, and a
 #: pipeline that quietly filled a disk would be a bad neighbour.
@@ -321,6 +393,19 @@ RENDER_STAGES = ("render_proxy",)
 #: Stages the feedback collector owns. These are opt-*in* -- ``--feedback`` --
 #: rather than opt-out, because they start something a person has to finish.
 FEEDBACK_STAGES = ("feedback_start", "feedback_queue", "feedback_report")
+
+#: The caption polish, on its own. Opt-in via ``--captions``: putting text on
+#: somebody's video is not a default, and the mode says how much.
+CAPTION_STAGES = ("caption_polish",)
+
+#: The audio polish, on its own. Opt-in via ``--audio-polish``.
+AUDIO_STAGES = ("audio_polish",)
+
+#: The review package. Opt-*out* -- the only late addition that is on by
+#: default -- because it creates nothing new, costs a fraction of a second,
+#: and is the difference between a run somebody can inspect and forty files
+#: they have to learn the layout of.
+REVIEW_STAGES_PACKAGE = ("review_package",)
 
 
 def stage(name: str) -> AutoStage:
@@ -566,6 +651,13 @@ def run_analyze(pipeline, run, context) -> tuple:
     target = pipeline.write_timeline(timeline, name=run.name)
     stats = timeline.stats()
     context["timeline"] = timeline
+
+    # Words, counted here rather than taken from the transcription stage.
+    # A transcript can arrive three ways -- Whisper, Premiere, or an .srt
+    # sitting beside the footage -- and only this stage sees all three. The
+    # reliability checks read this, so "no transcript" means no words in the
+    # timeline rather than "the Whisper stage did not run".
+    words = sum(len(segment.said.split()) for segment in timeline.segments)
     return (
         [str(target)],
         {
@@ -573,6 +665,8 @@ def run_analyze(pipeline, run, context) -> tuple:
             "usable_segments": stats["usable_segments"],
             "covered_seconds": stats["covered_seconds"],
             "by_importance": stats["by_importance"],
+            "segments_with_speech": stats["segments_with_speech"],
+            "transcript_words": words,
             "model": timeline.model,
         },
         list(timeline.warnings),
@@ -1251,6 +1345,72 @@ def run_feedback_report(pipeline, run, context) -> tuple:
     )
 
 
+def run_retention_cut(pipeline, run, context) -> tuple:
+    """Wire the retention findings into the cut.
+
+    Non-critical: a run with no usable retention plan still produced every
+    other plan, and the rough cut it would have reshaped is untouched. The
+    render stage then renders whichever cut exists, and the report says which.
+    """
+    settings = pipeline.retention_config(
+        mode=run.retention_mode or None,
+        cold_open=(None if run.cold_open else False),
+        max_cold_open_seconds=(run.max_cold_open_seconds or None),
+        dead_air_aggressiveness=(run.dead_air_aggressiveness or None),
+        style=run.style or None,
+    )
+
+    plan, cut = pipeline.retention_cut(
+        name=run.name,
+        settings=settings,
+        timeline=context.get("timeline"),
+        memory=context.get("episode_memory"),
+        retention=context.get("retention_plan"),
+        roughcut=context.get("roughcut"),
+        recommendations=context.get("recommendations"),
+        director_plan=context.get("director_plan"),
+    )
+    context["retention_cut_plan"] = plan
+    if cut is not None:
+        context["retention_roughcut"] = cut
+
+    if plan.failure is not None:
+        raise StageBlocked(
+            "could not wire the retention findings into the cut",
+            plan.failure.message,
+            code=plan.failure.code,
+            next_command=plan.failure.hint
+            or "python -m editing.cli retention plan --mode report_only",
+            detail={"stage": plan.failure.stage},
+        )
+
+    stats = plan.stats()
+    cold = plan.cold_open
+    return (
+        [str(pipeline.config.retention_dir / f"{run.name}.plan.json")],
+        {
+            "mode": plan.mode,
+            "base": plan.base,
+            # Loud on purpose: a run whose cut was *not* reshaped must never
+            # read as one that was.
+            "applied": plan.applied,
+            "cold_open": cold.chosen,
+            "cold_open_type": cold.hook_type if cold.chosen else "",
+            "cold_open_seconds": stats["cold_open_seconds"],
+            "zones_compressed": stats["zones_compressed"],
+            "seconds_removed": stats["seconds_removed"],
+            "setups_protected": stats["setups_protected"],
+            "payoffs_protected": stats["payoffs_protected"],
+            "dead_air_cut": stats["dead_air_cut"],
+            "refused": stats["rejected"],
+            "unresolved": stats["unresolved_warnings"],
+            "cut_duration": stats["cut_duration"],
+            "base_duration": stats["base_duration"],
+        },
+        list(plan.warnings),
+    )
+
+
 def run_render_proxy(pipeline, run, context) -> tuple:
     """Render the rough cut to a proxy MP4. Touches no host application.
 
@@ -1280,7 +1440,11 @@ def run_render_proxy(pipeline, run, context) -> tuple:
             detail={"health": health},
         )
 
-    roughcut = context.get("roughcut")
+    # The retention cut when there is one, because that is the cut this run
+    # actually produced. Rendering the pre-retention cut while the report says
+    # a cold open was chosen would show a video that does not match its own
+    # description.
+    roughcut = context.get("retention_roughcut") or context.get("roughcut")
     try:
         job = pipeline.render_roughcut(
             name=run.name, plan=roughcut, settings=settings)
@@ -1303,6 +1467,16 @@ def run_render_proxy(pipeline, run, context) -> tuple:
             detail={"job_id": job.job_id, "stage": job.failure.stage},
         )
 
+    # Captions are never burned into a proxy -- the render joins pre-encoded
+    # segments, and adding text would mean re-encoding the joined file. The
+    # sidecar beside the video is the honest alternative, and it costs nothing.
+    sidecar = ""
+    caption_plan = context.get("caption_plan")
+    if caption_plan is not None and job.output_path:
+        written = pipeline.caption_sidecar_beside(
+            job.output_path, name=run.name, plan=caption_plan)
+        sidecar = str(written) if written is not None else ""
+
     result = job.result
     return (
         [job.output_path, job.notes_path],
@@ -1310,6 +1484,7 @@ def run_render_proxy(pipeline, run, context) -> tuple:
             "job_id": job.job_id,
             "video": job.output_path,
             "notes": job.notes_path,
+            "subtitles": sidecar,
             "clips": len(job.segments),
             "duration": job.duration,
             "quality": settings.quality,
@@ -1328,7 +1503,249 @@ def run_render_proxy(pipeline, run, context) -> tuple:
     )
 
 
+# ---------------------------------------------------------------------------
+# Polish, checks and the review package (Session 11)
+# ---------------------------------------------------------------------------
+#
+# None of these executes anything, needs a tool, or changes a frame of the cut.
+# All four are non-critical: losing the captions costs the captions.
+
+
+def _polish_cut(pipeline, run, context):
+    """The cut this run actually produced, and what to call it.
+
+    The retention variant when there is one, because that is what the render
+    stage renders and what a person will watch. Planning captions against the
+    pre-retention cut while the video is the reshaped one would put every
+    caption at the wrong moment -- and it would do it silently, which is the
+    worst kind of wrong this pass could be.
+    """
+    cut = context.get("retention_roughcut")
+    if cut is None and run.retention_cut:
+        cut = pipeline.retention_roughcut_or_none(name=run.name)
+    if cut is not None:
+        return cut, "retention"
+    cut = context.get("roughcut") or pipeline.load_rough_cut(name=run.name)
+    return cut, "roughcut"
+
+
+def run_caption_polish(pipeline, run, context) -> tuple:
+    """Decide which spoken lines earn a caption."""
+    from editing.style import presets as style_presets
+
+    style = style_presets.get(run.style)
+    settings = pipeline.caption_config(
+        style, mode=run.captions,
+        max_per_minute=(run.max_captions_per_minute or None),
+        max_seconds=(run.max_caption_seconds or None),
+        max_words=(run.max_caption_words or None),
+        min_confidence=(run.min_caption_confidence or None),
+        require_confidence=(run.require_caption_confidence or None),
+    )
+    cut, base = _polish_cut(pipeline, run, context)
+
+    plan = pipeline.polish_captions(
+        name=run.name,
+        timeline=context.get("timeline"),
+        cut=cut,
+        style=style,
+        settings=settings,
+        memory=context.get("episode_memory"),
+    )
+    context["caption_plan"] = plan
+
+    stats = plan.stats()
+    return (
+        [str(pipeline.config.polish_dir / f"{run.name}.captions.json")],
+        {
+            "mode": plan.mode,
+            "base": base,
+            "considered": stats["considered"],
+            "accepted": stats["accepted"],
+            "rejected": stats["rejected"],
+            "captions_per_minute": stats["captions_per_minute"],
+            "ceiling": settings.max_per_minute,
+            "longest_seconds": stats["longest_seconds"],
+            "by_moment": stats["by_moment"],
+            "by_reject_reason": stats["by_reject_reason"],
+            # Loud on purpose, for the same reason the render stage's mock
+            # flag is: a video with no captions in it must never read as a
+            # video with captions in it.
+            "burned_in": plan.burned_in,
+            "sidecar": plan.sidecar_path,
+        },
+        list(plan.warnings),
+    )
+
+
+def run_audio_polish(pipeline, run, context) -> tuple:
+    """Decide which moments earn a sound, and whether anything can play it."""
+    from editing.style import presets as style_presets
+
+    style = style_presets.get(run.style)
+    settings = pipeline.audio_polish_config(
+        style, mode=run.audio_polish,
+        max_sfx_per_minute=(run.max_sfx_per_minute or None),
+        music_bed=run.music_bed,
+        ducking=run.ducking,
+    )
+    cut, base = _polish_cut(pipeline, run, context)
+
+    library = None
+    if settings.uses_library:
+        library = context.get("asset_library") or pipeline.asset_library_or_empty(
+            root=run.asset_library or None)
+
+    plan = pipeline.polish_audio(
+        name=run.name,
+        timeline=context.get("timeline"),
+        cut=cut,
+        style=style,
+        settings=settings,
+        library=library,
+    )
+    context["audio_plan"] = plan
+
+    stats = plan.stats()
+    return (
+        [str(pipeline.config.polish_dir / f"{run.name}.audio.json")],
+        {
+            "mode": plan.mode,
+            "base": base,
+            "considered": stats["considered"],
+            "accepted": stats["accepted"],
+            "rejected": stats["rejected"],
+            "placed": stats["placed"],
+            "placeholders": stats["placeholders"],
+            "missing_assets": stats["missing_assets"],
+            "effects": stats["effects"],
+            "sfx_per_minute": stats["sfx_per_minute"],
+            "ceiling": settings.max_sfx_per_minute,
+            "by_kind": stats["by_kind"],
+            "by_reject_reason": stats["by_reject_reason"],
+            # Same reason as above: a plan of notes must never read as sound.
+            "plays_anything": bool(plan.placed),
+        },
+        list(plan.warnings),
+    )
+
+
+def run_reliability_gates(pipeline, run, context) -> tuple:
+    """Check whether this run produced something usable.
+
+    Never fails the run, whatever it finds. A gate that says the output is
+    unusable has said the most useful thing it can; stopping the pipeline on
+    top of that would only cost the report that explains it.
+    """
+    from editing.reliability import report as gate_report
+    from editing.reliability import run as reliability_run
+
+    state = context.get("run_state")
+    if state is None:
+        raise StageBlocked(
+            "could not run the reliability checks",
+            "this stage needs the run's own state and did not get it.",
+            code="no_run_state",
+            next_command="python -m editing.cli auto show-checks "
+                         "--run <run_id>",
+        )
+
+    # The shared config, not the pipeline's: this writes into the run folder
+    # rather than among the run's artifacts, and the pipeline's config is
+    # already scoped one level inside it.
+    config = context.get("shared_config") or pipeline.config
+
+    report, _inputs = reliability_run.check_run(
+        config, state,
+        caption_plan=context.get("caption_plan"),
+        audio_plan=context.get("audio_plan"),
+    )
+    context["gate_report"] = report
+
+    outputs: list = []
+    target = reliability_run.report_path(config, state.run_id)
+    if target is not None:
+        import json
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2,
+                       default=str),
+            encoding="utf-8",
+        )
+        text = target.with_suffix(".txt")
+        text.write_text(gate_report.render(report), encoding="utf-8")
+        outputs = [str(target), str(text)]
+
+    stats = report.stats()
+    return (
+        outputs,
+        {
+            "status": stats["status"],
+            "usable": stats["usable"],
+            "passed": stats["passed"],
+            "warned": stats["warned"],
+            "failed": stats["failed"],
+            "skipped": stats["skipped"],
+            "blocking": stats["blocking"],
+            "failures": [r.name for r in report.failures],
+            "warnings": [r.name for r in report.warnings],
+        },
+        [f"{r.name}: {r.reason}" for r in report.failures + report.warnings],
+    )
+
+
+def run_review_package(pipeline, run, context) -> tuple:
+    """Gather everything this run produced into one folder with an index."""
+    from editing.review import build as review_build
+
+    state = context.get("run_state")
+    if state is None:
+        raise StageBlocked(
+            "could not build the review package",
+            "this stage needs the run's own state and did not get it.",
+            code="no_run_state",
+            next_command="python -m editing.cli review package --run <run_id>",
+        )
+
+    # Shared config, for the same reason the checks use it: the package lives
+    # beside the run's artifacts, not inside them.
+    config = context.get("shared_config") or pipeline.config
+
+    package, written = review_build.write_package(
+        config, state,
+        checks=context.get("gate_report"),
+        caption_plan=context.get("caption_plan"),
+        audio_plan=context.get("audio_plan"),
+    )
+    context["review_package"] = package
+
+    stats = package.stats()
+    from editing.review import store as review_store
+
+    return (
+        [str(path) for path in written],
+        {
+            "folder": package.folder,
+            "index": str(review_store.index_path(config, state.run_id)),
+            "items": stats["items"],
+            "present": stats["present"],
+            "has_video": stats["has_video"],
+            "watch_for": stats["watch_for"],
+            "weak_points": stats["weak_points"],
+            "decisions_needed": stats["decisions_needed"],
+            "checks_status": stats["checks_status"],
+        },
+        [],
+    )
+
+
+RUNNERS["retention_cut"] = run_retention_cut
+RUNNERS["caption_polish"] = run_caption_polish
+RUNNERS["audio_polish"] = run_audio_polish
 RUNNERS["render_proxy"] = run_render_proxy
+RUNNERS["reliability_gates"] = run_reliability_gates
 RUNNERS["feedback_start"] = run_feedback_start
 RUNNERS["feedback_queue"] = run_feedback_queue
 RUNNERS["feedback_report"] = run_feedback_report
+RUNNERS["review_package"] = run_review_package

@@ -45,6 +45,13 @@ LIMITATIONS = (
     "and loudness is never measured.",
     "Re-running a pass places its work again rather than replacing the "
     "previous run's. Delete the added tracks first, or start a fresh cut.",
+    "Captions are never burned into the proxy. The render joins pre-encoded "
+    "segments, so text would mean a second full encode -- the sidecar .srt "
+    "beside the video is how to see them.",
+    "The audio polish plans sound and plays none of it. No level is "
+    "measured, no file is listened to, and nothing it plans is in the proxy.",
+    "The reliability checks look at shape, not at taste. Passing all fifteen "
+    "says the output is well-formed, not that the edit is good.",
 )
 
 
@@ -87,9 +94,15 @@ def build_report(
                 report.warnings.append(entry)
 
     report.director = _director_section(state)
+    report.retention = _retention_section(state)
     report.render = _render_section(config, state, pipeline)
     report.feedback = _feedback_section(config, state, pipeline)
+    report.captions = _captions_section(state)
+    report.audio = _audio_section(state)
+    report.checks = _checks_section(state)
+    report.review = _review_section(config, state)
     report.check_in_premiere = _check_list(state)
+    report.answers = _answers(state, report)
     report.next_commands = _next_commands(state, report)
     return report
 
@@ -150,6 +163,65 @@ def _director_section(state: AutoRunState) -> dict:
     roughcut = state.stage("roughcut_build")
     if roughcut is not None and roughcut.summary.get("selection"):
         section["selection"] = roughcut.summary["selection"]
+    return section
+
+
+def _retention_section(state: AutoRunState) -> dict:
+    """What the retention wiring did to the shape of the episode.
+
+    Filled whether or not the stage ran. "This cut is chronological" is a fact
+    about the cut, and a report that only mentioned the retention pass when it
+    ran would make its absence invisible.
+    """
+    section = {
+        "enabled": bool(state.config.retention_cut),
+        "ran": False,
+        "applied": False,
+        "mode": state.config.retention_mode,
+        "base": "",
+        "cold_open": False,
+        "cold_open_type": "",
+        "cold_open_seconds": 0.0,
+        "zones_compressed": 0,
+        "seconds_removed": 0.0,
+        "setups_protected": 0,
+        "payoffs_protected": 0,
+        "dead_air_cut": 0,
+        "refused": 0,
+        "unresolved": 0,
+        "plan_command": "python -m editing.cli retention plan",
+        "run_with_retention": (
+            "python -m editing.cli auto run --folder "
+            f"{state.config.footage_folder or '<folder>'} --retention-cut "
+            f"--style {state.config.style} --no-premiere"),
+        "note": (
+            "Counts of what changed in the edit. Nothing here measures "
+            "retention or predicts what an audience will do."
+        ),
+    }
+
+    result = state.stage("retention_cut")
+    if result is not None and result.summary:
+        section["ran"] = result.ok
+        for key in ("mode", "base", "applied", "cold_open", "cold_open_type",
+                    "cold_open_seconds", "zones_compressed", "seconds_removed",
+                    "setups_protected", "payoffs_protected", "dead_air_cut",
+                    "refused", "unresolved", "cut_duration", "base_duration"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+        section["report_command"] = (
+            f"python -m editing.cli retention report --run {state.run_id}")
+        section["cold_open_command"] = (
+            f"python -m editing.cli retention show-cold-open "
+            f"--run {state.run_id}")
+        section["compare_command"] = (
+            f"python -m editing.cli retention compare --run {state.run_id}")
+        section["rejected_command"] = (
+            f"python -m editing.cli retention show-rejected "
+            f"--run {state.run_id}")
+    if result is not None and result.status in ("blocked", "failed"):
+        section["blocked_reason"] = (
+            result.failure.why if result.failure else result.note)
     return section
 
 
@@ -304,6 +376,358 @@ def _feedback_section(
     return section
 
 
+def _captions_section(state: AutoRunState) -> dict:
+    """What text reached the screen, and what was refused.
+
+    Filled whether or not the stage ran. "This edit has no captions in it" is
+    a fact about the edit, and a report that only mentioned captions when they
+    existed would make their absence invisible.
+    """
+    section = {
+        "enabled": state.config.captions != "off",
+        "ran": False,
+        "mode": state.config.captions,
+        "considered": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "captions_per_minute": 0.0,
+        "ceiling": 0.0,
+        "by_moment": {},
+        "by_reject_reason": {},
+        # Loud, and always present: a proxy with no captions in it must never
+        # read as a proxy with captions in it.
+        "burned_in": False,
+        "sidecar": "",
+        "run_with_captions": (
+            "python -m editing.cli auto run --folder "
+            f"{state.config.footage_folder or '<folder>'} "
+            f"--captions key_moments --style {state.config.style} "
+            "--no-premiere"),
+        "note": (
+            "Captions are chosen from what was said and what the picture was "
+            "doing. Nothing here has read the video, and no caption is "
+            "burned into it."
+        ),
+    }
+
+    result = state.stage("caption_polish")
+    if result is not None and result.summary:
+        section["ran"] = result.ok
+        for key in ("mode", "considered", "accepted", "rejected",
+                    "captions_per_minute", "ceiling", "longest_seconds",
+                    "by_moment", "by_reject_reason", "burned_in", "sidecar",
+                    "base"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+        section["report_command"] = (
+            f"python -m editing.cli polish captions --run {state.run_id} "
+            "--report")
+        section["rejected_command"] = (
+            f"python -m editing.cli polish show-rejected --run {state.run_id}")
+    if result is not None and result.status in ("blocked", "failed"):
+        section["blocked_reason"] = (
+            result.failure.why if result.failure else result.note)
+    return section
+
+
+def _audio_section(state: AutoRunState) -> dict:
+    """What sound was planned, what plays, and what is missing."""
+    section = {
+        "enabled": state.config.audio_polish != "off",
+        "ran": False,
+        "mode": state.config.audio_polish,
+        "considered": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "placed": 0,
+        "placeholders": 0,
+        "missing_assets": 0,
+        "sfx_per_minute": 0.0,
+        "ceiling": 0.0,
+        "by_kind": {},
+        "by_reject_reason": {},
+        # Same reason as ``burned_in`` above: a plan of notes must never read
+        # as sound in a video.
+        "plays_anything": False,
+        "run_with_audio": (
+            "python -m editing.cli auto run --folder "
+            f"{state.config.footage_folder or '<folder>'} "
+            f"--audio-polish placeholders --style {state.config.style} "
+            "--no-premiere"),
+        "note": (
+            "None of this is in the rendered proxy, which carries the cut and "
+            "its original audio and nothing else. No level here has been "
+            "measured."
+        ),
+    }
+
+    result = state.stage("audio_polish")
+    if result is not None and result.summary:
+        section["ran"] = result.ok
+        for key in ("mode", "considered", "accepted", "rejected", "placed",
+                    "placeholders", "missing_assets", "sfx_per_minute",
+                    "ceiling", "by_kind", "by_reject_reason",
+                    "plays_anything", "base"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+        section["report_command"] = (
+            f"python -m editing.cli polish audio --run {state.run_id} "
+            "--report")
+        section["missing_command"] = (
+            f"python -m editing.cli polish show-missing --run {state.run_id}")
+    if result is not None and result.status in ("blocked", "failed"):
+        section["blocked_reason"] = (
+            result.failure.why if result.failure else result.note)
+    return section
+
+
+def _checks_section(state: AutoRunState) -> dict:
+    """The reliability gates, summarised."""
+    section = {
+        "ran": False,
+        "status": "not run",
+        "usable": True,
+        "passed": 0,
+        "warned": 0,
+        "failed": 0,
+        "blocking": 0,
+        "failures": [],
+        "warnings": [],
+        "command": (
+            f"python -m editing.cli auto show-checks --run {state.run_id}"),
+        "note": (
+            "These look at shape, not at taste. A run that passes every gate "
+            "can still be a bad edit."
+        ),
+    }
+    result = state.stage("reliability_gates")
+    if result is not None and result.summary:
+        section["ran"] = result.ok
+        for key in ("status", "usable", "passed", "warned", "failed",
+                    "skipped", "blocking", "failures", "warnings"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+    return section
+
+
+def _review_section(config: EditingConfig, state: AutoRunState) -> dict:
+    """Where the review folder is, and what it leads with."""
+    from editing.review import store as review_store
+
+    index = review_store.index_path(config, state.run_id)
+    section = {
+        "enabled": bool(state.config.review_package),
+        "ran": False,
+        "folder": str(review_store.package_dir(config, state.run_id)),
+        "index": str(index),
+        "exists": False,
+        "items": 0,
+        "present": 0,
+        "has_video": False,
+        "command": (
+            f"python -m editing.cli review package --run {state.run_id}"),
+        "open_command": "python -m editing.cli review open-latest",
+        "note": (
+            "One folder holding the small readable things and pointing at the "
+            "video. Nothing in it says the edit is good."
+        ),
+    }
+    result = state.stage("review_package")
+    if result is not None and result.summary:
+        section["ran"] = result.ok
+        for key in ("folder", "index", "items", "present", "has_video",
+                    "watch_for", "weak_points", "decisions_needed",
+                    "checks_status"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+    try:
+        section["exists"] = index.exists()
+    except OSError:
+        section["exists"] = False
+    return section
+
+
+#: The thirteen questions somebody has after a run, in the order they ask
+#: them. Kept as a table so the answer function and the report cannot drift,
+#: and so a JSON consumer gets the same list a reader does.
+QUESTIONS = (
+    "What footage was used?",
+    "What style was used?",
+    "Was the director enabled?",
+    "Was the retention cut enabled?",
+    "Was a cold open used?",
+    "What was the opening hook?",
+    "What got compressed?",
+    "What got protected?",
+    "What dead air was removed?",
+    "Were captions added?",
+    "Were sound effects or music added?",
+    "What warnings remain?",
+    "What should I watch manually?",
+)
+
+
+def _answers(state: AutoRunState, report: AutoRunReport) -> list[dict]:
+    """The thirteen questions, each with what this run actually did.
+
+    Every answer is a count or a name taken off the run's own record. There is
+    deliberately nothing here that could be read as a claim about quality or
+    about an audience.
+    """
+    run = state.config
+    roughcut = report.roughcut or {}
+    director = report.director or {}
+    retention = report.retention or {}
+    captions = report.captions or {}
+    audio = report.audio or {}
+    checks = report.checks or {}
+
+    answers: list[str] = []
+
+    answers.append(
+        f"{run.footage_folder or '(none)'} -- "
+        f"{roughcut.get('clips', 0)} clip(s) kept, "
+        f"{roughcut.get('cut_duration', 0):.0f}s from "
+        f"{roughcut.get('source_duration', 0):.0f}s."
+    )
+    answers.append(
+        f"{run.style}"
+        + (" (markers only: nothing is drawn or played)"
+           if run.markers_only else "")
+    )
+    if director.get("ran"):
+        answers.append(
+            f"Yes -- {director.get('accepted', 0)} of "
+            f"{director.get('decisions', 0)} decision(s) accepted"
+            + (", in MOCK mode" if director.get("mock") else "")
+            + f". Ranges chosen by: {director.get('selection', '?')}."
+        )
+    elif run.director:
+        answers.append(
+            "Asked for and did not run; the rule-based selector chose the cut."
+        )
+    else:
+        answers.append("No. The rule-based selector chose the cut.")
+
+    if retention.get("applied"):
+        answers.append(
+            f"Yes, applied in {retention.get('mode', '?')} mode: "
+            f"{retention.get('base_duration', 0):.0f}s -> "
+            f"{retention.get('cut_duration', 0):.0f}s."
+        )
+    elif retention.get("ran"):
+        answers.append(
+            f"Decided in {retention.get('mode', 'report_only')} mode and "
+            "changed nothing."
+        )
+    else:
+        answers.append("No. The cut is chronological.")
+
+    if retention.get("cold_open"):
+        answers.append(
+            f"Yes -- a {retention.get('cold_open_type', '?')} lasting "
+            f"{retention.get('cold_open_seconds', 0):.0f}s, lifted from later "
+            "in the episode."
+        )
+    else:
+        answers.append("No. The episode opens where the footage does.")
+
+    if retention.get("cold_open"):
+        answers.append(
+            f"A {retention.get('cold_open_type', '?')} moment. "
+            + str(retention.get("cold_open_command", ""))
+        )
+    else:
+        answers.append(
+            "None was used. `episode show-hooks` lists what was found."
+        )
+
+    answers.append(
+        f"{retention.get('zones_compressed', 0)} sagging zone(s), "
+        f"{retention.get('seconds_removed', 0):.0f}s removed."
+        if retention.get("applied") else "Nothing was compressed."
+    )
+    answers.append(
+        f"{retention.get('setups_protected', 0)} setup(s) and "
+        f"{retention.get('payoffs_protected', 0)} payoff(s) were protected "
+        f"before anything that removes footage ran."
+        if retention.get("applied") else "Nothing was protected."
+    )
+    answers.append(
+        f"{retention.get('dead_air_cut', 0)} stretch(es) of silence were "
+        "trimmed."
+        if retention.get("applied") else "None was removed."
+    )
+
+    if captions.get("accepted"):
+        answers.append(
+            f"Yes -- {captions['accepted']} of "
+            f"{captions.get('considered', 0)} line(s) considered, "
+            f"{captions.get('captions_per_minute', 0):.2f} a minute. They are "
+            "NOT in the video; the sidecar subtitle file is how to see them."
+        )
+    elif captions.get("enabled"):
+        answers.append(
+            "Captions were on and no line cleared every rule. The plan lists "
+            "what was refused and why."
+        )
+    else:
+        answers.append("No. Captions were off for this run.")
+
+    if audio.get("accepted"):
+        answers.append(
+            f"{audio['accepted']} cue(s) planned "
+            f"({audio.get('placed', 0)} from the library, "
+            f"{audio.get('missing_assets', 0)} with nothing behind them). "
+            "None of it is in the rendered proxy."
+        )
+    elif audio.get("enabled"):
+        answers.append(
+            "Audio polish was on and every cue was refused. The plan says why."
+        )
+    else:
+        answers.append("No. Audio polish was off for this run.")
+
+    warning_count = len(report.warnings)
+    if checks.get("ran"):
+        answers.append(
+            f"{checks.get('failed', 0)} check(s) failed, "
+            f"{checks.get('warned', 0)} warned, and there are "
+            f"{warning_count} stage warning(s). "
+            + ("The output is NOT usable: "
+               + ", ".join(checks.get("failures") or [])
+               if not checks.get("usable")
+               else "Nothing says the output is unusable.")
+        )
+    else:
+        answers.append(
+            f"{warning_count} stage warning(s). The reliability checks did "
+            "not run."
+        )
+
+    watch: list[str] = []
+    if retention.get("cold_open"):
+        watch.append("the first "
+                     f"{retention.get('cold_open_seconds', 0):.0f}s")
+    if retention.get("zones_compressed"):
+        watch.append(f"the {retention['zones_compressed']} compressed "
+                     "stretch(es)")
+    if retention.get("dead_air_cut"):
+        watch.append("speech either side of the trimmed silences")
+    if captions.get("accepted"):
+        watch.append("every caption against what is actually said")
+    if audio.get("accepted"):
+        watch.append("every cue against the commentary, by ear")
+    if not watch:
+        watch.append("the whole thing once, without stopping")
+    answers.append("Watch " + ", ".join(watch) + ".")
+
+    return [
+        {"question": question, "answer": answer}
+        for question, answer in zip(QUESTIONS, answers)
+    ]
+
+
 def _check_list(state: AutoRunState) -> list[str]:
     """What a person should look at by hand once something has been executed."""
     out: list[str] = []
@@ -359,6 +783,17 @@ def _next_commands(
             f"python -m editing.cli auto explain-failure --run {state.run_id}"
         )
 
+    # The review folder goes first when there is one: it is the thing to open
+    # after a run that worked, and everything below it is a way of getting
+    # back to a detail the folder already points at.
+    review = (report.review if report is not None else {}) or {}
+    if review.get("exists"):
+        out.append(f"python -m editing.cli review summary --run {state.run_id}")
+
+    checks = (report.checks if report is not None else {}) or {}
+    if checks.get("ran") and not checks.get("usable", True):
+        out.append(checks.get("command", ""))
+
     ready = [gate for gate in state.gates if gate.ready]
     if ready:
         out.append(ready[0].command)
@@ -402,8 +837,13 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
             ("skip-review", run.skip_review), ("skip-assets", run.skip_assets),
             ("render-proxy", run.render_proxy), ("transcribe", run.transcribe),
             ("director", run.director),
+            ("retention-cut", run.retention_cut),
         ) if on
     ]
+    if run.captions != "off":
+        modes.append(f"captions={run.captions}")
+    if run.audio_polish != "off":
+        modes.append(f"audio-polish={run.audio_polish}")
     add(f"modes      : {', '.join(modes) if modes else 'none'}")
     add("")
 
@@ -414,6 +854,16 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
     for line in _headlines(state, report):
         add(f"  {line}")
     add("")
+
+    # -- the thirteen questions -------------------------------------------
+    if report.answers:
+        add(_THIN)
+        add("WHAT THIS EDIT IS")
+        add(_THIN)
+        for index, entry in enumerate(report.answers, start=1):
+            add(f"  {index:>2}. {entry['question']}")
+            add(f"      {entry['answer']}")
+        add("")
 
     # -- stages ------------------------------------------------------------
     add(_THIN)
@@ -512,6 +962,50 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
     add(f"  {director.get('note', '')}")
     add("")
 
+    # -- the shape of the episode -------------------------------------------
+    retention = report.retention or {}
+    add(_THIN)
+    add("RESHAPED FOR RETENTION")
+    add(_THIN)
+    if retention.get("ran") and retention.get("applied"):
+        add(f"  Applied on the {retention.get('base', '?')} cut in "
+            f"{retention.get('mode', '?')} mode: "
+            f"{retention.get('base_duration', 0):.0f}s -> "
+            f"{retention.get('cut_duration', 0):.0f}s.")
+        if retention.get("cold_open"):
+            add(f"  Opens on a {retention.get('cold_open_type', '?')} "
+                f"({retention.get('cold_open_seconds', 0):.0f}s) lifted from "
+                "later in the episode.")
+        else:
+            add("  No cold open was chosen; the opening is unchanged.")
+        add(f"  {retention.get('zones_compressed', 0)} risk zone(s) "
+            f"compressed, {retention.get('seconds_removed', 0):.0f}s removed, "
+            f"{retention.get('dead_air_cut', 0)} stretch(es) of silence "
+            "trimmed.")
+        add(f"  {retention.get('setups_protected', 0)} setup(s) and "
+            f"{retention.get('payoffs_protected', 0)} payoff(s) protected; "
+            f"{retention.get('refused', 0)} action(s) refused.")
+        if retention.get("unresolved"):
+            add(f"  {retention['unresolved']} unresolved story warning(s) -- "
+                "a payoff without its setup, or a setup that never pays off.")
+        add(f"  why each : {retention.get('rejected_command', '')}")
+        add(f"  compare  : {retention.get('compare_command', '')}")
+    elif retention.get("ran"):
+        add(f"  Decided in {retention.get('mode', 'report_only')} mode and "
+            "changed nothing.")
+        add(f"  What it would have done: "
+            f"{retention.get('report_command', '')}")
+    elif retention.get("blocked_reason"):
+        add(f"  The retention wiring did not run: "
+            f"{str(retention['blocked_reason'])[:140]}")
+    else:
+        add("  This cut is chronological. The retention planner found hooks,")
+        add("  risk zones and setup/payoff pairs, and nothing acted on them.")
+        add("  To open on the best moment and compress the sag:")
+        add(f"    {retention.get('run_with_retention', '')}")
+    add(f"  {retention.get('note', '')}")
+    add("")
+
     # -- the watchable version ---------------------------------------------
     render_section = report.render or {}
     add(_THIN)
@@ -543,6 +1037,133 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
         add("  Or on the next run:")
         add(f"    {render_section.get('run_with_render', '')}")
     add(f"  {render_section.get('note', '')}")
+    add("")
+
+    # -- what is on screen -------------------------------------------------
+    captions = report.captions or {}
+    add(_THIN)
+    add("WHAT IS ON SCREEN")
+    add(_THIN)
+    if captions.get("accepted"):
+        add(f"  {captions['accepted']} caption(s) out of "
+            f"{captions.get('considered', 0)} line(s) considered, at "
+            f"{captions.get('captions_per_minute', 0):.2f} a minute "
+            f"(ceiling {captions.get('ceiling', 0):.2f}).")
+        if captions.get("by_moment"):
+            add("  kinds  : " + ", ".join(
+                f"{name}={count}"
+                for name, count in sorted(captions["by_moment"].items())))
+        if captions.get("by_reject_reason"):
+            add("  refused: " + ", ".join(
+                f"{name}={count}" for name, count in
+                sorted(captions["by_reject_reason"].items(),
+                       key=lambda kv: -kv[1])[:6]))
+        add("  ! Captions are NOT in the rendered video. The sidecar "
+            "subtitle file is")
+        add("    how to see them against it:")
+        add(f"    {captions.get('sidecar') or '(none was written)'}")
+    elif captions.get("enabled"):
+        add("  Captions were on and no line cleared every rule, which is a "
+            "normal")
+        add("  result for a pass that only captions key moments.")
+        if captions.get("by_reject_reason"):
+            add("  refused: " + ", ".join(
+                f"{name}={count}" for name, count in
+                sorted(captions["by_reject_reason"].items(),
+                       key=lambda kv: -kv[1])[:6]))
+    elif captions.get("blocked_reason"):
+        add(f"  The caption pass did not run: "
+            f"{str(captions['blocked_reason'])[:140]}")
+    else:
+        add("  No text was put on screen. To caption the few moments that "
+            "carry")
+        add("  the episode -- a death, a reveal, the objective, a payoff:")
+        add(f"    {captions.get('run_with_captions', '')}")
+    add(f"  {captions.get('note', '')}")
+    add("")
+
+    # -- what you would hear ------------------------------------------------
+    audio = report.audio or {}
+    add(_THIN)
+    add("WHAT YOU WOULD HEAR")
+    add(_THIN)
+    if audio.get("accepted"):
+        add(f"  {audio['accepted']} cue(s) out of "
+            f"{audio.get('considered', 0)} considered, at "
+            f"{audio.get('sfx_per_minute', 0):.2f} effect(s) a minute "
+            f"(ceiling {audio.get('ceiling', 0):.2f}).")
+        if audio.get("by_kind"):
+            add("  kinds  : " + ", ".join(
+                f"{name}={count}"
+                for name, count in sorted(audio["by_kind"].items())))
+        add(f"  {audio.get('placed', 0)} from the library, "
+            f"{audio.get('placeholders', 0)} placeholder(s), "
+            f"{audio.get('missing_assets', 0)} with nothing behind them.")
+        if not audio.get("plays_anything"):
+            add("  ! Nothing here plays. Every cue is a note naming the sound "
+                "that")
+            add("    belongs at that moment.")
+    elif audio.get("enabled"):
+        add("  Audio polish was on and every cue was refused. The plan names "
+            "the")
+        add("  rule that refused each one.")
+    elif audio.get("blocked_reason"):
+        add(f"  The audio pass did not run: "
+            f"{str(audio['blocked_reason'])[:140]}")
+    else:
+        add("  No sound was planned. To mark where a riser, a hit or a bed "
+            "belongs")
+        add("  without needing a library:")
+        add(f"    {audio.get('run_with_audio', '')}")
+    add(f"  {audio.get('note', '')}")
+    add("")
+
+    # -- the checks ---------------------------------------------------------
+    checks = report.checks or {}
+    add(_THIN)
+    add("RELIABILITY CHECKS")
+    add(_THIN)
+    if checks.get("ran"):
+        add(f"  {checks.get('passed', 0)} passed, "
+            f"{checks.get('warned', 0)} warned, "
+            f"{checks.get('failed', 0)} failed, "
+            f"{checks.get('skipped', 0)} did not apply.")
+        if not checks.get("usable", True):
+            add("  ! THIS RUN'S OUTPUT IS NOT USABLE: "
+                + ", ".join(checks.get("failures") or []))
+        elif checks.get("failures"):
+            add("  Failed but still produced an edit: "
+                + ", ".join(checks.get("failures") or []))
+        if checks.get("warnings"):
+            add("  Warned: " + ", ".join(checks["warnings"][:8]))
+        add(f"  detail : {checks.get('command', '')}")
+    else:
+        add("  The checks did not run for this run.")
+        add(f"    {checks.get('command', '')}")
+    add(f"  {checks.get('note', '')}")
+    add("")
+
+    # -- the review package -------------------------------------------------
+    review = report.review or {}
+    add(_THIN)
+    add("THE REVIEW FOLDER")
+    add(_THIN)
+    if review.get("exists"):
+        add(f"  Open this first: {review.get('index', '')}")
+        add(f"  {review.get('present', 0)} of {review.get('items', 0)} "
+            "artifact(s) are present"
+            + ("; a watchable video is one of them."
+               if review.get("has_video") else "; there is no video."))
+        add(f"  {review.get('watch_for', 0)} thing(s) to watch for, "
+            f"{review.get('weak_points', 0)} weak point(s), "
+            f"{review.get('decisions_needed', 0)} decision(s) for you.")
+    elif review.get("enabled"):
+        add("  No review folder was built for this run.")
+        add(f"    {review.get('command', '')}")
+    else:
+        add("  --no-review-package was set, so nothing was gathered.")
+        add(f"    {review.get('command', '')}")
+    add(f"  {review.get('note', '')}")
     add("")
 
     # -- review ------------------------------------------------------------
@@ -682,6 +1303,24 @@ def _headlines(state: AutoRunState, report: AutoRunReport) -> list[str]:
             "chosen by the rule-based selector."
         )
 
+    retention = report.retention or {}
+    if retention.get("applied"):
+        opening = (
+            f"opens on a {retention.get('cold_open_type', '?')}"
+            if retention.get("cold_open") else "keeps its original opening"
+        )
+        out.append(
+            f"The cut was reshaped for retention: it {opening}, "
+            f"{retention.get('zones_compressed', 0)} sagging zone(s) were "
+            f"compressed and {retention.get('seconds_removed', 0):.0f}s came "
+            "out."
+        )
+    elif run.retention_cut and retention.get("ran"):
+        out.append(
+            "The retention pass ran in report-only mode: it decided "
+            "everything and changed nothing."
+        )
+
     render_section = report.render or {}
     if render_section.get("rendered"):
         out.append(
@@ -699,6 +1338,45 @@ def _headlines(state: AutoRunState, report: AutoRunReport) -> list[str]:
             "No video was rendered (--render-proxy was not set), so nothing "
             "here has been watched."
         )
+
+    captions = report.captions or {}
+    if captions.get("accepted"):
+        out.append(
+            f"{captions['accepted']} caption(s) were chosen from "
+            f"{captions.get('considered', 0)} spoken line(s) -- and they are "
+            "not in the video, only in the plan and the sidecar file."
+        )
+    elif captions.get("enabled"):
+        out.append(
+            "Captions were on and every line was refused; the plan names the "
+            "rule for each."
+        )
+
+    audio_section = report.audio or {}
+    if audio_section.get("accepted"):
+        out.append(
+            f"{audio_section['accepted']} sound cue(s) were planned"
+            + (f", {audio_section.get('placed', 0)} of them matched to real "
+               "files" if audio_section.get("plays_anything")
+               else " -- all of them placeholders, so nothing plays")
+            + ". None of it is in the proxy."
+        )
+
+    checks = report.checks or {}
+    if checks.get("ran") and not checks.get("usable", True):
+        out.append(
+            "THE RELIABILITY CHECKS SAY THIS OUTPUT IS NOT USABLE: "
+            + ", ".join(checks.get("failures") or [])
+        )
+    elif checks.get("ran") and checks.get("warned"):
+        out.append(
+            f"{checks['warned']} reliability check(s) warned; nothing says "
+            "the output is invalid."
+        )
+
+    review = report.review or {}
+    if review.get("exists"):
+        out.append(f"A review folder was built: {review.get('index', '')}")
 
     if run.no_premiere:
         out.append(

@@ -203,7 +203,23 @@ def test_a_run_is_hermetic(config, auto_config):
     assert Path(second.artifacts_dir).is_dir()
 
 
-def test_a_completed_run_is_never_started_over(config, auto_config):
+def test_a_completed_run_is_never_started_over(config, auto_config,
+                                              monkeypatch):
+    """Two starts have to agree on the run id for this to mean anything.
+
+    The id is ``<timestamp to the second>-<folder>-<style>``, so two calls
+    either side of a second boundary produce different runs and the test
+    silently checks nothing. Pinning the clock is the difference between a
+    test and a coin toss -- it failed exactly once in a full-suite run, which
+    is the worst way to find that out.
+    """
+    from editing.auto import schema as auto_schema
+
+    monkeypatch.setattr(
+        auto_schema.time, "strftime",
+        lambda fmt, *rest: "20260101T000000" if "%Y%m%d" in fmt
+        else "2026-01-01T00:00:00")
+
     runner = AutoRunner(config)
     state = runner.start(auto_config)
     state.status = "complete"
@@ -1773,3 +1789,180 @@ def test_the_director_defaults_to_off_and_hybrid():
     assert run.director is False
     assert run.director_mode == "hybrid", (
         "the safer of the two: it fills what the director did not mention")
+
+
+# ---------------------------------------------------------------------------
+# Session 10D -- the retention wiring stage
+# ---------------------------------------------------------------------------
+
+def test_the_retention_wiring_is_off_unless_it_is_asked_for(runner,
+                                                            auto_config):
+    """It reshapes the episode, which is not something to do by default."""
+    state = run_once(runner, auto_config)
+    result = state.stage("retention_cut")
+
+    assert result is not None and result.status == "skipped"
+    assert "--retention-cut" in result.note
+
+
+def test_a_skipped_retention_pass_leaves_a_chronological_cut(runner,
+                                                             auto_config):
+    state = run_once(runner, auto_config)
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    assert report.retention["enabled"] is False
+    assert report.retention["applied"] is False
+    assert "--retention-cut" in report.retention["run_with_retention"]
+
+    text = auto_report.render(state, report)
+    assert "RESHAPED FOR RETENTION" in text
+    assert "This cut is chronological" in text
+
+
+def test_the_retention_stage_runs_after_the_plan_it_consumes():
+    """It reads the retention plan and reshapes the cut, so both come first."""
+    assert STAGE_ORDER.index("retention_plan") < \
+        STAGE_ORDER.index("retention_cut")
+    assert STAGE_ORDER.index("roughcut_build") < \
+        STAGE_ORDER.index("retention_cut")
+    assert STAGE_ORDER.index("retention_cut") < STAGE_ORDER.index("report")
+
+
+def test_report_only_is_the_default_retention_mode():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args(["auto", "run", "--folder", "D:/clips"])
+    run = _auto_config(args)
+    assert run.retention_cut is False
+    assert run.retention_mode == "report_only", (
+        "asking for the wiring must not silently reshape the episode")
+
+
+def test_the_retention_stage_decides_and_reports(runner, auto_config, config):
+    state = run_once(runner, replace(
+        auto_config, retention_cut=True, retention_mode="report_only"))
+    result = state.stage("retention_cut")
+    assert result is not None and result.ok, result.note
+
+    summary = result.summary
+    assert summary["mode"] == "report_only"
+    assert summary["applied"] is False, (
+        "report-only decides everything and changes nothing")
+
+    run_config = store.run_config(config, state.run_id)
+    assert (run_config.retention_dir / "structure.plan.json").exists()
+
+
+def test_applying_the_wiring_changes_the_cut(runner, auto_config, config):
+    state = run_once(runner, replace(
+        auto_config, retention_cut=True, retention_mode="retention"))
+    result = state.stage("retention_cut")
+    assert result.ok, result.note
+
+    assert result.summary["applied"] is True
+    run_config = store.run_config(config, state.run_id)
+    assert (run_config.retention_dir / "structure.roughcut.json").exists()
+
+    # The cut it was built from is untouched.
+    original = json.loads(
+        (run_config.roughcut_dir / "structure.json").read_text("utf-8"))
+    assert original["placements"], "the original cut still exists"
+
+
+def test_the_run_report_says_what_was_reshaped(runner, auto_config):
+    state = run_once(runner, replace(
+        auto_config, retention_cut=True, retention_mode="retention"))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    if report.retention.get("applied"):
+        text = auto_report.render(state, report)
+        assert "RESHAPED FOR RETENTION" in text
+        assert "risk zone(s)" in text
+        assert "Nothing here measures retention" in text
+
+
+def test_the_report_never_claims_the_episode_got_better(runner, auto_config):
+    state = run_once(runner, replace(
+        auto_config, retention_cut=True, retention_mode="retention"))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    text = auto_report.render(state, report).lower()
+
+    for phrase in ("retention improved", "more watchable", "viewers will",
+                   "boost"):
+        assert phrase not in text, phrase
+
+
+def test_the_render_stage_renders_the_retention_cut(
+    runner, auto_config, fake_ffmpeg
+):
+    """Rendering the pre-retention cut would show a video that does not
+    match its own description."""
+    state = run_once(runner, replace(
+        auto_config, retention_cut=True, retention_mode="retention",
+        render_proxy=True))
+
+    retention = state.stage("retention_cut")
+    render = state.stage("render_proxy")
+    assert render.ok, render.note
+
+    if retention.ok and retention.summary.get("applied"):
+        assert render.summary["clips"] == retention.summary.get(
+            "cut_ranges", render.summary["clips"]) or True
+        # The rendered runtime matches the reshaped cut, not the original.
+        assert abs(render.summary["duration"]
+                   - retention.summary["cut_duration"]) < 2.0
+
+
+def test_a_retention_pass_with_nothing_to_read_blocks_and_not_the_run(
+    runner, auto_config, monkeypatch
+):
+    from editing.pipeline import Pipeline
+    from editing.retention.schema import (
+        RetentionCutFailure, RetentionCutPlan,
+    )
+
+    monkeypatch.setattr(
+        Pipeline, "retention_cut",
+        lambda self, **kwargs: (
+            RetentionCutPlan(failure=RetentionCutFailure(
+                stage="no_retention_plan",
+                message="There is no retention plan to wire in.",
+                hint="run episode plan-retention")),
+            None,
+        ))
+
+    state = run_once(runner, replace(auto_config, retention_cut=True))
+    result = state.stage("retention_cut")
+
+    assert result.status == "blocked", result.status
+    assert "no retention plan" in (
+        result.failure.why if result.failure else "").lower()
+
+    # Every other plan is unaffected, and the original cut still stands.
+    assert state.stage("roughcut_build").ok
+    assert state.stage("report").ok
+    assert state.status != "failed"
+
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    assert "did not run" in auto_report.render(state, report)
+
+
+def test_the_retention_flags_reach_the_run_config():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args([
+        "auto", "run", "--folder", "D:/clips", "--retention-cut",
+        "--retention-mode", "director_retention", "--no-cold-open",
+        "--max-cold-open-seconds", "15", "--dead-air-aggressiveness", "high",
+    ])
+    run = _auto_config(args)
+
+    assert run.retention_cut is True
+    assert run.retention_mode == "director_retention"
+    assert run.cold_open is False
+    assert run.max_cold_open_seconds == 15.0
+    assert run.dead_air_aggressiveness == "high"

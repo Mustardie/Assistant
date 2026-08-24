@@ -20,6 +20,10 @@ Layout::
     recommend/      six layers of edit proposals + a safety pass
     roughcut/       selected ranges -> a validated scratch-sequence plan
     critic/         review frames -> Qwen3-VL critique -> one revision pass
+    polish/         key-moment captions and restrained sound. Plans only
+    reliability/    fifteen checks on whether a run produced a usable thing
+    review/         one folder per run, with an index that reads top to bottom
+    batch/          one configuration over every footage folder under a root
     pipeline.py     the orchestration each CLI command calls into
     cli.py          ``python -m editing.cli``
 

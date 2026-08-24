@@ -358,6 +358,42 @@ def as_str_list(value: Any, limit: int = 40) -> list[str]:
     return out
 
 
+def as_text_list(value: Any, limit: int = 40, width: int = 1000) -> list[str]:
+    """A list of whole sentences, kept whole.
+
+    ``as_str_list`` is for *labels* a model produced: it splits on commas,
+    strips trailing full stops and caps each entry at eighty characters, all
+    of which are right for "creeper, skeleton" and all of which are wrong for
+    "The first 11s was lifted from later in the episode, so check it first."
+
+    This is the one for prose. It de-duplicates and caps the count, and
+    otherwise leaves what it was given alone.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items: list[Any] = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+
+    out: list[str] = []
+    seen = set()
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text[:width])
+        if len(out) >= limit:
+            break
+    return out
+
+
 def as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value

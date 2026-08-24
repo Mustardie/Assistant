@@ -435,6 +435,17 @@ class EditingConfig:
         return self.output_dir / "feedback"
 
     @property
+    def retention_dir(self) -> Path:
+        """Retention cut plans, their reports, and the cuts they produce.
+
+        Its own directory, and the cut it writes goes in here rather than in
+        ``roughcut/``: a retention cut is a *variant* of the cut it was built
+        from, and overwriting the original would mean disagreeing with this
+        pass cost you the cut it was arguing with.
+        """
+        return self.output_dir / "retention"
+
+    @property
     def director_dir(self) -> Path:
         """Director contexts, plans, prompts and comparisons.
 
@@ -460,6 +471,17 @@ class EditingConfig:
         return self.output_dir / "render"
 
     @property
+    def polish_dir(self) -> Path:
+        """Caption and audio polish plans, and the caption sidecar.
+
+        Its own directory for the same reason ``layers_dir`` is: a polish pass
+        is one opinion about what belongs on top of a cut, and re-running it
+        must never be able to overwrite the cut underneath. Everything here is
+        derived and can be rebuilt in a second.
+        """
+        return self.output_dir / "polish"
+
+    @property
     def frames_dir(self) -> Path:
         return self.output_dir / "frames"
 
@@ -475,6 +497,7 @@ class EditingConfig:
             self.roughcut_dir, self.review_dir, self.critic_dir,
             self.layers_dir, self.asset_library_dir, self.episode_dir,
             self.feedback_dir, self.render_dir, self.director_dir,
+            self.retention_dir, self.polish_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

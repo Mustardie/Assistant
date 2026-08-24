@@ -220,6 +220,15 @@ class AutoRunner:
                 store.save(self.config, state)
                 continue
 
+            # The two summarising stages describe the run, so they need its
+            # status to be settled before they read it. Without this the run
+            # report and the review index both open with "running", which is
+            # true for about four milliseconds and misleading afterwards. The
+            # status is recomputed after the loop, so a summarising stage that
+            # blocks still changes the final answer.
+            if name in ("review_package", "report"):
+                state.status = self._final_status(state)
+
             if name == "report":
                 self._run_report(state, pipeline, result)
                 store.save(self.config, state)
@@ -462,6 +471,20 @@ class AutoRunner:
         # ID to tie a review to the run it is about, so it is seeded here
         # rather than widening every runner's signature.
         context["run_id"] = state.run_id
+        # The reliability checks and the review package are *about the run*
+        # rather than about the footage: they read stage summaries, so they
+        # need the state itself rather than another artifact. It is seeded
+        # here rather than widening every runner's signature, and it is the
+        # live object -- a stage that reads it after eight stages have
+        # finished sees those eight.
+        context["run_state"] = state
+        # And the *shared* config, which is not the one the stage runners get.
+        # A stage is handed a pipeline scoped to the run's ``artifacts/``
+        # folder, so asking it where the run folder is answers
+        # ``artifacts/auto/runs/<id>`` -- one level inside the run it is
+        # looking for. Anything that writes beside the artifacts rather than
+        # among them needs this one.
+        context["shared_config"] = self.config
         try:
             shared = build_pipeline(
                 self.config, (self.sampling or SamplingConfig()).validated(),
@@ -504,6 +527,10 @@ class AutoRunner:
         # that has not set one up.
         if not run.director and name in stages_module.DIRECTOR_STAGES:
             return "--director was not set"
+        # Inverted as well: the retention wiring reshapes the episode, and
+        # reshaping somebody's episode is not something to do by default.
+        if not run.retention_cut and name in stages_module.RETENTION_STAGES:
+            return "--retention-cut was not set"
         # Inverted too: rendering is opt-in because it is the only stage
         # that costs minutes of CPU and hundreds of megabytes of disk.
         if not run.render_proxy and name in stages_module.RENDER_STAGES:
@@ -512,6 +539,16 @@ class AutoRunner:
         # because it starts a review a person has to finish.
         if not run.feedback and name in stages_module.FEEDBACK_STAGES:
             return "--feedback was not set"
+        # Inverted too: putting text on somebody's video is not a default.
+        if run.captions == "off" and name in stages_module.CAPTION_STAGES:
+            return "--captions was not set"
+        if run.audio_polish == "off" and name in stages_module.AUDIO_STAGES:
+            return "--audio-polish was not set"
+        # The one late addition that is opt-*out*: it creates nothing, costs a
+        # fraction of a second, and is what makes a run inspectable.
+        if (not run.review_package
+                and name in stages_module.REVIEW_STAGES_PACKAGE):
+            return "--no-review-package was set"
         return ""
 
     @staticmethod

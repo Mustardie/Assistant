@@ -68,6 +68,19 @@ from editing.recommend import report as report_module
 from editing.recommend.planner import PlannerOptions, plan_recommendations
 from editing.recommend.premiere_plan import DraftPlan, build_and_dry_run
 from editing.recommend.schema import RecommendationSet
+from editing.polish import run as polish_run
+from editing.polish import store as polish_store
+from editing.polish.schema import (
+    AudioPolishConfig, AudioPolishPlan, CaptionConfig, CaptionPlan,
+    audio_defaults, caption_defaults,
+)
+from editing.retention import compare as retention_compare
+from editing.retention import report as retention_report
+from editing.retention import run as retention_run
+from editing.retention import store as retention_store
+from editing.retention.schema import (
+    RetentionCutComparison, RetentionCutConfig, RetentionCutPlan,
+)
 from editing.render import notes as render_notes
 from editing.render import report as render_report
 from editing.render import run as render_run
@@ -2397,6 +2410,286 @@ class Pipeline:
             return self.feedback_signals()
         except Exception:  # noqa: BLE001 - an optional input, never a failure
             return []
+
+    # ------------------------------------------------------------------
+    # Retention structure wiring
+    # ------------------------------------------------------------------
+    #
+    # The consumer for Session 8. Reads the retention plan and reshapes a cut
+    # around it: a cold open at the front, sagging stretches compressed,
+    # setups protected, ordinary silence cut harder. Writes a *variant* -- the
+    # cut it read is never touched.
+
+    def retention_config(self, **overrides) -> RetentionCutConfig:
+        """Retention settings from the environment, overridden by kwargs."""
+        base = RetentionCutConfig.from_env()
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if clean:
+            from dataclasses import replace
+            base = replace(base, **clean)
+        return base.validated()
+
+    def retention_cut(
+        self,
+        *,
+        name: str = "structure",
+        settings: Optional[RetentionCutConfig] = None,
+        timeline: Optional[StructureTimeline] = None,
+        memory=None,
+        retention=None,
+        roughcut: Optional[RoughCutPlan] = None,
+        director_plan=None,
+        recommendations: Optional[RecommendationSet] = None,
+        options: Optional[RoughCutOptions] = None,
+        save: bool = True,
+    ) -> tuple:
+        """Build a retention-aware cut. Returns ``(plan, RoughCutPlan|None)``.
+
+        Every input is read from disk when it is not passed in, and a missing
+        one is a *result* rather than an exception -- there is no retention
+        plan on a folder nobody has run ``episode plan-retention`` over, and
+        the honest outcome is a failure record with that command in it.
+        """
+        settings = settings or self.retention_config()
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if recommendations is None:
+            recommendations = self._recommendations_or_none(name)
+        if roughcut is None:
+            roughcut = self._rough_cut_or_none(name)
+        if memory is None:
+            memory = self._episode_memory_or_none(name)
+        if retention is None:
+            retention = self._retention_or_none(name)
+        if director_plan is None and settings.prefers_director:
+            director_plan = self.director_plan_or_none(name=name)
+
+        assets = self.assets or self._assets_or_empty()
+
+        plan, ranges = retention_run.plan(
+            self.config,
+            timeline=timeline,
+            memory=memory,
+            retention=retention,
+            recommendations=recommendations,
+            roughcut=roughcut,
+            director_plan=director_plan,
+            assets=assets,
+            settings=settings,
+            roughcut_options=options,
+            name=name,
+            say=self.say,
+        )
+
+        cut = None
+        if plan.applied:
+            cut = retention_run.to_rough_cut(
+                ranges, timeline, recommendations,
+                assets=assets, options=options,
+                sequence_name="Nova Retention Cut",
+            )
+
+        for warning in plan.warnings[:10]:
+            self.say(f"  ! {warning}")
+        if plan.failure is not None:
+            self.say(f"  x {plan.failure.message}")
+
+        if save:
+            retention_store.save_plan(self.config, plan, name=name)
+            retention_store.save_report(
+                self.config, retention_report.render(plan), name=name)
+            if cut is not None:
+                retention_store.save_roughcut(self.config, cut, name=name)
+        return plan, cut
+
+    def load_retention_cut_plan(
+        self, *, name: str = "structure"
+    ) -> RetentionCutPlan:
+        return retention_store.load_plan(self.config, name=name)
+
+    def retention_cut_plan_or_none(
+        self, *, name: str = "structure"
+    ) -> Optional[RetentionCutPlan]:
+        return retention_store.plan_or_none(self.config, name=name)
+
+    def load_retention_roughcut(
+        self, *, name: str = "structure"
+    ) -> RoughCutPlan:
+        return retention_store.load_roughcut(self.config, name=name)
+
+    def retention_roughcut_or_none(
+        self, *, name: str = "structure"
+    ) -> Optional[RoughCutPlan]:
+        return retention_store.roughcut_or_none(self.config, name=name)
+
+    def retention_report(self, plan: Optional[RetentionCutPlan] = None, *,
+                         name: str = "structure") -> str:
+        plan = plan or self.load_retention_cut_plan(name=name)
+        return retention_report.render(plan)
+
+    def compare_retention(
+        self,
+        *,
+        name: str = "structure",
+        plan: Optional[RetentionCutPlan] = None,
+        options: Optional[RoughCutOptions] = None,
+        save: bool = True,
+    ) -> RetentionCutComparison:
+        """Measure the retention cut against the cut it was built from.
+
+        Counts only. There is deliberately no score and no percentage that
+        could be read as an audience prediction.
+        """
+        plan = plan or self.load_retention_cut_plan(name=name)
+        timeline = self.load_timeline(name=name)
+        recommendations = self._recommendations_or_none(name)
+        roughcut = self._rough_cut_or_none(name)
+        director = (self.director_plan_or_none(name=name)
+                    if plan.base == "director" else None)
+
+        before, _base, _failure = retention_run._base(
+            plan.config, timeline, recommendations, roughcut, director,
+            options or RoughCutOptions(),
+            self.assets or self._assets_or_empty(),
+        )
+
+        after = before
+        cut = self.retention_roughcut_or_none(name=name)
+        if cut is not None:
+            after = retention_run._from_roughcut(cut)
+
+        comparison = retention_compare.compare(
+            plan, before, after, name=name)
+        if save:
+            retention_store.save_comparison(self.config, comparison, name=name)
+        return comparison
+
+    # ------------------------------------------------------------------
+    # Caption and audio polish
+    # ------------------------------------------------------------------
+    #
+    # The little that goes on top of a cut: a few captions for the moments
+    # that carry the episode, and a few sounds for the moments that land.
+    # Neither executes anything, needs a tool, or changes a frame.
+
+    def caption_config(
+        self, style=None, *, mode: str = "off", **overrides
+    ) -> CaptionConfig:
+        """Caption settings: the style's own numbers, then any override.
+
+        The style is the source of truth for word counts and rates, because a
+        preset is a document a person can read and edit. An explicit flag beats
+        it; nothing else does.
+        """
+        style = style or style_presets.get()
+        base = caption_defaults(style, mode)
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if clean:
+            from dataclasses import replace
+            base = replace(base, **clean)
+        return base.validated()
+
+    def audio_polish_config(
+        self, style=None, *, mode: str = "off", **overrides
+    ) -> AudioPolishConfig:
+        """Audio polish settings for one style, then any override."""
+        style = style or style_presets.get()
+        base = audio_defaults(style, mode)
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if clean:
+            from dataclasses import replace
+            base = replace(base, **clean)
+        return base.validated()
+
+    def polish_captions(
+        self,
+        *,
+        name: str = "structure",
+        timeline: Optional[StructureTimeline] = None,
+        cut: Optional[RoughCutPlan] = None,
+        style=None,
+        settings: Optional[CaptionConfig] = None,
+        memory=None,
+        save: bool = True,
+    ) -> CaptionPlan:
+        """Decide which spoken lines earn a caption.
+
+        Every input is read from disk when it is not passed in, and a missing
+        one is a *result* rather than an exception wherever it can be: a run
+        with no transcript produces a plan whose every line is a refusal with
+        a reason, which is more useful than a stack trace.
+        """
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if cut is None:
+            cut = (self.retention_roughcut_or_none(name=name)
+                   or self.load_rough_cut(name=name))
+        style = style or style_presets.get()
+        if memory is None:
+            memory = self._episode_memory_or_none(name)
+        return polish_run.plan_captions(
+            self.config,
+            timeline=timeline, cut=cut, style=style,
+            settings=settings or self.caption_config(style),
+            memory=memory, name=name, save=save, say=self.say,
+        )
+
+    def polish_audio(
+        self,
+        *,
+        name: str = "structure",
+        timeline: Optional[StructureTimeline] = None,
+        cut: Optional[RoughCutPlan] = None,
+        style=None,
+        settings: Optional[AudioPolishConfig] = None,
+        library: Optional[AssetLibrary] = None,
+        save: bool = True,
+    ) -> AudioPolishPlan:
+        """Decide which moments earn a sound."""
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        if cut is None:
+            cut = (self.retention_roughcut_or_none(name=name)
+                   or self.load_rough_cut(name=name))
+        style = style or style_presets.get()
+        settings = settings or self.audio_polish_config(style)
+        if library is None and settings.uses_library:
+            library = self.asset_library_or_empty()
+        return polish_run.plan_audio(
+            self.config,
+            timeline=timeline, cut=cut, style=style, settings=settings,
+            library=library, name=name, save=save, say=self.say,
+        )
+
+    def load_caption_plan(self, *, name: str = "structure") -> CaptionPlan:
+        return polish_store.load_captions(self.config, name=name)
+
+    def caption_plan_or_none(
+        self, *, name: str = "structure"
+    ) -> Optional[CaptionPlan]:
+        return polish_store.captions_or_none(self.config, name=name)
+
+    def load_audio_plan(self, *, name: str = "structure") -> AudioPolishPlan:
+        return polish_store.load_audio(self.config, name=name)
+
+    def audio_plan_or_none(
+        self, *, name: str = "structure"
+    ) -> Optional[AudioPolishPlan]:
+        return polish_store.audio_or_none(self.config, name=name)
+
+    def caption_sidecar_beside(
+        self, video_path: str, *, name: str = "structure", plan=None
+    ) -> Optional[Path]:
+        """Write the caption sidecar next to a rendered video.
+
+        Separate from the render because captions are not burned in and never
+        will be by this package: the sidecar is the honest way to see them
+        against the proxy, and it costs nothing to rewrite.
+        """
+        plan = plan or self.caption_plan_or_none(name=name)
+        if plan is None:
+            return None
+        return polish_run.sidecar_beside(plan, video_path)
 
     # ------------------------------------------------------------------
     # Proxy renders

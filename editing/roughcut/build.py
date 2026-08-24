@@ -8,12 +8,15 @@ actually tunes them.
 **Three ways ranges get chosen**, and only the first existed before Session
 10C:
 
-``heuristic``  ``select_ranges`` -- the thresholds. Always available, and the
-               fallback whenever anything else is not.
-``director``   the ranges a director pass proposed and its safety layer
-               accepted, and nothing else.
-``hybrid``     those ranges, with the heuristic filling every stretch the
-               director said nothing about.
+``heuristic``    ``select_ranges`` -- the thresholds. Always available, and
+                 the fallback whenever anything else is not.
+``director``     the ranges a director pass proposed and its safety layer
+                 accepted, and nothing else.
+``hybrid``       those ranges, with the heuristic filling every stretch the
+                 director said nothing about.
+``preselected``  ranges a caller worked out for itself, handed in whole. What
+                 the retention pass uses, so a cut it reshaped goes through
+                 exactly the same assembly as every other cut.
 
 Everything after selection is identical in all three. The layout arithmetic,
 the operation conversion, the dry run and every execution guard are the same
@@ -78,6 +81,7 @@ def build_rough_cut(
     options: Optional[RoughCutOptions] = None,
     validate: bool = True,
     director_plan=None,
+    preselected: Optional[Sequence] = None,
 ) -> RoughCutPlan:
     """Select, lay out, convert and (by default) dry-run a rough cut.
 
@@ -100,7 +104,8 @@ def build_rough_cut(
     }
 
     ranges, selection_notes = _select(
-        timeline, recommendations, options, durations, director_plan)
+        timeline, recommendations, options, durations, director_plan,
+        preselected)
     # Segments carry the source path, but an explicitly discovered asset list
     # is more authoritative -- it is what was actually probed on disk.
     for entry in ranges:
@@ -138,6 +143,7 @@ def _select(
     options: RoughCutOptions,
     durations: dict,
     director_plan,
+    preselected: Optional[Sequence] = None,
 ) -> tuple:
     """The ranges this cut is built from, and how they were chosen.
 
@@ -156,6 +162,20 @@ def _select(
         )
 
     mode = (options.mode or "heuristic").strip().lower()
+    if mode == "preselected":
+        # A caller that already knows what it wants -- the retention pass.
+        # It still goes through this builder so the assembly, the operations,
+        # the dry run and every execution guard are the same code.
+        if not preselected:
+            return heuristic(), [
+                "Mode 'preselected' was asked for with no ranges, so the "
+                "rule-based selector chose them."
+            ]
+        return list(preselected), [
+            f"Ranges supplied by the caller: {len(preselected)} range(s), "
+            "assembled and validated exactly like any other cut."
+        ]
+
     if mode == "heuristic":
         return heuristic(), ["Ranges chosen by the rule-based selector."]
 

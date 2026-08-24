@@ -18,6 +18,10 @@ Commands, in the order a session normally uses them::
     roughcut    build | dry-run | execute | placements | unconverted | report
     review      export-frames | critique | plan | dry-run | execute --yes |
                 report | show-issues   -- the critic pass over a rough cut
+                package | summary | open-latest   -- and the review folder a
+                finished run leaves behind: one index, five questions
+    polish      captions | audio | show-rejected | show-missing
+                -- key-moment captions and restrained sound. Plans only
     style       list | show <preset>   -- the editing styles available
     layers      build | report | export | dry-run | execute --yes |
                 show-deferred | show-density   -- a styled, layered edit
@@ -25,8 +29,10 @@ Commands, in the order a session normally uses them::
                 plan | dry-run | execute --yes | show-missing | show-deferred
                 -- a local sound/graphic library, and placing from it
     auto        run | status | list-runs | resume | report | show-gates |
-                execute-stage <stage> --yes | clean | explain-failure
-                -- the whole pipeline, checkpointed, with gated execution
+                execute-stage <stage> --yes | clean | explain-failure |
+                show-checks | batch | list-batches | batch-report
+                -- the whole pipeline, checkpointed, with gated execution,
+                over one folder or over every folder under a root
     episode     build-memory | plan-retention | report | show-beats |
                 show-risks | show-hooks | show-open-loops | show-callbacks |
                 export   -- the story the footage tells, and where it sags
@@ -36,6 +42,10 @@ Commands, in the order a session normally uses them::
     render      roughcut | from-plan | show | list | report | notes | open |
                 clean   -- a watchable proxy MP4 of a rough cut, made with
                 FFmpeg. No Premiere, and nothing is executed
+    retention   plan | report | show-cold-open | show-compression |
+                show-protected | show-rejected | compare | render
+                -- wires the retention findings into the cut itself: a cold
+                open, compressed sag, protected setups, harder dead air
     director    build-context | plan | report | show-decisions |
                 show-rejected | show-style | compare-heuristic | render |
                 status | clear-cache   -- a model reads the whole episode and
@@ -87,6 +97,10 @@ from editing.assets.compile import AssetOptions
 from editing.assets.place import PlacementLimits
 from editing.style import presets as style_presets, report as layers_report
 from editing.style.compile import CompileOptions
+from editing.retention import compare as retention_compare
+from editing.retention import report as retention_report
+from editing.retention import schema as retention_schema
+from editing.retention import store as retention_store
 from editing.director import compare as director_compare
 from editing.director import report as director_report
 from editing.director import schema as director_schema
@@ -807,8 +821,15 @@ def _revision_options(args) -> RevisionOptions:
 
 
 def cmd_review(args) -> int:
-    """The critic pass: frames, critique, revisions, dry run, execution."""
+    """The critic pass, and the review package a finished run produces."""
     command = getattr(args, "review_command", None) or "export-frames"
+
+    # The three package commands are about a *run* rather than about the
+    # critic, so they are handled before the pipeline is built: they read a
+    # run folder and never need a model, a bridge or a cache.
+    if command in ("package", "summary", "open-latest"):
+        return _review_package_command(args, command)
+
     pipeline = _pipeline(args)
 
     # -- export-frames ---------------------------------------------------
@@ -1059,6 +1080,124 @@ def _print_revision_plan(revisions, plan, *, limit: int = 30) -> None:
         print(f"\n  ! {plan.dry_run_error.get('error')}")
     for warning in revisions.warnings + plan.warnings:
         print(f"  ! {warning}")
+
+
+def _review_package_command(args, command: str) -> int:
+    """``review package`` / ``summary`` / ``open-latest``.
+
+    All three read a finished run and none of them needs the analysis
+    pipeline, so they share one path and build only what they use.
+    """
+    from editing.reliability import run as reliability_run
+    from editing.review import build as review_build
+    from editing.review import index as review_index
+    from editing.review import store as review_store
+
+    runner = _auto_runner(args)
+    config = runner.config
+
+    # -- package: rebuild it from what is on disk now ---------------------
+    if command == "package":
+        state = runner.resolve(args.run)
+        checks = None
+        if not args.no_checks:
+            checks, _inputs = reliability_run.check_run(config, state)
+        package, written = review_build.write_package(
+            config, state, checks=checks)
+
+        if args.json:
+            _emit({"success": True, "written": [str(p) for p in written],
+                   **package.to_dict()})
+            return EXIT_OK
+        print(review_index.render_summary(package))
+        print()
+        print(f"  Index written to {review_store.index_path(config, state.run_id)}")
+        return EXIT_OK
+
+    # -- summary and open-latest ------------------------------------------
+    run_id = args.run or ""
+    if not run_id:
+        run_id = review_store.latest_with_package(config) or ""
+    if not run_id:
+        # No package anywhere. Fall back to the most recent run and say what
+        # to type, rather than reporting an absence as an error.
+        latest = runner.latest_run_id()
+        if not latest:
+            raise EditingError(
+                "No automated runs exist yet",
+                hint="Start one with `auto run --folder <folder> "
+                     "--style <preset>`.",
+            )
+        raise EditingError(
+            f"No run has a review package yet (most recent run: {latest})",
+            hint=f"Build one with `review package --run {latest}`.",
+            detail={"latest_run": latest},
+        )
+
+    package = review_store.package_or_none(config, run_id)
+    if package is None:
+        raise EditingError(
+            f"Run '{run_id}' has no review package",
+            hint=f"Build one with `review package --run {run_id}`.",
+        )
+
+    index = review_store.index_path(config, run_id)
+    if command == "summary":
+        if args.json:
+            _emit({"success": True, **package.to_dict()})
+            return EXIT_OK
+        print(review_index.render_summary(package))
+        return EXIT_OK
+
+    # -- open-latest -------------------------------------------------------
+    opened = False
+    if not args.print_only:
+        opened = _open_on_desktop(index)
+    if args.json:
+        _emit({"success": True, "run_id": run_id, "index": str(index),
+               "opened": opened, "folder": package.folder})
+        return EXIT_OK
+
+    print(f"Review index for {run_id}")
+    print(f"  {index}")
+    if opened:
+        print("  (opened)")
+        return EXIT_OK
+    if index.exists():
+        print()
+        print(index.read_text(encoding="utf-8"))
+    return EXIT_OK
+
+
+def _open_on_desktop(path) -> bool:
+    """Hand a file to the desktop. False when that is not possible here.
+
+    Never raises and never blocks: a headless machine, an SSH session and a
+    locked-down desktop all return False, and the caller prints the file
+    instead. Failing to open a Markdown file is not an error worth an exit
+    code.
+    """
+    from pathlib import Path as _Path
+
+    target = _Path(path)
+    if not target.exists():
+        return False
+    try:
+        import os
+        import subprocess
+        import sys
+
+        if sys.platform.startswith("win"):
+            os.startfile(str(target))  # noqa: S606 - a local file this wrote
+            return True
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        subprocess.Popen(  # noqa: S603 - fixed argv, path from this system
+            [opener, str(target)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception:  # noqa: BLE001 - not opening a file is not a failure
+        return False
 
 
 def cmd_style(args) -> int:
@@ -1707,9 +1846,32 @@ def _auto_config(args) -> AutoRunConfig:
         director_backend=getattr(args, "director_backend", "") or "",
         style_guide=getattr(args, "style_guide", "") or "",
         target_duration=float(getattr(args, "target_duration", 0.0) or 0.0),
+        retention_cut=getattr(args, "retention_cut", False),
+        retention_mode=getattr(args, "retention_mode", "") or "report_only",
+        cold_open=not getattr(args, "no_cold_open", False),
+        max_cold_open_seconds=float(
+            getattr(args, "max_cold_open_seconds", 0.0) or 0.0),
+        dead_air_aggressiveness=getattr(
+            args, "dead_air_aggressiveness", "") or "",
         render_proxy=getattr(args, "render_proxy", False),
         render_quality=getattr(args, "render_quality", "") or "",
         render_height=int(getattr(args, "render_height", 0) or 0),
+        captions=getattr(args, "captions", "") or "off",
+        max_captions_per_minute=float(
+            getattr(args, "max_captions_per_minute", 0.0) or 0.0),
+        max_caption_seconds=float(
+            getattr(args, "max_caption_seconds", 0.0) or 0.0),
+        max_caption_words=int(getattr(args, "max_caption_words", 0) or 0),
+        min_caption_confidence=float(
+            getattr(args, "min_caption_confidence", 0.0) or 0.0),
+        require_caption_confidence=getattr(
+            args, "require_caption_confidence", False),
+        audio_polish=getattr(args, "audio_polish", "") or "off",
+        max_sfx_per_minute=float(
+            getattr(args, "max_sfx_per_minute", 0.0) or 0.0),
+        music_bed=not getattr(args, "no_music_bed", False),
+        ducking=not getattr(args, "no_ducking", False),
+        review_package=not getattr(args, "no_review_package", False),
     )
 
 
@@ -1854,6 +2016,112 @@ def cmd_auto(args) -> int:
             print(f"  next     : {result['next_command']}")
         return EXIT_OK if result.get("success") else EXIT_ERROR
 
+    # -- show-checks ------------------------------------------------------
+    if command == "show-checks":
+        from editing.reliability import report as gate_report
+        from editing.reliability import run as reliability_run
+        from editing.reliability.schema import GateReport
+
+        state = runner.resolve(args.run)
+        report = None
+        if not args.rebuild:
+            stored = reliability_run.report_path(runner.config, state.run_id)
+            if stored is not None and stored.exists():
+                try:
+                    report = GateReport.from_dict(
+                        json.loads(stored.read_text(encoding="utf-8")))
+                except (OSError, json.JSONDecodeError):
+                    report = None
+        if report is None:
+            # Re-evaluating is always safe: the checks read files and stage
+            # summaries and change nothing.
+            report, _inputs = reliability_run.check_run(runner.config, state)
+
+        if args.json:
+            _emit({"success": True, **report.to_dict()})
+            return EXIT_OK
+        print(gate_report.render(report))
+        return EXIT_OK
+
+    # -- batch ------------------------------------------------------------
+    if command == "batch":
+        from editing.batch import report as batch_report
+        from editing.batch import run as batch_run
+        from editing.batch.schema import BatchConfig
+
+        batch = BatchConfig(
+            root=str(args.root),
+            style=args.style,
+            name=args.name,
+            limit=int(args.limit or 0),
+            only_new=args.only_new,
+            resume=args.resume,
+            force=args.force,
+            dry_run=args.dry_run,
+            recursive=not args.no_recursive,
+            director=args.director,
+            retention_cut=args.retention_cut,
+            render_proxy=args.render_proxy,
+            no_premiere=getattr(args, "no_premiere", False),
+            mock=args.mock,
+            transcribe=args.transcribe,
+            captions=args.captions,
+            audio_polish=args.audio_polish,
+        )
+        summary = batch_run.run_batch(
+            runner.config, batch, runner=runner, say=_reporter(args))
+
+        if args.json:
+            _emit({"success": not summary.failed, **summary.to_dict()})
+            # A batch with failures still exits 0: the useful outcome is the
+            # folders that worked, and the summary names the ones that did not.
+            return EXIT_OK
+        print(batch_report.render(summary, limit=args.limit or 60))
+        return EXIT_OK
+
+    # -- list-batches -----------------------------------------------------
+    if command == "list-batches":
+        from editing.batch import store as batch_store
+
+        batches = batch_store.list_batches(runner.config, limit=args.limit)
+        if args.json:
+            _emit({"success": True, "count": len(batches),
+                   "batches": batches})
+            return EXIT_OK
+        if not batches:
+            print("No batches yet. Start one with:")
+            print("  python -m editing.cli auto batch --root <folder> "
+                  "--dry-run")
+            return EXIT_OK
+        print(f"{len(batches)} batch(es), newest first:\n")
+        for entry in batches:
+            print(f"  {entry['batch_id']:<44} {entry.get('status', '?')}")
+            print(f"      {entry.get('completed', 0)} completed, "
+                  f"{entry.get('failed', 0)} failed, "
+                  f"{entry.get('skipped', 0)} skipped   "
+                  f"style {entry.get('style', '?')}")
+            if entry.get("root"):
+                print(f"      {entry['root']}")
+        return EXIT_OK
+
+    # -- batch-report -----------------------------------------------------
+    if command == "batch-report":
+        from editing.batch import report as batch_report
+        from editing.batch import store as batch_store
+
+        batch_id = args.batch or batch_store.latest_batch_id(runner.config)
+        if not batch_id:
+            raise EditingError(
+                "No batches exist yet",
+                hint="Start one with `auto batch --root <folder> --dry-run`.",
+            )
+        summary = batch_store.load(runner.config, batch_id)
+        if args.json:
+            _emit({"success": True, **summary.to_dict()})
+            return EXIT_OK
+        print(batch_report.render(summary, limit=args.limit))
+        return EXIT_OK
+
     # -- explain-failure --------------------------------------------------
     if command == "explain-failure":
         state = runner.resolve(args.run)
@@ -1943,6 +2211,100 @@ def _print_roughcut(plan, *, limit: int = 30) -> None:
         print("\n  Warnings:")
         for warning in plan.warnings:
             print(f"    ! {warning}")
+
+
+def cmd_polish(args) -> int:
+    """Caption and audio polish: plan them, read them, see what was refused."""
+    from editing.polish import report as polish_report
+
+    command = args.polish_command
+    pipeline = _run_scoped_pipeline(args)
+    style = style_presets.get(args.style) if args.style else style_presets.get()
+
+    # -- captions ---------------------------------------------------------
+    if command == "captions":
+        if args.report:
+            plan = pipeline.load_caption_plan(name=args.name)
+        else:
+            settings = pipeline.caption_config(
+                style, mode=args.captions,
+                max_per_minute=(args.max_captions_per_minute or None),
+                max_seconds=(args.max_caption_seconds or None),
+                max_words=(args.max_caption_words or None),
+                min_confidence=(args.min_caption_confidence or None),
+                require_confidence=(args.require_caption_confidence or None),
+            )
+            plan = pipeline.polish_captions(
+                name=args.name, style=style, settings=settings)
+
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        print(polish_report.render_captions(plan, limit=args.limit))
+        return EXIT_OK
+
+    # -- audio ------------------------------------------------------------
+    if command == "audio":
+        if args.report:
+            plan = pipeline.load_audio_plan(name=args.name)
+        else:
+            settings = pipeline.audio_polish_config(
+                style, mode=args.audio_polish,
+                max_sfx_per_minute=(args.max_sfx_per_minute or None),
+                music_bed=(False if args.no_music_bed else None),
+                ducking=(False if args.no_ducking else None),
+            )
+            plan = pipeline.polish_audio(
+                name=args.name, style=style, settings=settings)
+
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        print(polish_report.render_audio(plan, limit=args.limit))
+        return EXIT_OK
+
+    # -- show-rejected ----------------------------------------------------
+    if command == "show-rejected":
+        plan = pipeline.load_caption_plan(name=args.name)
+        rejected = plan.rejected
+        if args.reason:
+            rejected = [d for d in rejected if d.reject_reason == args.reason]
+        if args.json:
+            _emit({"success": True, "count": len(rejected),
+                   "rejected": [d.to_dict() for d in rejected[:args.limit]]})
+            return EXIT_OK
+        print(f"{len(rejected)} line(s) were refused a caption:\n")
+        for decision in rejected[:args.limit]:
+            print(f"  {decision.line()}")
+        if len(rejected) > args.limit:
+            print(f"  ... and {len(rejected) - args.limit} more.")
+        print("\n  by reason:")
+        for code, count in sorted(
+            plan.by_reject_reason().items(), key=lambda kv: -kv[1]
+        ):
+            print(f"    {count:>4}  {code}")
+        return EXIT_OK
+
+    # -- show-missing -----------------------------------------------------
+    if command == "show-missing":
+        plan = pipeline.load_audio_plan(name=args.name)
+        shopping = plan.shopping_list()
+        if args.json:
+            _emit({"success": True, "count": len(shopping),
+                   "missing": shopping})
+            return EXIT_OK
+        if not shopping:
+            print("Nothing is missing: every planned cue has a file behind "
+                  "it, or the plan is placeholders-only by design.")
+            return EXIT_OK
+        print(f"{len(shopping)} sound(s) to go and find:\n")
+        for entry in shopping[:args.limit]:
+            print(f"  {entry['count']:>3} x {entry['placeholder']}")
+            print(f"        kind {entry['kind']}, first needed at "
+                  f"{entry['first_at']:.0f}s")
+        return EXIT_OK
+
+    raise EditingError("Unknown polish command")
 
 
 def cmd_episode(args) -> int:
@@ -2289,6 +2651,143 @@ def _render_batch(batch, *, limit: int = 40) -> str:
     for warning in batch.warnings:
         lines.append(f"  ! {warning}")
     return "\n".join(lines)
+
+
+def cmd_retention(args) -> int:
+    """Wire the retention findings into the cut.
+
+    Eight subcommands. None touches Premiere, executes anything, or modifies
+    the cut it reads -- a retention cut is written as a variant under its own
+    name.
+    """
+    pipeline = _run_scoped_pipeline(args)
+    command = args.retention_command
+    name = getattr(args, "name", "structure") or "structure"
+
+    settings = pipeline.retention_config(
+        mode=getattr(args, "mode", None),
+        cold_open=(False if getattr(args, "no_cold_open", False) else None),
+        max_cold_open_seconds=getattr(args, "max_cold_open_seconds", None),
+        min_cold_open_seconds=getattr(args, "min_cold_open_seconds", None),
+        duplicate_policy=getattr(args, "duplicate_policy", None),
+        allow_duplicate_footage=(
+            True if getattr(args, "allow_duplicates", False) else None),
+        compress_sag=(
+            False if getattr(args, "no_compress", False) else None),
+        grind_speed=getattr(args, "grind_speed", None),
+        dead_air_aggressiveness=getattr(args, "dead_air", None),
+        max_ordinary_silence=getattr(args, "max_silence", None),
+        kill_dead_air=(
+            False if getattr(args, "keep_dead_air", False) else None),
+        protect_setups=(
+            False if getattr(args, "no_protect", False) else None),
+        max_compression_share=getattr(args, "max_compression", None),
+        target_duration=getattr(args, "target", None),
+        max_duration=getattr(args, "max_duration", None),
+        style=getattr(args, "style", None),
+    )
+
+    if command == "plan":
+        plan, cut = pipeline.retention_cut(
+            name=name, settings=settings, options=_roughcut_options(args))
+        if args.json:
+            _emit({
+                "success": plan.ok,
+                "applied": plan.applied,
+                "cut": cut.to_dict() if cut is not None else None,
+                **plan.to_dict(),
+            })
+        else:
+            print(retention_report.render(plan))
+        return EXIT_OK if plan.ok else EXIT_ERROR
+
+    if command == "report":
+        plan = pipeline.load_retention_cut_plan(name=name)
+        if args.json:
+            _emit({"success": plan.ok, **plan.to_dict()})
+            return EXIT_OK
+        print(retention_report.render(plan))
+        return EXIT_OK
+
+    if command == "show-cold-open":
+        plan = pipeline.load_retention_cut_plan(name=name)
+        if args.json:
+            _emit({"success": True, **plan.cold_open.to_dict()})
+            return EXIT_OK
+        print(retention_report.render_cold_open(plan))
+        return EXIT_OK
+
+    if command == "show-compression":
+        plan = pipeline.load_retention_cut_plan(name=name)
+        if args.json:
+            _emit({"success": True, **plan.sag.to_dict()})
+            return EXIT_OK
+        print(retention_report.render_compression(plan, limit=args.limit))
+        return EXIT_OK
+
+    if command == "show-protected":
+        plan = pipeline.load_retention_cut_plan(name=name)
+        if args.json:
+            _emit({
+                "success": True,
+                "setups": [item.to_dict() for item in plan.setups],
+                "payoffs": [item.to_dict() for item in plan.payoffs],
+                "unresolved": plan.unresolved_warnings,
+            })
+            return EXIT_OK
+        print(retention_report.render_protected(plan))
+        return EXIT_OK
+
+    if command == "show-rejected":
+        plan = pipeline.load_retention_cut_plan(name=name)
+        if args.json:
+            _emit({
+                "success": True,
+                "count": len(plan.rejected),
+                "rejected": [item.to_dict() for item in plan.rejected],
+            })
+            return EXIT_OK
+        print(retention_report.render_rejected(plan, limit=args.limit))
+        return EXIT_OK
+
+    if command == "compare":
+        comparison = pipeline.compare_retention(
+            name=name, options=_roughcut_options(args))
+        if args.json:
+            _emit({"success": True, **comparison.to_dict()})
+            return EXIT_OK
+        print(retention_compare.render(comparison))
+        return EXIT_OK
+
+    if command == "render":
+        # The retention cut, through the Session 10B renderer. Two verbs on
+        # purpose: reshaping the cut and rendering it are separate decisions,
+        # and you should be able to re-render without re-deciding.
+        cut = pipeline.retention_roughcut_or_none(name=name)
+        if cut is None:
+            raise EditingError(
+                f"There is no retention cut for '{name}' to render",
+                hint="Build one with `python -m editing.cli retention plan "
+                     "--mode retention`. In report-only mode nothing is "
+                     "written, because nothing changed.",
+            )
+        render_settings = pipeline.render_config(
+            quality=getattr(args, "quality", None),
+            height=getattr(args, "height", None),
+            backend=("mock" if getattr(args, "mock", False) else None),
+        )
+        job = pipeline.render_roughcut(
+            name=name, plan=cut, settings=render_settings,
+            force=getattr(args, "force", False),
+        )
+        if args.json:
+            _emit({"success": job.ok, "clips": len(cut.placements),
+                   **job.to_dict()})
+        else:
+            print(render_report.render_text(job))
+        return EXIT_OK if job.ok else EXIT_ERROR
+
+    raise EditingError("Unknown retention command")
 
 
 def cmd_director(args) -> int:
@@ -3393,6 +3892,57 @@ def _add_review_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=40)
 
 
+def _add_polish(parser: argparse.ArgumentParser) -> None:
+    """Caption and audio polish flags, shared by ``auto run`` and ``batch``.
+
+    Defined once so the two cannot drift: a batch that spelled ``--captions``
+    differently from a single run would be a batch nobody could reproduce by
+    hand.
+    """
+    from editing.polish import schema as polish_schema
+
+    group = parser.add_argument_group("polish")
+    group.add_argument(
+        "--captions", default="off", choices=list(polish_schema.CAPTION_MODES),
+        help="key_moments captions only the moments that carry the episode; "
+             "dense is close to subtitles and is never a default")
+    group.add_argument(
+        "--max-captions-per-minute", dest="max_captions_per_minute",
+        type=float, default=0.0,
+        help="ceiling on captions a minute (0 = the style's own number)")
+    group.add_argument(
+        "--max-caption-seconds", dest="max_caption_seconds", type=float,
+        default=0.0, help="longest a caption may stay up (0 = the style's)")
+    group.add_argument(
+        "--max-caption-words", dest="max_caption_words", type=int, default=0,
+        help="words a caption may carry (0 = the style's own number)")
+    group.add_argument(
+        "--min-caption-confidence", dest="min_caption_confidence", type=float,
+        default=0.0,
+        help="ASR confidence a line needs to be captioned (0 = default 0.6)")
+    group.add_argument(
+        "--require-caption-confidence", dest="require_caption_confidence",
+        action="store_true",
+        help="refuse lines from a transcript that carries no confidence "
+             "figures at all")
+    group.add_argument(
+        "--audio-polish", dest="audio_polish", default="off",
+        choices=list(polish_schema.AUDIO_POLISH_MODES),
+        help="placeholders marks where sound belongs and needs no library; "
+             "assets matches against the local one and reports what is "
+             "missing")
+    group.add_argument(
+        "--max-sfx-per-minute", dest="max_sfx_per_minute", type=float,
+        default=0.0,
+        help="ceiling on effects a minute (0 = the style's own number)")
+    group.add_argument(
+        "--no-music-bed", dest="no_music_bed", action="store_true",
+        help="never lay a music or ambience bed")
+    group.add_argument(
+        "--no-ducking", dest="no_ducking", action="store_true",
+        help="do not ask for the bed to duck under speech")
+
+
 def _add_model(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("model")
     group.add_argument("--backend", choices=sorted(set(qwen.BACKENDS) | {"mock"}),
@@ -3752,6 +4302,41 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(rv_report)
     rv_report.set_defaults(func=cmd_review)
 
+    rv_package = review_subs.add_parser(
+        "package",
+        help="gather one run into a review folder with an index. Rebuilds it "
+             "from what is on disk now")
+    rv_package.add_argument("--run", help="run id (default: the most recent)")
+    rv_package.add_argument(
+        "--no-checks", dest="no_checks", action="store_true",
+        help="skip the reliability checks rather than running them fresh")
+    rv_package.add_argument("--limit", type=int, default=40)
+    _add_common(rv_package)
+    rv_package.set_defaults(func=cmd_review)
+
+    rv_summary = review_subs.add_parser(
+        "summary",
+        help="what one run produced, what to watch for, and what needs you")
+    rv_summary.add_argument("--run", help="run id")
+    rv_summary.add_argument(
+        "--latest", action="store_true",
+        help="the most recent run with a review package (the default when no "
+             "--run is given)")
+    rv_summary.add_argument("--limit", type=int, default=40)
+    _add_common(rv_summary)
+    rv_summary.set_defaults(func=cmd_review)
+
+    rv_open = review_subs.add_parser(
+        "open-latest",
+        help="print the newest review index, and open it if the desktop can")
+    rv_open.add_argument("--run", help="run id (default: the most recent)")
+    rv_open.add_argument(
+        "--print", dest="print_only", action="store_true",
+        help="print the index rather than handing it to the desktop")
+    rv_open.add_argument("--limit", type=int, default=40)
+    _add_common(rv_open)
+    rv_open.set_defaults(func=cmd_review)
+
     rv_issues = review_subs.add_parser(
         "show-issues", help="one line per issue, worst first")
     rv_issues.add_argument("--name", default="structure")
@@ -4066,6 +4651,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-duration", dest="target_duration", type=float, default=0.0,
         help="runtime the director should aim at, in seconds")
     au_run.add_argument(
+        "--retention-cut", dest="retention_cut", action="store_true",
+        help="reshape the cut around the retention findings: a cold open, "
+             "compressed sag, protected setups, harder dead air")
+    au_run.add_argument(
+        "--retention-mode", dest="retention_mode", default="report_only",
+        choices=list(retention_schema.MODES),
+        help="report_only decides everything and changes nothing (default)")
+    au_run.add_argument(
+        "--no-cold-open", dest="no_cold_open", action="store_true",
+        help="leave the opening where it is")
+    au_run.add_argument(
+        "--max-cold-open-seconds", dest="max_cold_open_seconds", type=float,
+        default=0.0, help="ceiling on the opening, in seconds")
+    au_run.add_argument(
+        "--dead-air-aggressiveness", dest="dead_air_aggressiveness",
+        default="", choices=[""] + list(retention_schema.AGGRESSIVENESS),
+        help="how hard ordinary silence is cut")
+    au_run.add_argument(
         "--render-proxy", dest="render_proxy", action="store_true",
         help="render a watchable proxy MP4 of the rough cut with FFmpeg "
              "(off by default: minutes of CPU and hundreds of MB)")
@@ -4080,6 +4683,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--feedback", action="store_true",
         help="open a review session and build its queue at the end of the run "
              "(off by default: it starts a review a person has to finish)")
+    au_run.add_argument(
+        "--no-review-package", dest="no_review_package", action="store_true",
+        help="do not gather this run into a review folder. On by default: it "
+             "creates nothing new and is what makes a run inspectable")
+    _add_polish(au_run)
     au_run.add_argument("--skip-assets", action="store_true",
                         help="skip the asset pass entirely")
     au_run.add_argument("--force-new-run", action="store_true",
@@ -4152,6 +4760,74 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(au_exec)
     au_exec.set_defaults(func=cmd_auto)
 
+    au_checks = auto_subs.add_parser(
+        "show-checks",
+        help="the reliability checks: what passed, warned and failed")
+    _add_run_ref(au_checks)
+    au_checks.add_argument(
+        "--rebuild", action="store_true",
+        help="re-evaluate the checks now rather than reading the run's stored "
+             "answers")
+    au_checks.add_argument("--limit", type=int, default=40)
+    _add_common(au_checks)
+    au_checks.set_defaults(func=cmd_auto)
+
+    au_batch = auto_subs.add_parser(
+        "batch",
+        help="run every footage folder under a root, one after the other")
+    au_batch.add_argument("--root", required=True,
+                          help="folder holding your episode folders")
+    au_batch.add_argument("--style", default=style_presets.DEFAULT_PRESET,
+                          choices=style_presets.names())
+    au_batch.add_argument("--name", default="structure")
+    au_batch.add_argument(
+        "--limit", type=int, default=0,
+        help="process at most this many folders (0 = all of them)")
+    au_batch.add_argument(
+        "--only-new", dest="only_new", action="store_true",
+        help="only folders that have never been run at all")
+    au_batch.add_argument(
+        "--resume", action="store_true",
+        help="continue runs that did not finish, instead of skipping them")
+    au_batch.add_argument(
+        "--force", action="store_true",
+        help="run folders that already completed. Each gets a new run folder; "
+             "nothing is ever overwritten")
+    au_batch.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="say what would happen and create nothing")
+    au_batch.add_argument("--no-recursive", action="store_true")
+    au_batch.add_argument("--mock", action="store_true",
+                          help="mock the vision model and the critic")
+    au_batch.add_argument("--transcribe", action="store_true")
+    au_batch.add_argument(
+        "--director", action="store_true",
+        help="have a model choose each cut (needs a model endpoint)")
+    au_batch.add_argument(
+        "--retention-cut", dest="retention_cut", action="store_true",
+        help="reshape each cut around its retention findings")
+    au_batch.add_argument(
+        "--render-proxy", dest="render_proxy", action="store_true",
+        help="render a watchable proxy for each folder")
+    _add_polish(au_batch)
+    _add_model(au_batch)
+    _add_common(au_batch)
+    au_batch.set_defaults(func=cmd_auto)
+
+    au_batches = auto_subs.add_parser(
+        "list-batches", help="recent batches, newest first")
+    au_batches.add_argument("--limit", type=int, default=25)
+    _add_common(au_batches)
+    au_batches.set_defaults(func=cmd_auto)
+
+    au_batch_report = auto_subs.add_parser(
+        "batch-report", help="the full summary for one batch")
+    au_batch_report.add_argument(
+        "--batch", help="batch id (default: the most recent batch)")
+    au_batch_report.add_argument("--limit", type=int, default=60)
+    _add_common(au_batch_report)
+    au_batch_report.set_defaults(func=cmd_auto)
+
     au_why = auto_subs.add_parser(
         "explain-failure",
         help="every failed and blocked stage, with the command for each")
@@ -4171,6 +4847,60 @@ def build_parser() -> argparse.ArgumentParser:
     au_clean.add_argument("--limit", type=int, default=40)
     _add_common(au_clean)
     au_clean.set_defaults(func=cmd_auto)
+
+    # -- polish ----------------------------------------------------------
+    polish = subparsers.add_parser(
+        "polish",
+        help="key-moment captions and restrained sound. Plans only; nothing "
+             "is drawn, played or executed",
+    )
+    polish_subs = polish.add_subparsers(dest="polish_command", required=True)
+
+    def _add_polish_ref(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--name", default="structure")
+        parser.add_argument(
+            "--run", help="read and write inside this auto run's artifacts")
+        parser.add_argument(
+            "--style", choices=style_presets.names(),
+            help="style preset whose caption and sound numbers to use")
+        parser.add_argument("--limit", type=int, default=40)
+
+    po_cap = polish_subs.add_parser(
+        "captions", help="choose the few lines worth putting on screen")
+    _add_polish_ref(po_cap)
+    po_cap.add_argument(
+        "--report", action="store_true",
+        help="print the existing plan rather than building a new one")
+    _add_polish(po_cap)
+    _add_common(po_cap)
+    po_cap.set_defaults(func=cmd_polish)
+
+    po_audio = polish_subs.add_parser(
+        "audio", help="mark the few moments that earn a sound")
+    _add_polish_ref(po_audio)
+    po_audio.add_argument(
+        "--report", action="store_true",
+        help="print the existing plan rather than building a new one")
+    _add_polish(po_audio)
+    _add_common(po_audio)
+    po_audio.set_defaults(func=cmd_polish)
+
+    po_rej = polish_subs.add_parser(
+        "show-rejected",
+        help="every line that was refused a caption, and the rule that "
+             "refused it")
+    _add_polish_ref(po_rej)
+    po_rej.add_argument(
+        "--reason", help="only this refusal code (see the plan's summary)")
+    _add_common(po_rej)
+    po_rej.set_defaults(func=cmd_polish)
+
+    po_miss = polish_subs.add_parser(
+        "show-missing",
+        help="the sounds a plan asked for and could not find: a shopping list")
+    _add_polish_ref(po_miss)
+    _add_common(po_miss)
+    po_miss.set_defaults(func=cmd_polish)
 
     # -- episode ---------------------------------------------------------
     episode = subparsers.add_parser(
@@ -4374,6 +5104,131 @@ def build_parser() -> argparse.ArgumentParser:
     for transcribe_parser in (tr_file, tr_folder, tr_status, tr_show,
                               tr_export, tr_clear):
         transcribe_parser.set_defaults(func=cmd_transcribe)
+
+    # -- retention --------------------------------------------------------
+    retention = subparsers.add_parser(
+        "retention",
+        help="wire the retention findings into the cut: a cold open, "
+             "compressed sag, protected setups, harder dead air",
+    )
+    retention_subs = retention.add_subparsers(
+        dest="retention_command", required=True)
+
+    def _add_retention_args(parser: argparse.ArgumentParser) -> None:
+        group = parser.add_argument_group("retention")
+        group.add_argument(
+            "--mode", default=None, choices=list(retention_schema.MODES),
+            help="report_only decides everything and changes nothing "
+                 "(default); retention applies on the rule-based cut; "
+                 "director_retention on the director's")
+        group.add_argument("--no-cold-open", dest="no_cold_open",
+                           action="store_true",
+                           help="leave the opening where it is")
+        group.add_argument(
+            "--max-cold-open-seconds", dest="max_cold_open_seconds",
+            type=float, default=None, help="ceiling on the opening (default 20)")
+        group.add_argument(
+            "--min-cold-open-seconds", dest="min_cold_open_seconds",
+            type=float, default=None, help="floor on the opening (default 5)")
+        group.add_argument(
+            "--duplicate-policy", dest="duplicate_policy", default=None,
+            choices=list(retention_schema.DUPLICATE_POLICIES),
+            help="what happens to the footage the opening was lifted from "
+                 "(default remove)")
+        group.add_argument(
+            "--allow-duplicates", dest="allow_duplicates",
+            action="store_true",
+            help="let the opening play twice, as a deliberate teaser")
+        group.add_argument("--no-compress", dest="no_compress",
+                           action="store_true",
+                           help="mark sagging stretches instead of cutting")
+        group.add_argument(
+            "--grind-speed", dest="grind_speed", type=float, default=None,
+            help="playback rate for a sped-up sag (default 2.0)")
+        group.add_argument(
+            "--dead-air-aggressiveness", dest="dead_air", default=None,
+            choices=list(retention_schema.AGGRESSIVENESS),
+            help="how hard ordinary silence is cut (default medium)")
+        group.add_argument(
+            "--max-silence", dest="max_silence", type=float, default=None,
+            help="seconds of purposeless silence tolerated, overriding the "
+                 "aggressiveness setting")
+        group.add_argument("--keep-dead-air", dest="keep_dead_air",
+                           action="store_true",
+                           help="do not touch silence at all")
+        group.add_argument("--no-protect", dest="no_protect",
+                           action="store_true",
+                           help="do not protect setups (rarely what you want)")
+        group.add_argument(
+            "--max-compression", dest="max_compression", type=float,
+            default=None,
+            help="ceiling on how much of the cut compression may remove, 0..1")
+        group.add_argument("--target", type=float, default=None,
+                           help="runtime to aim at, in seconds")
+        group.add_argument("--max-duration", dest="max_duration", type=float,
+                           default=None, help="hard maximum runtime")
+        group.add_argument("--style", default=None,
+                           choices=style_presets.names())
+
+    rt_plan = retention_subs.add_parser(
+        "plan", help="decide the retention edits, and apply them if asked")
+    rt_plan.add_argument("--name", default="structure")
+    _add_retention_args(rt_plan)
+    _add_common(rt_plan)
+
+    rt_report = retention_subs.add_parser(
+        "report", help="the full report for the current retention cut")
+    rt_report.add_argument("--name", default="structure")
+    _add_common(rt_report)
+
+    rt_cold = retention_subs.add_parser(
+        "show-cold-open", help="the opening, and every candidate refused")
+    rt_cold.add_argument("--name", default="structure")
+    _add_common(rt_cold)
+
+    rt_comp = retention_subs.add_parser(
+        "show-compression", help="every risk zone and what happened to it")
+    rt_comp.add_argument("--name", default="structure")
+    rt_comp.add_argument("--limit", type=int, default=40)
+    _add_common(rt_comp)
+
+    rt_prot = retention_subs.add_parser(
+        "show-protected", help="what nothing may touch, and why")
+    rt_prot.add_argument("--name", default="structure")
+    _add_common(rt_prot)
+
+    rt_rej = retention_subs.add_parser(
+        "show-rejected", help="every refused retention action, with the rule")
+    rt_rej.add_argument("--name", default="structure")
+    rt_rej.add_argument("--limit", type=int, default=60)
+    _add_common(rt_rej)
+
+    rt_cmp = retention_subs.add_parser(
+        "compare", help="the retention cut against the cut it was built from")
+    rt_cmp.add_argument("--name", default="structure")
+    rt_cmp.add_argument("--keep-threshold", type=float, default=None)
+    rt_cmp.add_argument("--filler-speed", type=float, default=None)
+    rt_cmp.add_argument("--handle", type=float, default=None)
+    rt_cmp.add_argument("--drop-filler", action="store_true")
+    _add_common(rt_cmp)
+
+    rt_render = retention_subs.add_parser(
+        "render", help="render the retention cut to a proxy")
+    rt_render.add_argument("--name", default="structure")
+    rt_render.add_argument("--quality", default=None,
+                           choices=list(render_schema.QUALITIES))
+    rt_render.add_argument("--height", type=int, default=None)
+    rt_render.add_argument("--force", action="store_true")
+    rt_render.add_argument("--mock", action="store_true",
+                           help="write a placeholder instead of a video")
+    _add_common(rt_render)
+
+    for retention_parser in (rt_plan, rt_report, rt_cold, rt_comp, rt_prot,
+                             rt_rej, rt_cmp, rt_render):
+        retention_parser.add_argument(
+            "--run", default="",
+            help="scope to one auto run's artifacts")
+        retention_parser.set_defaults(func=cmd_retention)
 
     # -- director ---------------------------------------------------------
     director = subparsers.add_parser(

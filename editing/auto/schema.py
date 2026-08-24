@@ -57,10 +57,20 @@ STAGE_ORDER = (
     "assets_dry_run",
     "episode_memory",
     "retention_plan",
+    "retention_cut",
+    # Polish reads whichever cut this run actually produced, so it sits after
+    # the retention wiring and before the render -- the sidecar it writes
+    # belongs beside the video.
+    "caption_polish",
+    "audio_polish",
     "render_proxy",
+    # The checks look at the output, so they come after the thing that
+    # produces it.
+    "reliability_gates",
     "feedback_start",
     "feedback_queue",
     "feedback_report",
+    "review_package",
     "report",
 )
 
@@ -214,6 +224,46 @@ class AutoRunConfig:
     #: Target runtime the director aims at, in seconds. 0 means no target.
     target_duration: float = 0.0
 
+    #: Reshape the cut around the retention findings: a cold open, compressed
+    #: sag, protected setups, harder dead air. Off by default because it
+    #: changes the shape of the episode, and a person should ask for that.
+    retention_cut: bool = False
+    #: How hard it pulls. ``report_only`` decides everything and changes no
+    #: frame, which is the setting to look at first.
+    retention_mode: str = "report_only"
+    #: Move the best hook to the front.
+    cold_open: bool = True
+    #: Ceiling on the opening, in seconds. 0 means the configured default.
+    max_cold_open_seconds: float = 0.0
+    #: How hard ordinary silence is cut: low / medium / high.
+    dead_air_aggressiveness: str = ""
+
+    #: Put text on screen for the moments that carry the episode. ``off`` by
+    #: default, and ``key_moments`` is the one to use: ``dense`` is close to
+    #: subtitles and every plan it produces says so.
+    captions: str = "off"
+    #: Ceiling on captions a minute. 0 means the style's own number.
+    max_captions_per_minute: float = 0.0
+    #: Longest a caption may stay up. 0 means the style's own number.
+    max_caption_seconds: float = 0.0
+    #: Words a caption may carry. 0 means the style's own number.
+    max_caption_words: int = 0
+    #: ASR confidence a line needs. 0 means the default.
+    min_caption_confidence: float = 0.0
+    #: Refuse lines from a transcript that carries no confidence figures.
+    require_caption_confidence: bool = False
+
+    #: Restrained sound: a riser, a hit, a whoosh, a bed, a beat of silence.
+    #: ``placeholders`` needs no library and plays nothing; ``assets`` matches
+    #: against the local library and reports honestly what it could not find.
+    audio_polish: str = "off"
+    #: Ceiling on effects a minute. 0 means the style's own number.
+    max_sfx_per_minute: float = 0.0
+    #: Whether a music or ambience bed is allowed at all.
+    music_bed: bool = True
+    #: Whether the plan asks for that bed to duck under speech.
+    ducking: bool = True
+
     #: Render a watchable proxy of the rough cut with FFmpeg. Off by default
     #: because it is the only stage that costs minutes of CPU and produces
     #: hundreds of megabytes -- but it is also the only stage that produces
@@ -232,6 +282,12 @@ class AutoRunConfig:
     #: asked for would leave a trail of abandoned sessions, so the run report
     #: says how to start a review instead of starting one.
     feedback: bool = False
+
+    #: Gather the run into one review folder with an index. On by default,
+    #: unlike everything else added late: it creates nothing new, costs a
+    #: fraction of a second, and is the difference between a run somebody can
+    #: inspect and forty files they have to learn the layout of.
+    review_package: bool = True
 
     created_at: str = ""
     schema_version: int = 1
@@ -660,6 +716,10 @@ class AutoRunReport:
     #: refused. Always filled, whether or not the stage ran -- "this cut was
     #: chosen by thresholds" is worth saying out loud.
     director: dict = field(default_factory=dict)
+    #: The retention wiring: what it opened on, what it compressed, what it
+    #: protected and what the rules refused. Always filled, whether or not
+    #: the stage ran.
+    retention: dict = field(default_factory=dict)
     #: The proxy render: where the video is, where the notes are, and the
     #: exact command to make another. Always filled, whether or not the
     #: render stage ran -- "you could watch this" is worth saying to somebody
@@ -668,6 +728,17 @@ class AutoRunReport:
     #: How much of this run is worth a human review, and how to start one.
     #: Always filled, whether or not the feedback stages ran.
     feedback: dict = field(default_factory=dict)
+    #: What text reached the screen, and what was refused. Always filled --
+    #: "no captions were added" is a fact about the edit.
+    captions: dict = field(default_factory=dict)
+    #: What sound was planned, what plays, and what is missing. Always filled.
+    audio: dict = field(default_factory=dict)
+    #: The reliability checks: what passed, what warned, what failed.
+    checks: dict = field(default_factory=dict)
+    #: Where the review folder is, and what it says to look at first.
+    review: dict = field(default_factory=dict)
+    #: The thirteen questions a person has after a run, each with its answer.
+    answers: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
     check_in_premiere: list[str] = field(default_factory=list)

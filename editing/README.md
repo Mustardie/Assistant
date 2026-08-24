@@ -28,6 +28,9 @@ footage → Premiere mapping → local Whisper transcript → Qwen3-VL vision �
                                                     ↓
                      rough cut: selected ranges → scratch sequence plan
                                                     ↓
+      optionally: the retention findings are wired into the cut -- a cold open
+      at the front, sagging stretches compressed, setups protected
+                                                    ↓
               offline dry-run → (explicit command only) execute → review frames
                                                     ↓
                      Qwen3-VL critic → findings → revision recommendations
@@ -50,6 +53,15 @@ footage → Premiere mapping → local Whisper transcript → Qwen3-VL vision �
                                                     ↓
       and, at any point after the rough cut: FFmpeg renders it to a proxy MP4
       you can actually watch, with timestamped review notes beside it
+                                                    ↓
+      optionally: a few key-moment captions and a few restrained sound cues --
+      never subtitles, never a whoosh at every cut, every refusal recorded
+                                                    ↓
+        fifteen reliability checks: is what this produced actually usable?
+                                                    ↓
+       one review folder with an index: what to watch, what changed, what is
+       weak, and what needs you -- and the whole thing again over every folder
+       under a root, in batch
 ```
 
 **Nothing runs unless you say so, twice.** Every plan is validated offline
@@ -89,6 +101,14 @@ deterministic checks decide which of those it is allowed to do. The model
 proposes; the rules dispose, and every refusal names the rule. See
 [§18 the director pass](#18-the-director-pass).
 
+**The cut can be shaped like an episode rather than like a timeline.** The
+strongest moment moves to the front as a cold open, the stretches the retention
+planner called sagging get compressed, the setups a payoff needs are protected
+before anything that removes footage runs, and ordinary silence is cut harder
+than the general selector dares. Nothing in it claims to predict retention --
+it counts what changed in the edit. See
+[§19 retention structure wiring](#19-retention-structure-wiring).
+
 **You can watch the cut without Premiere.** FFmpeg renders any rough cut to a
 proxy MP4 in about a minute per ten minutes of video, with a timestamped review
 file beside it to write on. That turns the loop from "open Premiere, execute,
@@ -101,6 +121,31 @@ file under `data/editing/` is derived from the footage and can be rebuilt by
 re-running a pass. Human feedback cannot, so it is written to an append-only
 log that nothing in this system ever rewrites — and nothing trains on it either.
 See [§16 Feedback](#16-feedback-and-the-human-review-loop).
+
+**Text and sound are punctuation, not decoration.** The caption pass will only
+caption nine kinds of moment -- a death, a reveal, the stated objective, a
+payoff, a callback, a named threat -- inside a per-minute budget it will
+usually lose, and every refused line stays in the plan with the rule that
+refused it. The audio pass places a riser, a sting, a whoosh at a real section
+change and at most one bed, and refuses anything that would land on a spoken
+word. Both are off by default. See [§20 key-moment captions](#20-key-moment-captions)
+and [§21 minimal music and SFX polish](#21-minimal-music-and-sfx-polish).
+
+**Every run says whether it produced something usable.** Fifteen checks look at
+the footage, the transcript, the decisions and the output, and each one carries
+what it measured and the command that would fix it. A warning never stops a
+run; only five conditions can say "do not review this". See
+[§22 reliability checks](#22-reliability-checks).
+
+**A finished run is one folder with an index.** What video was produced, what
+changed, what to watch for, where it is weak, and what needs a human decision
+-- five questions in that order, with the small reports copied in beside them.
+See [§23 the review package](#23-the-review-package).
+
+**You can point it at a library rather than a folder.** Batch mode applies one
+configuration to every footage folder under a root, skips what is already done,
+survives a folder that breaks, and never overwrites finished work. See
+[§24 batch mode](#24-batch-mode).
 
 **The critic pass is one iteration, not a loop.** It exists to catch the obvious
 mistakes an automatic assembly makes — a zoom that crops the HUD, a caption over
@@ -119,10 +164,11 @@ which order they go in.
 python -m editing.cli auto run --folder D:/Footage/ep12 --style cinematic_minecraft
 ```
 
-That runs twenty-four stages — discovery, transcripts, audio, vision,
+That runs twenty-nine stages — discovery, transcripts, audio, vision,
 timeline, recommendations, rough cut, critic, style layers, asset placement,
-episode memory, retention plan, proxy render — and writes a plan and an offline
-dry run for each of the four things that could touch Premiere.
+episode memory, retention plan, caption polish, audio polish, proxy render,
+reliability checks, review package — and writes a plan and an offline dry run
+for each of the four things that could touch Premiere.
 
 **It executes nothing.** Not by accident, and not by default. Execution is four
 separate decisions:
@@ -176,31 +222,49 @@ footage before committing an afternoon to it.
   + assets_dry_run         passed   operations=12
   + episode_memory         passed   beats=7, open_loops=3, callbacks=1
   + retention_plan         passed   risks=4, hooks=3, suggestions=9
+  . retention_cut          skipped  --retention-cut was not set
+  . caption_polish         skipped  --captions was not set
+  . audio_polish           skipped  --audio-polish was not set
   . render_proxy           skipped  --render-proxy was not set
+  + reliability_gates      passed   status=warn, usable=True, passed=9
   . feedback_start         skipped  --feedback was not set
   . feedback_queue         skipped  --feedback was not set
   . feedback_report        skipped  --feedback was not set
+  + review_package         passed   items=20, present=11, has_video=False
   + report                 passed
 ```
 
-`transcribe`, `director_plan`, `render_proxy` and the three `feedback_*`
-stages are the only ones in the pipeline that are opt-*in*, and each for its
-own reason. Transcription loads a speech model and takes minutes per episode,
-so it waits to be asked — but the story layer is blind without it, so turn it
-on unless you already have transcripts. The director needs a model endpoint.
-Rendering costs minutes of CPU and hundreds of megabytes. Feedback starts a review a person is expected to finish, so
-`auto run --feedback` asks for it and the run report otherwise just tells you
-how much would be worth reviewing.
+`transcribe`, `director_plan`, `retention_cut`, `caption_polish`,
+`audio_polish`, `render_proxy` and the three `feedback_*` stages are the
+opt-*in* ones, each for its own reason. The retention wiring reshapes the
+episode, which is not something to do to somebody's footage by default.
+Transcription loads a speech model and takes minutes per episode, so it waits
+to be asked — but the story layer is blind without it, so turn it on unless you
+already have transcripts. The director needs a model endpoint. Putting text and
+sound on your video is not a default. Rendering costs minutes of CPU and
+hundreds of megabytes. Feedback starts a review a person is expected to finish,
+so `auto run --feedback` asks for it and the run report otherwise just tells
+you how much would be worth reviewing.
+
+`reliability_gates` and `review_package` are the two exceptions: they are
+opt-*out*. Neither creates anything new, both cost a fraction of a second, and
+together they are the difference between a run you can inspect and forty files
+whose layout you have to learn. `--no-review-package` turns the second off.
 
 ```bash
-python -m editing.cli auto run --folder D:/Footage/ep12 --transcribe --director --render-proxy --no-premiere
+python -m editing.cli auto run --folder D:/Footage/ep12     --transcribe --director --retention-cut --render-proxy     --captions key_moments --audio-polish placeholders --no-premiere
 ```
 
-That hears the footage, has a model choose the cut, checks every decision, and
-leaves you a video to watch — without Premiere being opened once. See
+That hears the footage, has a model choose the cut, reshapes it like an
+episode, captions the handful of moments that carry it, marks where sound
+belongs, renders it, checks whether the result is usable, and leaves you one
+folder with an index — without Premiere being opened once. See
 [§18 the director pass](#18-the-director-pass),
-[§17 the proxy render](#17-watching-it-the-ffmpeg-proxy-render) and
-[§16 Feedback](#16-feedback-and-the-human-review-loop).
+[§19 retention wiring](#19-retention-structure-wiring),
+[§20 captions](#20-key-moment-captions),
+[§21 sound](#21-minimal-music-and-sfx-polish),
+[§22 the checks](#22-reliability-checks) and
+[§23 the review package](#23-the-review-package).
 
 ### The run folder
 
@@ -211,9 +275,13 @@ config.json      exactly what the run was invoked with
 state.json       every stage result and gate, rewritten after each stage
 checkpoints/     one file per completed stage, with artifact fingerprints
 artifacts/       the run's own output_dir -- timelines, plans, reports
-reports/         report.json and report.txt
+reports/         report.json report.txt checks.json checks.txt
+review/          review_index.md, and a copy of every small report
 logs/            run.log
 ```
+
+`review/review_index.md` is the one to open. See
+[§23 the review package](#23-the-review-package).
 
 The run ID is `<timestamp>-<folder hash>-<style>`, so runs sort by time, group
 by footage, and are told apart by style.
@@ -359,6 +427,12 @@ clearing a run's artifacts while a sequence built from them is still open.
 - **It does not review the edit for you, and does not learn from you doing it.**
   `--feedback` opens a review session and builds its queue; reading it and
   answering is yours, and nothing trains on the answers.
+- **It does not put captions in the video.** The caption pass writes a plan and
+  a sidecar `.srt`; the proxy carries the cut and its original audio.
+- **It does not play any sound it plans.** The audio pass produces notes and,
+  in `assets` mode, matches. Nothing is mixed, levelled or heard.
+- **Its reliability checks judge shape, not taste.** Fifteen green ticks mean
+  the output is well-formed, not that the edit is good.
 
 ---
 
@@ -376,6 +450,8 @@ python -m editing.cli director plan                       # let a model choose t
 python -m editing.cli director show-rejected              # what the rules refused
 python -m editing.cli roughcut build                      # assemble a rough cut plan
 python -m editing.cli roughcut dry-run                    # validate it offline
+python -m editing.cli retention plan                      # what a cold open would change
+python -m editing.cli retention plan --mode retention     # and reshape the cut
 python -m editing.cli render roughcut                     # watch it, without Premiere
 python -m editing.cli render open                         # play the proxy
 python -m editing.cli roughcut execute --yes              # build it in Premiere
@@ -398,6 +474,18 @@ python -m editing.cli assets plan                         # match placeholders
 python -m editing.cli assets show-missing                 # what to go and find
 python -m editing.cli assets dry-run
 python -m editing.cli assets execute --yes                # place them
+
+python -m editing.cli polish captions --captions key_moments   # the few lines
+python -m editing.cli polish show-rejected                # and every refusal
+python -m editing.cli polish audio --audio-polish placeholders # where sound goes
+python -m editing.cli polish show-missing                 # the shopping list
+
+python -m editing.cli auto show-checks                    # is the output usable?
+python -m editing.cli review package                      # gather it into one folder
+python -m editing.cli review open-latest                  # and open the index
+
+python -m editing.cli auto batch --root E:/Clips --dry-run     # a whole library
+python -m editing.cli auto batch --root E:/Clips --render-proxy --no-premiere
 ```
 
 Then read the results:
@@ -3242,7 +3330,757 @@ WHO CHOSE THIS CUT
 
 ---
 
-## 19. Where outputs go
+## 19. Retention structure wiring
+
+Session 8 built the retention planner: hook candidates, risk zones, setups and
+payoffs, open loops, a peak, an ending. It executed nothing, and for four
+sessions nothing read it. The handoff said so, every time.
+
+This is the consumer. It reshapes a cut around what that planner found:
+
+```bash
+python -m editing.cli retention plan                  # decide, change nothing
+python -m editing.cli retention show-cold-open
+python -m editing.cli retention plan --mode retention  # and apply it
+python -m editing.cli retention compare
+python -m editing.cli retention render --quality proxy
+```
+
+Four things happen, in this order:
+
+1. **Protect** — a setup whose payoff is in the cut is claimed, along with the
+   payoff, the peak and anything a callback refers to.
+2. **Cold open** — the strongest hook moves to the front, and the footage it
+   came from does not play twice.
+3. **Compress** — stretches the planner called sagging are sped up when the
+   picture is changing and cut when it is not.
+4. **Dead air** — silence that is doing nothing is trimmed hard; silence that
+   is doing something is left alone.
+
+**The order is the safety model.** Protection runs before anything that removes
+footage, so a compression pass literally cannot take a setup out — the claim
+already exists when the question is asked. Reversing those two steps would work
+most of the time, which is worse than not working at all.
+
+### Report-only is the default
+
+```bash
+python -m editing.cli retention plan          # mode: report_only
+```
+
+Every decision is made, recorded and reported, and **no frame changes**. That
+is the setting to look at first, because this pass reshapes an episode and you
+should read what it wants to do before letting it.
+
+| Mode | What it does |
+|---|---|
+| `off` | nothing, not even deciding |
+| `report_only` | decides everything, changes nothing (**default**) |
+| `retention` | applies on the rule-based cut |
+| `director_retention` | applies on the director's cut; fails clearly without one |
+| `hybrid` | applies on the director's cut if there is one, else the heuristic |
+
+`director_retention` and `hybrid` differ only in what happens when the director
+pass is missing. One says "I asked for the director's cut and did not get it";
+the other says "use whatever is best available". Both are reasonable to want,
+and guessing would leave somebody with a threshold cut they believed was
+directed.
+
+**The cut it reads is never touched.** The result is a variant, written to
+`retention/<name>.roughcut.json`, so disagreeing with this pass costs nothing.
+
+### The cold open
+
+The highest-leverage edit in the system, and one a chronological clip cutter
+can never make: the best thing in the episode is usually nine minutes in, and a
+viewer who leaves at fifteen seconds never sees it.
+
+Every rule below can veto, and each refusal is recorded with its reason:
+
+- **5–20 seconds.** Long enough to land, short enough to be a tease.
+- **Not boring.** A hook over walking, sorting or a menu is refused however
+  well it scored — unless the footage is *also* labelled danger, a reveal or a
+  payoff, because a creeper explosion is a cold open even if the model
+  mentioned walking.
+- **Stands on its own.** Something has to be said over it, or the footage has
+  to carry a strong label. A viewer arriving cold has the picture and the
+  commentary and nothing else.
+- **Not already the opening.** Moving the first ten seconds to the front is a
+  no-op with extra steps.
+- **Not the ending.** The last tenth of the episode is a spoiler, not a tease.
+- **Goes somewhere.** A hook opening a question the episode never answers is
+  used and warned about loudly — it is a promise to a viewer the video does not
+  keep.
+
+```bash
+python -m editing.cli retention show-cold-open
+```
+
+```
+  chosen   : danger [hook_00a4]  score 0.96, confidence 0.80
+  was at   : 140.0-170.0s
+  now      : the first 12.0s of the cut
+  question : is that a creeper behind him?
+  answered : 202.0s
+  original : shorten, shortened to 12s
+```
+
+**Duplication.** A cold open lifted from minute nine is the same footage as
+minute nine. Left in both places it plays twice, which reads as a teaser when a
+channel does it deliberately and as a bug when it does not. So the original is
+removed by default; `--duplicate-policy shorten` trims it instead, and
+`--allow-duplicates` keeps both as a deliberate teaser.
+
+Two cases override the policy and say so: a hook that **is** the peak, and a
+hook sitting on **protected** footage. Removing either would take the payoff
+out of the episode to put it at the front, so the original is shortened
+instead.
+
+This is also the one place the layer trims something protection claimed —
+carving the teased seconds out of where they used to be. The justification is
+narrow and worth stating: the footage is not being removed from the episode, it
+has *moved*.
+
+### Sag compression
+
+Session 8 marks thirteen kinds of risk. Seven describe footage that is too long
+for what it contains, and those get compressed. The other six describe problems
+compression cannot fix — a confusing transition does not get better by being
+shorter — and become markers.
+
+**Cut, or speed up?** Decided by what the footage is *for*:
+
+| The footage | What happens | Why |
+|---|---|---|
+| somebody is talking | neither, marker only | sped-up dialogue is unusable |
+| the picture is changing (a tunnel getting longer, a build going up) | **speed up** | a viewer needs to see it happened, not watch it happen |
+| nothing changes | **cut** | there is nothing to see, so nothing to preserve |
+
+Every compressed stretch keeps `--keep-context 2` seconds at each end, so the
+cut does not read as a missing scene. And `--max-compression 0.5` caps how much
+of the cut this pass may remove in total: a retention pass that removes 80% of
+an episode has not compressed a sag, it has deleted the video.
+
+```bash
+python -m editing.cli retention show-compression
+```
+
+### Setup and payoff protection
+
+The check that most justifies this layer, because no local heuristic can see
+it: the setup looks like nothing, and the only reason to keep it sits twenty
+minutes later.
+
+- a setup whose payoff is **in the cut** is protected
+- a setup whose payoff was **cut** is not — it is footage with no destination,
+  and saying so is more useful than defending it
+- a payoff is kept whole and never retimed; so is the peak
+- a callback protects the moment it calls back to
+
+Two warnings come out of it, and neither is automatically fixable:
+
+```
+! A payoff at 202s is in the cut and its setup is not. A viewer reaches the
+  moment without knowing why it matters.
+! A setup at 41s is in the cut and never pays off. A viewer is left waiting
+  for something that does not come.
+```
+
+Both are exactly the sort of thing a person watching the proxy will feel and
+not be able to name.
+
+```bash
+python -m editing.cli retention show-protected
+```
+
+### Dead air
+
+The general selector already drops dead air: Session 3 refuses any segment
+where measured silence covers most of it. That is conservative and leaves a lot
+behind — 1.5 seconds between two sentences is not "most of a segment", and
+forty of those across an episode is a minute of a viewer waiting.
+
+This pass is harder, and the whole difficulty is that **some of that silence is
+the edit**. The beat after a death is the joke. The pause before a reveal is
+the tension. So every stretch is asked what it is for, from evidence the
+earlier passes recorded:
+
+| Context | Purpose | Kept up to |
+|---|---|---|
+| follows a scream, laughter or a reaction | `aftermath` | `--max-purposeful-silence` (2.5s) |
+| sits around a payoff, reveal or danger | `tension` | 2.5s |
+| bridges two different places | `transition` | 2.5s |
+| inside protected footage | `setup_payoff_timing` | 2.5s |
+| nothing | *ordinary* | 0.6s / 1.2s / 2.0s |
+
+```bash
+python -m editing.cli retention plan --dead-air-aggressiveness high
+```
+
+| Setting | Ordinary silence cut past |
+|---|---|
+| `low` | 2.0s |
+| `medium` | 1.2s (default) |
+| `high` | 0.6s |
+
+Silence is **trimmed to the limit**, not deleted — the first second of a pause
+is usually the reaction to whatever just happened. And nothing is ever trimmed
+into speech: a gap with talking across it is speech pacing, not dead air, and
+clipping it is how an edit starts sounding wrong.
+
+### Comparing
+
+```bash
+python -m editing.cli retention compare
+```
+
+```
+                                before       after
+  ranges                            31          27
+  runtime (s)                    874.0       690.5
+
+WHAT CHANGED
+  seconds removed          : 152
+  seconds sped up          : 88
+  risk zones compressed    : 4
+  risk zones marked only   : 2
+  silence trimmed          : 19
+  silence kept on purpose  : 6
+  setups protected         : 3
+  actions refused          : 5
+```
+
+**There is no score.** No grade, no percentage, nothing that could be read as
+an audience prediction. "Risk zones compressed: 4" is a count of what changed
+in the edit; "retention improved 12%" would be a fabrication, because nothing
+in this system has ever seen a viewer.
+
+The comparison also checks the **finished cut** for duplicated footage rather
+than trusting the cold-open policy, and lists every refused action with the
+rule that refused it.
+
+### In auto mode
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 --transcribe \
+    --director --retention-cut --retention-mode retention \
+    --render-proxy --style cinematic_minecraft --no-premiere
+```
+
+The stage is opt-in and non-critical: a run with no usable retention plan still
+produces every other plan, and the cut it would have reshaped is untouched.
+When the wiring does apply, `render_proxy` renders **the reshaped cut** — a
+report saying a cold open was chosen next to a video that opens on walking
+would be the worst possible outcome.
+
+```
+RESHAPED FOR RETENTION
+  Applied on the director cut in retention mode: 874s -> 690s.
+  Opens on a danger (12s) lifted from later in the episode.
+  4 risk zone(s) compressed, 152s removed, 19 stretch(es) of silence trimmed.
+  3 setup(s) and 2 payoff(s) protected; 5 action(s) refused.
+  why each : python -m editing.cli retention show-rejected --run <run_id>
+```
+
+Flags: `--retention-cut`, `--retention-mode`, `--no-cold-open`,
+`--max-cold-open-seconds`, `--dead-air-aggressiveness`.
+
+### Limitations
+
+1. **Nothing here measures retention.** Every count is a count of what changed
+   in the edit. No number in any output is a prediction about an audience.
+2. **The findings it acts on are Session 8's**, whose thresholds are calibrated
+   against intuition rather than against outcomes. An error there is an error
+   this layer inherits and amplifies, because now it cuts on it.
+3. **A cold open is chosen by a scoring formula.** It has no idea what your
+   channel usually opens on. Write a style guide and use the director pass if
+   you want taste in the decision.
+4. **Silence is judged by what surrounds it.** A pause that is funny for a
+   reason the footage does not show will read as dead air and be cut.
+5. **Compression can still confuse.** Two seconds of context at each end is a
+   rule of thumb, not an understanding of the scene.
+6. **A `roughcut` memory needs a rough cut.** Resolving sequence times against
+   the synthetic timeline ordering would place every finding wrongly, so the
+   pass refuses rather than guessing.
+7. **Nobody has watched a retention cut yet.** It produces the right shape on
+   fixtures and on generated footage. Whether an episode reshaped this way is
+   actually better is a question only a person watching both proxies can
+   answer.
+
+---
+
+## 20. Key-moment captions
+
+Session 5's caption layer answers "which spoken lines *could* carry text". This
+pass answers a narrower question: **which lines are the episode**. It is the
+difference between a styled edit and subtitles, and it is off by default.
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 \
+    --captions key_moments --no-premiere
+```
+
+### Three modes
+
+| `--captions` | What it does |
+|---|---|
+| `off` | Nothing. The default: putting text on your video is not a default |
+| `key_moments` | Only the nine moments below, inside a small per-minute budget |
+| `dense` | Every line the style's own caption rules would allow — close to subtitles, and every plan it produces says so |
+
+### The nine moments
+
+A line has to be one of these, argued for by the picture, the audio and the
+words **together**. "oh my god" over a crafting table is not a reaction caption.
+
+| Moment | What earns it |
+|---|---|
+| `funny_reaction` | Laughter around a short line, or a reaction over something absurd |
+| `death_or_fail` | A death screen on screen, or the line that admits one |
+| `objective` | The line that states what the episode is trying to do |
+| `reveal` | A reveal in the picture and a line pointing at it |
+| `payoff_line` | A payoff landing and the line that names it |
+| `callback` | A line referring back, where the episode memory recorded a callback |
+| `danger` | A named threat, at the moment it is on screen |
+| `meme_quote` | Short, said with force, over a moment that lands |
+| `transition_setup` | The hinge between two sections |
+
+### Three gates, in order
+
+**1 — Is it legible?** Long lines, filler, ASR uncertainty markers and
+low-confidence speech are refused before anything looks at what they mean. A
+caption that misquotes the audio is worse than no caption, because a viewer can
+hear the difference.
+
+**2 — Is it a key moment?** One of the nine above. In `key_moments` mode, a
+line that is none of them is refused as `not_a_key_moment` however clearly it
+was said.
+
+**3 — Does it fit the budget?** Candidates are ranked strongest-first and the
+per-minute ceiling is applied. Structural moments (the objective, a reveal, a
+payoff, a callback, a transition) beat purely reactive ones on a tie: a viewer
+who loses the objective line loses the plot, and one who loses an "oh my god"
+loses nothing.
+
+### What is refused, and why
+
+Every refusal is kept in the plan with the rule that made it. That is the whole
+point — a pass that placed four captions out of sixty candidates and a pass
+that is broken both print "4".
+
+```bash
+python -m editing.cli polish show-rejected --run <run_id>
+```
+
+```
+7 line(s) were refused a caption:
+
+  -    5.50  -             "...we go that is what..."   duplicate_line: already captioned
+  -   13.00  objective     "right so today we are..."   density_limit: the budget for this
+                                                        cut is 1 caption(s) (1.5 a minute
+                                                        over 40s), and stronger moments
+                                                        filled it
+
+  by reason:
+       4  not_a_key_moment
+       2  duplicate_line
+       1  density_limit
+```
+
+| Refusal | Means |
+|---|---|
+| `not_a_key_moment` | Nothing made it one of the nine |
+| `boring_explanation` | It explains rather than lands |
+| `too_long` | The line runs over eight seconds: a paragraph |
+| `too_many_words` | Over 22 words. Condensing that to five picks a phrase and calls it a sentence |
+| `unclear_transcript` | The transcript carries `[inaudible]` or similar |
+| `low_confidence` | ASR confidence below the floor |
+| `background_speech` | Quiet, uncertain speech over a low-energy stretch |
+| `repeated_filler` | The whole line is "um" / "okay so" / an annotation |
+| `duplicate_line` | The same text is already captioned |
+| `cut_from_the_edit` | The line is not in the cut. Nudging it would caption footage nobody kept |
+| `blocked_by_ui` | A full-screen menu is open there |
+| `style_forbids_text` | This style puts no text on screen |
+| `no_safe_zone` | No safe place on screen for it in this style |
+| `density_limit` | The budget was full and stronger moments filled it |
+| `too_close_to_another` | Inside the style's caption spacing |
+
+### The numbers, and where they come from
+
+The style preset is the source of truth wherever it has one — a style that says
+five words is not overruled. `key_moments` only ever *tightens*: the rate is
+capped at 1.5 a minute and the spacing floored at 6 seconds, whatever the style
+allowed.
+
+| Flag | Default |
+|---|---|
+| `--max-captions-per-minute` | the style's, capped at 1.5 in `key_moments` |
+| `--max-caption-seconds` | the style's caption duration + 1s, 2–5s |
+| `--max-caption-words` | the style's `max_caption_words` |
+| `--min-caption-confidence` | `0.6` |
+| `--require-caption-confidence` | off — a hand-written `.srt` carries no confidence and is usually more trustworthy than a machine one |
+
+A rate that would round down to zero on a short cut still allows one caption,
+and the plan says so rather than printing a density that looks like a broken
+limit.
+
+### Captions are not in the video
+
+**The proxy render never burns them in.** The renderer encodes each segment and
+joins them with the concat demuxer, which is what makes it survive a folder of
+mismatched game capture; adding text would mean a second full re-encode of the
+joined file with a subtitle filter, and that fails on exactly the fonts-and-
+libass edge cases you cannot debug from here.
+
+So the pass writes a **sidecar `.srt` beside the video**, in sequence time:
+
+```
+render/jobs/<job_id>/render.mp4
+render/jobs/<job_id>/render.srt     ← open the mp4 in VLC or MPV
+```
+
+`polish/<name>.captions.srt` is the same file inside the run's artifacts, and
+the review folder holds a copy as `subtitles.srt`.
+
+---
+
+## 21. Minimal music and SFX polish
+
+Five things, placed rarely, and none of them plays.
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 \
+    --audio-polish placeholders --no-premiere
+```
+
+| Cue | When |
+|---|---|
+| `riser` | Three seconds into a payoff or a reveal |
+| `hit` | On a fail or a reveal, at the frame it lands |
+| `whoosh` | Where the cut moves to a *different source file* — a real section change, not a trim |
+| `ambience` / `music_bed` | Under the cut, when the style allows one. At most one bed, ever |
+| `silence_drop` | Half a second of nothing before a reveal or a death, so it lands |
+
+### Two rules do the work
+
+**A cue names the moment it is for.** There is no "place one at every cut"
+path. A candidate is generated by something the earlier passes recorded — a
+death screen, a payoff beat, a change of source file — and a cue with nothing
+behind it is refused as `no_moment` rather than placed hopefully.
+
+**A cue may not land on a word.** Hits, risers, whooshes and silence drops are
+checked against the transcript with a guard band either side. A sting over the
+middle of a sentence is the single most obvious way an automated edit announces
+itself. Beds are the exception and are ducked instead — which the cue says in
+its own safety notes rather than in a footnote.
+
+### Two modes
+
+| `--audio-polish` | What it does |
+|---|---|
+| `off` | Nothing. The default |
+| `placeholders` | Every cue is a note naming the sound that belongs there. **No library is read at all** |
+| `assets` | Cues are matched against your local library (§13). Anything unmatched stays a note and lands on the shopping list |
+
+```bash
+python -m editing.cli polish show-missing --run <run_id>
+```
+
+```
+2 sound(s) to go and find:
+
+    1 x a hard one-shot sting
+          kind hit, first needed at 26s
+    1 x a loopable low-intensity bed
+          kind music_bed, first needed at 0s
+```
+
+### Density and taste
+
+| Style | Effects a minute | Bed allowed | Spacing |
+|---|---|---|---|
+| `cinematic_minecraft` | 0.8 | yes | 10s |
+| `fast_funny` | 2.0 | yes | 4s |
+| `documentary_story` | 0.6 | yes | 12s |
+| `minimal_clean` | 0.25 | no | 30s |
+
+Which *kinds* a style tolerates is read off the preset's own `audio_kinds` and
+`forbidden_kinds`, not restated here — so `cinematic_minecraft`, which forbids
+`whoosh`, forbids it in this pass too without anybody having to say it twice.
+
+Override with `--max-sfx-per-minute`, `--no-music-bed`, `--no-ducking`.
+
+### What it never does
+
+* **Nothing plays.** This pass produces a plan. No operation in it is executed
+  by this package, and nothing it plans is in the rendered proxy.
+* **No level is measured.** Not the bed's, not the sting's, not the
+  commentary's. Every accepted cue says so in its own safety notes.
+* **Nothing has been listened to.** In `assets` mode a match is made on tags,
+  folder and duration, exactly as §14 describes.
+* **A bed is tiled, not crossfaded.** A file that does not loop cleanly has an
+  audible seam, and the plan says that too.
+
+---
+
+## 22. Reliability checks
+
+Fifteen checks on whether a run produced a **usable** thing. Not to be confused
+with the execution gates of §0, which are about *permission* — what may be run
+against Premiere. These are about *validity*.
+
+```bash
+python -m editing.cli auto show-checks --run <run_id>
+```
+
+```
+overall  : warn
+gates    : 11 passed, 1 warned, 0 failed, 3 not applicable
+usable   : yes
+
+  WARN     story_warnings
+      what : Setups and payoffs are still paired
+      why  : 2 unresolved story warning(s): a payoff without its setup, or a
+             setup that never pays off.
+      saw  : unresolved=2
+      fix  : python -m editing.cli episode show-open-loops
+```
+
+### Four statuses
+
+| Status | Means |
+|---|---|
+| `pass` | The check looked and found nothing wrong |
+| `warn` | Worth knowing, and the output is still usable |
+| `fail` | The output is not valid for this reason |
+| `skipped` | The pass this is about did not run, so the question does not apply |
+
+**A gate about a pass that did not run says `skipped`, never `pass`.** Fifteen
+green ticks that mean nothing is worse than five that mean something.
+
+### The fifteen
+
+| Check | Asks |
+|---|---|
+| `footage` | Footage was found and probed |
+| `transcript` | The episode has words in it |
+| `transcript_confidence` | The transcript is confident enough to build on |
+| `hook` | An opening hook was found |
+| `director` | The director's decisions survived the rules |
+| `retention_length` | The reshaped cut is still an episode |
+| `cold_open_duplicate` | The cold open does not play twice |
+| `story_warnings` | Setups and payoffs are still paired |
+| `compression` | The story was not compressed away |
+| `caption_density` | Captions are punctuation, not subtitles |
+| `sfx_density` | Effects mark moments rather than fill them |
+| `missing_assets` | Every placed sound exists |
+| `render_output` | The render produced the file it claims |
+| `render_size` | The rendered file is big enough to be a video |
+| `output_duration` | The output runtime is plausible |
+
+### A warning never stops a run
+
+Only five checks can ever say "do not review this output", and each needs a
+condition that is unambiguous:
+
+* `footage` — no footage at all
+* `compression` — a cut with no runtime
+* `retention_length` — a reshaped cut with no runtime
+* `render_output` — the run says it rendered a video and the file is not there
+* `render_size` — the rendered file is too small to be video
+
+Everything else warns with a fix attached. A pipeline that refuses to finish an
+overnight run over a caption density is one nobody runs twice, and a check
+somebody disables protects nothing.
+
+### Every gate carries evidence and a fix
+
+A gate that says "confidence is low" without saying what it was, over how many
+words, is an opinion; one with no suggested fix is a complaint. Both fields are
+filled by every check, and both are in `reports/checks.json`.
+
+**These look at shape, not at taste.** A run that passes all fifteen can still
+be a bad edit, and the only way to find that out is to watch it.
+
+---
+
+## 23. The review package
+
+A run leaves six sub-directories and forty files behind. Knowing that the
+retention comparison lives in `artifacts/retention/<name>.compare.json` is a
+thing you have to learn — and this exists so you do not have to.
+
+```bash
+python -m editing.cli review open-latest       # the newest index
+python -m editing.cli review summary --latest  # the short form
+python -m editing.cli review package --run <id>   # rebuild it from disk now
+```
+
+Every completed run gets one, unless `--no-review-package` says otherwise:
+
+```
+data/editing/auto/runs/<run_id>/review/
+├── review_index.md      ← open this
+├── package.json         the same content, for a script
+├── checks.json          the fifteen reliability checks
+├── checks.txt           the readable version
+├── captions.txt         a copy of the caption report
+├── subtitles.srt        the caption sidecar
+├── audio.txt            the audio polish report
+├── retention.txt        the retention report
+├── run_report.txt       the full run report
+└── ...                  every other small report the run produced
+```
+
+Small reports are **copied in**, so the folder is self-contained. The video is
+**pointed at** — copying a proxy to make a folder tidy would be an unkind thing
+to do to a disk.
+
+### The index answers five questions, in order
+
+1. **Watch this** — the video, and the subtitle file to load beside it
+2. **What changed** — counts, never claims: what was reshaped, compressed,
+   protected, captioned, scored
+3. **What to watch for** — the specific moments most likely to be wrong,
+   starting with the cold open
+4. **Weak points** — what the reliability checks found, what stages were
+   blocked, and the fix each one suggested
+5. **Needs you** — what only a person can settle
+
+Then the files, then the commands.
+
+### It is a view, not a record
+
+`review package` rebuilds it from what is on disk **now**. Delete the proxy and
+rebuild, and the index says there is no video. That is the whole point: a
+package that listed a file that had been deleted would be worse than no
+package.
+
+**Nothing in it is a verdict.** It says what was done, what was refused and
+what is worth checking. Whether the edit works is a question only somebody
+watching it can answer, and the index says so at the top.
+
+---
+
+## 24. Batch mode
+
+One configuration, many folders, one summary.
+
+```bash
+python -m editing.cli auto batch --root E:\Clips --style cinematic_minecraft \
+    --director --retention-cut --render-proxy --no-premiere --limit 3
+```
+
+**Type `--dry-run` first.** It creates nothing and reports exactly which
+folders it would process, which it would skip and why.
+
+### What counts as a folder
+
+A folder that **directly contains video files**. Nested folders are candidates
+in their own right; a parent whose clips all live one level down is not, because
+running it would process the same footage twice under a different name. Folders
+this system or Premiere writes to (`render/`, `data/`, `auto/`, the auto-save
+folders) are never scanned.
+
+### The four decisions
+
+| Decision | When |
+|---|---|
+| `run` | A fresh folder |
+| `skip` | A completed run exists, and neither `--force` nor `--resume` was given |
+| `resume` | An unfinished run exists and `--resume` was given |
+| `force` | A completed run exists and `--force` was given — a **new** run folder beside the old one |
+
+### Options
+
+| Flag | What it does |
+|---|---|
+| `--limit N` | Process at most N folders |
+| `--only-new` | Only folders that have never been run at all |
+| `--resume` | Continue unfinished runs instead of skipping them |
+| `--force` | Run folders that already completed, in new run folders |
+| `--dry-run` | Say what would happen and create nothing |
+| `--style` | The style every run uses |
+| `--director` / `--retention-cut` / `--render-proxy` | What each run does |
+| `--captions` / `--audio-polish` | Polish, applied to every run |
+| `--no-premiere` | Never talk to Premiere |
+
+### Four properties
+
+**Nothing is ever overwritten.** A completed folder is skipped; `--force` gives
+it a new run beside the old one. There is no path through batch mode that
+writes over finished work — including the batch's own summary, which waits for
+a new second rather than reusing an ID.
+
+**One failure does not stop the batch.** A folder that raises is recorded with
+its reason and the next one starts. The most useful property of an overnight
+run is that it is still going in the morning.
+
+**Every folder ends in a named state** — `completed`, `failed`, `skipped`,
+`planned` — each carrying why. A summary where something silently did not
+happen would be worse than no summary.
+
+**It is sequential.** No concurrency, no retries, no dependency graph. Two runs
+at once contend for the same analysis cache and the same GPU, and the failure
+mode of a parallel batch — two half-finished runs and no way to tell which log
+belongs to which — is worse than the wall-clock it saves.
+
+### The summary
+
+```
+data/editing/auto/batches/<batch_id>/
+├── summary.json     rewritten after every folder
+├── summary.txt      the readable version
+└── batch.log        one line per folder
+```
+
+It leads with failures, then the completed runs worth looking at (a failed
+stage, or a check saying the output is unusable), then the watchable ones with
+their review indexes, then every folder.
+
+```bash
+python -m editing.cli auto list-batches
+python -m editing.cli auto batch-report --batch <batch_id>
+```
+
+A batch creates nothing an ordinary `auto run` would not create, which is what
+makes every other command in this system work unchanged on its output.
+
+---
+
+## 25. Running without Premiere
+
+Premiere is optional everywhere, and has been since Session 3. There are four
+export modes:
+
+| Mode | Command | What you get |
+|---|---|---|
+| **Plan only** | `auto run --folder <f> --no-premiere` | Every plan, validated offline. No video, nothing executed |
+| **Proxy render** | add `--render-proxy` | A watchable MP4 built with FFmpeg, plus review notes and a caption sidecar |
+| **Premiere plan export** | `layers export`, `roughcut report`, `assets plan` | The JSON a Premiere session would consume |
+| **Premiere execution** | `auto execute-stage <stage> --run <id> --yes` | The only path that touches Premiere, one stage at a time |
+
+**Nothing executes by default.** `--no-premiere` shuts every gate for the life
+of the run; without it, the gates are *computed* and still need an individual
+`--yes` each.
+
+The whole of Week 4 — captions, audio polish, the reliability checks, the
+review package, batch mode — needs no Premiere, no GPU, no model server and no
+asset library. The one thing that needs an external tool is the proxy render,
+which needs FFmpeg.
+
+### The honest gap in the Premiere path
+
+`text.create` uses the rasterised path, so captions placed by the style pass
+are not editable in Premiere afterwards, and `.mogrt` templates are matched and
+never placed. **The caption polish pass does not place text in Premiere at
+all** — it produces a plan and a sidecar subtitle file. Wiring it into the
+style pass's operation list is a real piece of work that has not been done, and
+this section says so rather than implying the two are connected.
+
+---
+
+## 26. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
@@ -3284,22 +4122,41 @@ data/editing/
 │   ├── feedback.jsonl              ← append-only, never rewritten
 │   ├── summary.json  report.md     derived from the log on demand
 │   └── exports/                    each with a manifest
+├── retention/structure.plan.json   ← every retention decision and refusal
+├── retention/structure.plan.txt    ← the readable retention report
+├── retention/structure.roughcut.json ← the reshaped cut, as a variant
+├── retention/structure.compare.json ← reshaped cut against the original
 ├── director/structure.plan.json    ← every decision, accepted and rejected
 ├── director/structure.plan.txt     ← the readable director report
 ├── director/structure.context.json ← exactly what the model was shown
 ├── director/structure.prompt.txt   ← exactly what it was sent
 ├── director/structure.compare.json ← director cut against threshold cut
+├── polish/structure.captions.json  ← every line judged, accepted and refused
+├── polish/structure.captions.txt   ← the readable caption report
+├── polish/structure.captions.srt   ← the sidecar subtitles, in sequence time
+├── polish/structure.audio.json     ← every cue judged, and what is missing
+├── polish/structure.audio.txt      ← the readable audio polish report
 ├── render/jobs/<job_id>/           ← one proxy render, and how it was made
 │   ├── render.mp4                  ← watch this
+│   ├── render.srt                  ← load this beside it: captions are not in it
 │   ├── review_notes.md             ← write on this while you watch
 │   ├── report.md   result.json     what was produced, and what was not
 │   ├── segments.json               every source range, in play order
 │   ├── ffmpeg_commands.json        every invocation, as it ran
 │   ├── config.json   logs/         the settings, and FFmpeg's own output
 │   └── temp/                       intermediates, deleted on success
-└── auto/runs/<run_id>/            ← one self-contained folder per auto run
-    ├── config.json  state.json
-    ├── checkpoints/  artifacts/  reports/  logs/
+├── auto/runs/<run_id>/            ← one self-contained folder per auto run
+│   ├── config.json  state.json
+│   ├── checkpoints/  artifacts/  logs/
+│   ├── reports/                    report.json report.txt checks.json checks.txt
+│   └── review/                    ← open review_index.md first
+│       ├── review_index.md         the five questions, in order
+│       ├── package.json            the same content, for a script
+│       └── <item>.txt/.json/.srt   a copy of every small report
+└── auto/batches/<batch_id>/       ← one batch over a library of folders
+    ├── summary.json                rewritten after every folder
+    ├── summary.txt                 the readable summary
+    └── batch.log
 ├── frames/                         extracted JPEGs (deleted unless --keep-frames)
 └── cache/
     ├── probe/       ffprobe results
@@ -3323,7 +4180,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 20. Caching
+## 27. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -3373,10 +4230,10 @@ that window.
 
 ---
 
-## 21. Tests
+## 28. Tests
 
 ```bash
-python -m pytest tests/editing -q        # 1692 tests, ~110s
+python -m pytest tests/editing -q        # 2060 tests, ~130s
 ```
 
 **No FFmpeg, no GPU, no model server and no Premiere required.** Every external
@@ -3404,6 +4261,7 @@ asserting on the same call shape the real component receives.
 | `test_editing_auto.py` | run state, stage ordering, **checkpoint validation**, resume, execution gates |
 | `test_editing_episode.py` | beats, open loops, risk zones, hooks, **the confidence cap**, no fake analytics |
 | `test_editing_feedback.py` | the review queue, **the append-only log**, target resolution, preference and training signals, exports |
+| `test_editing_retention.py` | resolving episode time to footage, cold-open vetoes, **protection before compression**, purposeful silence, the comparison's refusal to claim analytics |
 | `test_editing_director.py` | context compaction, **the segment-id guarantee**, invalid JSON, the twelve safety checks, the three modes, the HTTP contract |
 | `test_editing_render.py` | plan-to-segment conversion, **the FFmpeg commands**, speed chaining, the render cache, review notes, missing FFmpeg |
 | `test_editing_pipeline.py` | discovery, Premiere mapping, pipeline, CLI |
@@ -3499,6 +4357,20 @@ Tests worth knowing about, because they pin the promises this layer makes:
   cut you no longer have is the worst thing this package could do
 - `test_the_mock_runner_completes_and_claims_no_video` — a placeholder is never
   reported as something to watch
+- `test_protection_is_claimed_before_compression_runs` — the ordering the
+  whole retention layer rests on, asserted from both sides
+- `test_the_cold_open_footage_is_carved_out_of_where_it_used_to_be` — checked
+  on the finished cut rather than trusted from the policy
+- `test_a_roughcut_memory_without_a_rough_cut_is_refused` — sequence times
+  read against a synthetic ordering are all wrong, and every one of them would
+  still look like a number
+- `test_the_setup_seconds_field_is_not_read_as_context_needed` — Session 8
+  sets it to the beat's position despite the name, and reading it as
+  documented refused every hook worth having
+- `test_silence_after_a_reaction_is_kept_as_aftermath` — the beat after a
+  scream is the joke
+- `test_the_comparison_never_claims_analytics` — scanned over the whole
+  rendered comparison, not spot-checked
 - `test_times_come_from_the_context_not_from_the_model` — the whole
   anti-hallucination guarantee, in one assertion
 - `test_cutting_the_setup_for_a_kept_payoff_is_refused` — the check that most
@@ -3512,6 +4384,30 @@ Tests worth knowing about, because they pin the promises this layer makes:
   most of a normal cut
 - `test_nothing_but_the_runner_shells_out` — walked over the package's AST, so
   the render strategy stays testable without FFmpeg installed
+- `test_a_cue_never_lands_on_a_spoken_word` — asserted against the transcript
+  rather than against the cue list, because "a sting over the middle of a
+  sentence" is the single most obvious way an automated edit announces itself
+- `test_covering_speech_is_a_named_refusal` — the overlap check returned the
+  speech's start time as its "yes", so a line spoken at exactly 0.0s was waved
+  through by a falsy sentinel
+- `test_a_long_paragraph_is_refused_rather_than_condensed` — condensing thirty
+  words to five picks a phrase and presents it as the sentence
+- `test_what_survives_the_ceiling_is_what_scored_best` — a density limit that
+  kept whatever happened to be early would be a different feature
+- `test_only_a_short_list_of_checks_may_ever_block` — every check run against
+  every way its subject can go wrong, asserting that the set of gates which can
+  refuse an output stays the five that should
+- `test_a_check_that_raises_becomes_a_skipped_gate` — one broken check must not
+  cost the other fourteen
+- `test_a_dry_run_creates_nothing` — asserted on the filesystem, not on the
+  summary: it is the command a person types first over a library they care
+  about
+- `test_a_batch_continues_after_a_folder_fails` — the property that makes an
+  overnight batch worth starting
+- `test_rebuilding_a_package_says_what_is_true_now` — a review index that
+  listed a video which had been deleted would be worse than no index
+- `test_the_review_index_reports_a_settled_run_status` — "running" is true for
+  about four milliseconds and misleading afterwards
 
 ---
 
@@ -3537,6 +4433,48 @@ about how much evidence agreed, not permission anything has been given.
 reserved-slot counts, the share kept for good decisions, and the line between
 "uncertain" and "confident" are numbers somebody chose. Nobody has yet done
 twenty reviews and found out whether the queue puts the right things first.
+
+**Nobody has watched a retention cut.** The wiring produces the right shape on
+fixtures and on generated footage: a cold open at the front, compressed sag,
+protected setups. Whether an episode reshaped this way is actually better is a
+question only a person watching both proxies can answer, and no number this
+system produces will ever answer it.
+
+**Captions are never in the video, and are not placed in Premiere either.** The
+caption polish pass produces a plan and a sidecar `.srt`. Burning them into the
+proxy would mean a second full re-encode of the joined file; placing them in
+Premiere would mean wiring this pass into the style layer's operation list.
+Neither is built.
+
+**Nothing in the audio polish plays.** No level is measured, no file is
+listened to, and no cue it plans reaches the proxy — which carries the cut and
+its original audio and nothing else. In `assets` mode a match is tags, folder
+and duration, exactly as §14 describes.
+
+**The caption and cue heuristics have never been checked against a real
+episode.** Nine moment kinds, four keyword lists, a scoring formula and a
+per-minute budget, all calibrated against intuition and fixtures. Whether the
+lines it picks are the lines you would have picked is unknown, and
+`polish show-rejected` exists mostly so you can find out.
+
+**The reliability checks look at shape, not at taste.** Passing all fifteen
+says the output is well-formed. It says nothing about whether the edit works,
+and the report says so on every page.
+
+**"Background speech" is a heuristic with no diarisation behind it.** There is
+no speaker separation anywhere in this system. What the caption pass can
+actually see is speech the ASR was unsure of over audio measured as quiet, and
+it calls that background — which is two pieces of evidence pointing the same
+way, not a detection.
+
+**Batch mode is sequential and has no retry.** Twenty folders in order. A
+folder that fails is recorded and skipped past; re-running with `--resume` is a
+separate decision you make after reading the summary.
+
+**The retention wiring inherits Session 8's calibration.** Its risk thresholds,
+hook scores and severity bands were tuned against intuition. Until now that
+cost a marker in the wrong place; now it cuts footage, so a wrong finding is
+more expensive than it was.
 
 **The director has never been run against a large model on a real episode.**
 The API contract is verified against a real HTTP endpoint and the decisions are
@@ -3788,6 +4726,11 @@ values.
 | `EDITING_MODEL_DIR` | `E:\Assistant\AI_Models\editingllm` | Named in error messages |
 | `EDITING_FFMPEG` / `EDITING_FFPROBE` | `ffmpeg` / `ffprobe` | Full paths if not on PATH |
 | `EDITING_USE_PREMIERE` | `true` | Talk to Premiere at all |
+| `EDITING_RETENTION_MODE` | `report_only` | `off`, `report_only`, `retention`, `director_retention`, `hybrid` |
+| `EDITING_RETENTION_COLD_OPEN` | `true` | Move the best hook to the front |
+| `EDITING_MAX_COLD_OPEN_SECONDS` | `20` | Ceiling on the opening |
+| `EDITING_DEAD_AIR_AGGRESSIVENESS` | `medium` | `low`, `medium`, `high` |
+| `EDITING_RETENTION_COMPRESS` | `true` | Compress sagging stretches |
 | `EDITING_DIRECTOR_BACKEND` | `openai` | `openai` or `mock` |
 | `EDITING_DIRECTOR_BASE_URL` | `http://localhost:8000/v1` | Any OpenAI-compatible endpoint |
 | `EDITING_DIRECTOR_MODEL` | `qwen2.5-14b-instruct` | Model name at that endpoint |
