@@ -96,6 +96,9 @@ class ToolDecisionLayer:
         "file_delete", "delete_file", "delete_folder", "gmail_delete",
         "gmail_send", "shutdown", "restart", "purchase", "submit",
         "app_close_confirmed", "process_kill_confirmed",
+        "desktop_monitor_start", "desktop_monitor_stop",
+        "desktop_startup_enable_confirmed", "desktop_startup_disable",
+        "desktop_habit_delete", "desktop_activity_clear",
         "type_text", "press_key", "hotkey", "left_click", "double_click",
         "right_click", "scroll", "move_mouse",
     }

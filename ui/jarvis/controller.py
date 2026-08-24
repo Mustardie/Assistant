@@ -70,6 +70,15 @@ class JarvisUIController:
             ensure("web_results", data={"query": text})
         if re.search(r"\b(open|launch|start)\b.*\b(app|application|chrome|discord|spotify|calculator)\b", lower):
             ensure("app_launcher", data={"query": text})
+        if re.search(r"\b(what am i doing|what do you think i(?:'m| am) working on|current mode|desktop context|what app am i using)\b", lower):
+            ensure("desktop_context")
+            ensure("current_mode")
+        if re.search(r"\b(habits?|routines?|suggest(?:ion)?|learn my desktop routine|skill from .*routine)\b", lower):
+            ensure("routine_suggestions")
+        if re.search(r"\b(desktop awareness|desktop monitoring|stop monitoring|pause monitoring|resume monitoring|privacy mode|background)\b", lower):
+            ensure("privacy_monitoring")
+        if re.search(r"\b(start with windows|startup status|disable startup)\b", lower):
+            ensure("startup_status")
         if re.search(r"\b(clipboard|copied|copy buffer)\b", lower):
             ensure("clipboard")
         if re.search(r"\b(skill|watch me do|record this workflow)\b", lower):

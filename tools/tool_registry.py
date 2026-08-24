@@ -960,11 +960,16 @@ def inbox_scan_downloads(query="assignment worksheet homework", days=3, limit=12
 
     if str(source).lower() in {InboxSource.WHATSAPP.value, InboxSource.DISCORD.value}:
         return _inbox_service().scan_limited_source(str(source).lower(), query=str(query), days=float(days), limit=int(limit))
-    return _inbox_service().scan_downloads(query=str(query), days=float(days), limit=int(limit))
+    result = _inbox_service().scan_downloads(query=str(query), days=float(days), limit=int(limit))
+    if result.get("success"):
+        for candidate in (result.get("candidates") or [])[:max(0, min(int(limit), 25))]:
+            if isinstance(candidate, dict) and candidate.get("path"):
+                _context_service().record_file_activity("detected", candidate["path"], download=True, source="explicit_downloads_scan")
+    return result
 
 
 def inbox_ingest_file(path, source="manual_import", message="", sender="", channel="", timestamp=""):
-    return _inbox_service().ingest_file(
+    result = _inbox_service().ingest_file(
         path,
         source=source,
         message=message,
@@ -972,6 +977,9 @@ def inbox_ingest_file(path, source="manual_import", message="", sender="", chann
         channel=channel,
         timestamp=timestamp,
     ).to_dict()
+    if result.get("success"):
+        _context_service().record_file_activity("ingest", path, source="jarvis_inbox")
+    return result
 
 
 def inbox_ingest_folder(path, source="folder_watch", message="", limit=25):
@@ -1064,6 +1072,17 @@ def _desktop_service():
     return get_desktop_service()
 
 
+def _context_service():
+    from tools.desktop_context import get_desktop_context_service
+    return get_desktop_context_service()
+
+
+def _remember_desktop_file(action, path, result, app_name=None):
+    if isinstance(result, dict) and result.get("success") and result.get("verified", True):
+        _context_service().record_file_activity(action, str(path), app_name)
+    return result
+
+
 def desktop_get_state():
     return _desktop_service().get_state().to_dict()
 
@@ -1096,7 +1115,17 @@ def app_open(query, path=None, working_directory=None, confirmation_id=None, con
     request = AppLaunchRequest(str(query), file_path=file_path, working_directory=workdir,
                                arguments=arguments, focus_existing=not bool(path),
                                confirmation_id=confirmation_id, confirmed=bool(confirm))
-    return _desktop_service().open_app(request).to_dict()
+    result = _desktop_service().open_app(request).to_dict()
+    if result.get("success") and result.get("verified"):
+        from tools.desktop_context_models import DesktopEventType
+        _context_service().record_event(
+            DesktopEventType.APP_ACTION,
+            app_name=str(query), summary="app opened or focused",
+            metadata={"action": "open", "app_name": str(query), "status": result.get("status")},
+        )
+        if file_path:
+            _remember_desktop_file("open", file_path, result, str(query))
+    return result
 
 
 def app_focus(query):
@@ -1104,15 +1133,18 @@ def app_focus(query):
 
 
 def app_open_file(path, app=None, confirmation_id=None, confirm=False):
-    return _desktop_service().open_file(path, app, confirmation_id=confirmation_id, confirm=confirm).to_dict()
+    result = _desktop_service().open_file(path, app, confirmation_id=confirmation_id, confirm=confirm).to_dict()
+    return _remember_desktop_file("open", path, result, app)
 
 
 def app_open_folder(path):
-    return _desktop_service().open_folder(path).to_dict()
+    result = _desktop_service().open_folder(path).to_dict()
+    return _remember_desktop_file("open_folder", path, result, "File Explorer")
 
 
 def app_show_in_folder(path):
-    return _desktop_service().show_in_folder(path).to_dict()
+    result = _desktop_service().show_in_folder(path).to_dict()
+    return _remember_desktop_file("reveal", path, result, "File Explorer")
 
 
 def app_minimize(query=None, window_handle=None):
@@ -1143,6 +1175,130 @@ def process_kill_confirmed(confirmation_id, confirm=False):
     return _desktop_service().kill_confirmed(confirmation_id, confirm=confirm).to_dict()
 
 
+# ---------------- Background desktop context and habit learning ---------------- #
+
+def desktop_context_snapshot():
+    snapshot = _context_service().capture_snapshot(persist=False)
+    return {"success": True, "snapshot": snapshot.to_dict()}
+
+
+def desktop_monitor_start(confirm=False):
+    return _context_service().start(confirm=confirm)
+
+
+def desktop_monitor_stop(confirm=False):
+    return _context_service().stop(confirm=confirm, disable=True)
+
+
+def desktop_monitor_pause():
+    return _context_service().pause()
+
+
+def desktop_monitor_resume():
+    return _context_service().resume()
+
+
+def desktop_monitor_status():
+    return {"success": True, "status": _context_service().status().to_dict()}
+
+
+def desktop_startup_status():
+    from tools.desktop_startup import get_startup_manager
+    return {"success": True, "status": get_startup_manager().status().to_dict()}
+
+
+def desktop_startup_enable_plan():
+    from tools.desktop_startup import get_startup_manager
+    return get_startup_manager().enable_plan()
+
+
+def desktop_startup_enable_confirmed(confirmation_id, confirm=False):
+    from tools.desktop_startup import get_startup_manager
+    return get_startup_manager().enable_confirmed(confirmation_id, confirm=confirm)
+
+
+def desktop_startup_disable(confirm=False):
+    from tools.desktop_startup import get_startup_manager
+    return get_startup_manager().disable(confirm=confirm)
+
+
+def desktop_habits_list(refresh=True):
+    habits = _context_service().learn_habits() if refresh else _context_service().store.habits()
+    return {"success": True, "habits": habits, "raw_events_included": False}
+
+
+def desktop_habit_explain(habit_id):
+    return _context_service().habit_explain(habit_id)
+
+
+def desktop_habit_delete(habit_id, confirm=False):
+    if not confirm:
+        return {"success": False, "status": "confirmation_required", "requires_confirmation": True,
+                "confirmation": {"action": "Delete learned habit", "target": habit_id,
+                                 "risk": "Permanently removes this local learned summary"}}
+    return _context_service().habit_delete(habit_id)
+
+
+def desktop_habit_disable(habit_id, disabled=True):
+    return _context_service().habit_disable(habit_id, disabled)
+
+
+def desktop_activity_clear(confirm=False):
+    if not confirm:
+        return {"success": False, "status": "confirmation_required", "requires_confirmation": True,
+                "confirmation": {"action": "Clear safe desktop activity history", "target": "bounded local activity store",
+                                 "risk": "Permanently removes learning evidence"}}
+    return _context_service().clear_activity()
+
+
+def desktop_activity_list(limit=50):
+    return _context_service().activity_timeline(limit)
+
+
+def desktop_mode_predict():
+    return _context_service().prediction()
+
+
+def desktop_suggestions_list(generate=True):
+    return _context_service().suggestions(generate=generate)
+
+
+def desktop_suggestion_dismiss(suggestion_id):
+    return _context_service().dismiss_suggestion(suggestion_id)
+
+
+def desktop_suggestion_accept(suggestion_id):
+    return _context_service().accept_suggestion(suggestion_id)
+
+
+def desktop_suggestion_type_disable(suggestion_type):
+    return _context_service().disable_suggestion_type(suggestion_type)
+
+
+def desktop_gaming_suggestions_set(allowed=False):
+    return _context_service().set_gaming_suggestions(allowed)
+
+
+def desktop_prediction_mark_wrong(predicted_mode, actual_mode=None):
+    return _context_service().mark_prediction_wrong(predicted_mode, actual_mode)
+
+
+def desktop_privacy_set(mode, confirm=False):
+    if str(mode).lower() == "off" and not confirm:
+        return {"success": False, "status": "confirmation_required", "requires_confirmation": True,
+                "confirmation": {"action": "Turn standard title redaction off", "target": "desktop context monitor",
+                                 "risk": "More window-title metadata may be stored"}}
+    return _context_service().set_privacy_mode(mode)
+
+
+def desktop_create_skill_from_routine_plan(habit_id):
+    return _context_service().create_skill_plan(habit_id)
+
+
+def desktop_context_debug_summary():
+    return {"success": True, "summary": _context_service().store.debug_summary()}
+
+
 # ---------------- Tool Registry ---------------- #
 
 TOOLS = {
@@ -1165,6 +1321,33 @@ TOOLS = {
     "app_close_confirmed": app_close_confirmed,
     "process_kill_plan": process_kill_plan,
     "process_kill_confirmed": process_kill_confirmed,
+
+    "desktop_context_snapshot": desktop_context_snapshot,
+    "desktop_monitor_start": desktop_monitor_start,
+    "desktop_monitor_stop": desktop_monitor_stop,
+    "desktop_monitor_pause": desktop_monitor_pause,
+    "desktop_monitor_resume": desktop_monitor_resume,
+    "desktop_monitor_status": desktop_monitor_status,
+    "desktop_startup_status": desktop_startup_status,
+    "desktop_startup_enable_plan": desktop_startup_enable_plan,
+    "desktop_startup_enable_confirmed": desktop_startup_enable_confirmed,
+    "desktop_startup_disable": desktop_startup_disable,
+    "desktop_habits_list": desktop_habits_list,
+    "desktop_habit_explain": desktop_habit_explain,
+    "desktop_habit_delete": desktop_habit_delete,
+    "desktop_habit_disable": desktop_habit_disable,
+    "desktop_activity_clear": desktop_activity_clear,
+    "desktop_activity_list": desktop_activity_list,
+    "desktop_mode_predict": desktop_mode_predict,
+    "desktop_suggestions_list": desktop_suggestions_list,
+    "desktop_suggestion_dismiss": desktop_suggestion_dismiss,
+    "desktop_suggestion_accept": desktop_suggestion_accept,
+    "desktop_suggestion_type_disable": desktop_suggestion_type_disable,
+    "desktop_gaming_suggestions_set": desktop_gaming_suggestions_set,
+    "desktop_prediction_mark_wrong": desktop_prediction_mark_wrong,
+    "desktop_privacy_set": desktop_privacy_set,
+    "desktop_create_skill_from_routine_plan": desktop_create_skill_from_routine_plan,
+    "desktop_context_debug_summary": desktop_context_debug_summary,
 
     "browser_open": browser_open,
     "youtube_recommend": youtube_recommend,

@@ -19,6 +19,10 @@ SW_RESTORE = 9
 WM_CLOSE = 0x0010
 
 
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
 def _app_name(executable_path: str | None, title: str) -> str:
     executable = Path(executable_path).name if executable_path else ""
     known = resolve_known_app(executable) or resolve_known_app(title)
@@ -71,6 +75,11 @@ class WindowsWindowBackend:
             self._kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
             self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             self._kernel32.CloseHandle.restype = wintypes.BOOL
+            self._user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+            self._user32.GetLastInputInfo.restype = wintypes.BOOL
+            if hasattr(self._kernel32, "GetTickCount64"):
+                self._kernel32.GetTickCount64.argtypes = []
+                self._kernel32.GetTickCount64.restype = ctypes.c_ulonglong
         except (AttributeError, TypeError):
             # Injectable fakes do not expose ctypes function attributes.
             return
@@ -133,6 +142,20 @@ class WindowsWindowBackend:
 
     def active_window(self) -> WindowInfo | None:
         return next((window for window in self.list_windows() if window.active), None)
+
+    def idle_seconds(self) -> float | None:
+        """Return time since input, never the input itself."""
+        if not self.supported or not self._user32 or not self._kernel32:
+            return None
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not self._user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        try:
+            ticks = int(self._kernel32.GetTickCount64())
+        except AttributeError:
+            ticks = int(self._kernel32.GetTickCount())
+        return max(0.0, (ticks - int(info.dwTime)) / 1000.0)
 
     def focus(self, handle: int) -> bool:
         if not self.supported or not self._user32 or not self._user32.IsWindow(handle):

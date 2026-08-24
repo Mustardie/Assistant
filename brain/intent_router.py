@@ -17,6 +17,7 @@ class Intent(str, Enum):
     QUESTION = "answer_question"
     LOCAL_TASK = "local_file_task"
     APP_CONTROL = "app_tool_control"
+    DESKTOP_CONTEXT = "desktop_context_and_habits"
     CONNECTOR = "connector_request"
     MEMORY = "memory_request"
     SKILL_EXECUTION = "skill_execution"
@@ -73,6 +74,13 @@ class IntentRouter:
     _AUTOMATION = re.compile(
         r"\b(remind me|every (?:day|week|month|hour)|monitor|watch for|notify me|"
         r"when .* happens|schedule|automation)\b",
+        re.I,
+    )
+    _DESKTOP_CONTEXT = re.compile(
+        r"\b(run in (?:the )?background|start with windows|desktop awareness|desktop monitoring|"
+        r"stop monitoring|pause monitoring|resume monitoring|what am i doing|what do you think i(?:'m| am) working on|"
+        r"learn(?:ed)? (?:my )?(?:desktop )?routine|what habits|forget (?:that |this )?habit|"
+        r"skill from (?:this |the )?routine|don't bother me while gaming|do not bother me while gaming)\b",
         re.I,
     )
     _CONNECTORS = {
@@ -167,6 +175,40 @@ class IntentRouter:
                 clarification_needed=needs_value,
                 can_answer_directly=not needs_value,
                 memory_relevant=True,
+            )
+
+        if self._DESKTOP_CONTEXT.search(text):
+            lowered = text.lower()
+            if "start with windows" in lowered:
+                tools = ["desktop_startup_enable_plan"]
+            elif re.search(r"\bstop (?:desktop )?monitoring\b", lowered):
+                tools = ["desktop_monitor_stop"]
+            elif "pause" in lowered:
+                tools = ["desktop_monitor_pause"]
+            elif "resume" in lowered:
+                tools = ["desktop_monitor_resume"]
+            elif "run in" in lowered and "background" in lowered:
+                tools = ["desktop_monitor_start"]
+            elif "what habits" in lowered or "learn" in lowered:
+                tools = ["desktop_habits_list"]
+            elif "forget" in lowered and "habit" in lowered:
+                tools = ["desktop_habits_list", "desktop_habit_delete"]
+            elif "skill from" in lowered:
+                tools = ["desktop_habits_list", "desktop_create_skill_from_routine_plan"]
+            elif "gaming" in lowered:
+                tools = ["desktop_gaming_suggestions_set"]
+            else:
+                tools = ["desktop_context_snapshot", "desktop_mode_predict"]
+            persistent = any(tool in {"desktop_monitor_start", "desktop_monitor_stop", "desktop_startup_enable_plan"} for tool in tools)
+            return IntentDecision(
+                Intent.DESKTOP_CONTEXT,
+                0.98,
+                likely_required_tools=tools,
+                memory_relevant=True,
+                safety_notes=[
+                    "collect only bounded safe metadata and respect privacy mode",
+                    *( ["persistent background or startup changes require clear confirmation"] if persistent else [] ),
+                ],
             )
 
         if self._AUTOMATION.search(text):

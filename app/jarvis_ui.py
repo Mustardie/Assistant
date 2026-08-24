@@ -82,15 +82,17 @@ class _RuntimeRelay(QObject):
     state = Signal(str)
     event = Signal(str, object)
     status = Signal(object)
+    context = Signal(object)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Voice-first JARVIS interface")
     parser.add_argument("--demo", action="store_true", help="Open with mock widgets and no agent, mic, or external services")
+    parser.add_argument("--start-minimized", action="store_true", help="Start in the visible system tray when it is available")
     return parser
 
 
-def _wire_runtime(window: JarvisWindow) -> None:
+def _wire_runtime(window: JarvisWindow, context_service) -> None:
     """Attach the existing agent and voice stack with Qt-safe relays."""
     relay = _RuntimeRelay(window)
     try:
@@ -99,7 +101,7 @@ def _wire_runtime(window: JarvisWindow) -> None:
         from config.settings import PROVIDER_MODEL_FIELD, settings
 
         agent = Agent()
-        widget_backend = JarvisWidgetBackend(agent=agent)
+        widget_backend = JarvisWidgetBackend(agent=agent, context_service=context_service)
     except Exception as exc:
         logger.exception("JARVIS agent initialization failed")
         window.widget_manager.update(
@@ -120,10 +122,31 @@ def _wire_runtime(window: JarvisWindow) -> None:
             threading.Thread(target=manager.handle_speak, args=(message,), daemon=True).start()
 
     agent.set_voice_callback(on_speak)
-    agent.set_event_callback(lambda event_type, payload: relay.event.emit(event_type, payload))
+    def relay_agent_event(event_type, payload):
+        context_service.observe_runtime_event(event_type, payload)
+        relay.event.emit(event_type, payload)
+
+    agent.set_event_callback(relay_agent_event)
     relay.response.connect(window.append_assistant)
     relay.state.connect(window.set_voice_state)
     relay.event.connect(window.controller.handle_agent_event)
+
+    def update_context_widgets(payload):
+        kind = str((payload or {}).get("event") or "")
+        tray = getattr(window, "_jarvis_tray", None)
+        if tray is not None and kind == "monitoring":
+            tray.refresh_monitoring()
+        if kind == "context_updated":
+            widget = window.widget_manager.find_type("desktop_context")
+            if widget:
+                window.widget_manager.update(widget.widget_id, data={"snapshot": payload.get("snapshot") or {}})
+        for widget_type in ("current_mode", "routine_suggestions", "privacy_monitoring"):
+            widget = window.widget_manager.find_type(widget_type)
+            if widget and kind in {"context_updated", "monitoring"}:
+                window.widgetAction.emit(widget.widget_id, "refresh", {})
+
+    relay.context.connect(update_context_widgets)
+    context_service.subscribe(lambda payload: relay.context.emit(payload))
     model_field = PROVIDER_MODEL_FIELD.get(settings.llm_provider)
     active_model = getattr(settings, model_field, "") if model_field else ""
     window.update_system_status(
@@ -136,6 +159,7 @@ def _wire_runtime(window: JarvisWindow) -> None:
 
     def run_text(text: str) -> None:
         mode["value"] = "text"
+        context_service.record_command(text)
         window.begin_reply()
         threading.Thread(target=agent.run, args=(text,), daemon=True, name="jarvis-text-task").start()
 
@@ -174,6 +198,24 @@ def _wire_runtime(window: JarvisWindow) -> None:
         threading.Thread(target=execute_widget_action, daemon=True, name=f"jarvis-widget-{state.widget_type}").start()
 
     window.widgetAction.connect(widget_action)
+    window.events.subscribe("*", lambda event: context_service.observe_ui_event(event.event_type, event.payload))
+
+    def widget_types():
+        return [state.widget_type for state in window.widget_manager.all(include_minimized=False)]
+
+    def connector_statuses():
+        try:
+            from connectors.defaults import default_registry
+            registry = default_registry()
+            return {name: registry.status(name).value for name in registry.names()}
+        except Exception:
+            return {}
+
+    context_service.configure_providers(
+        widget_provider=widget_types,
+        task_provider=lambda: window.controller.current_goal or None,
+        connector_provider=connector_statuses,
+    )
 
     def resolve_confirmation(_confirmation_id: str, approved: bool) -> None:
         threading.Thread(target=agent.run, args=("yes" if approved else "no",), daemon=True, name="jarvis-confirmation").start()
@@ -228,6 +270,7 @@ def _wire_runtime(window: JarvisWindow) -> None:
 
     window._jarvis_agent = agent
     window._jarvis_voice_manager = voice["manager"]
+    window._jarvis_context_service = context_service
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -236,9 +279,20 @@ def main(argv: list[str] | None = None) -> int:
     application = QApplication.instance() or QApplication(sys.argv)
     application.setApplicationName("JARVIS")
     window = JarvisWindow(demo_mode=args.demo)
+    from tools.desktop_context import get_desktop_context_service
+    from ui.jarvis.tray import JarvisTrayController
+
+    context_service = get_desktop_context_service()
+    context_service.record_system_lifecycle("startup")
+    tray = JarvisTrayController(window, context_service)
+    if tray.available:
+        application.setQuitOnLastWindowClosed(False)
     if not args.demo:
-        _wire_runtime(window)
-    window.show()
+        _wire_runtime(window, context_service)
+        context_service.autostart_if_enabled()
+    if not args.start_minimized or not tray.available:
+        window.show()
+    window._jarvis_tray_controller = tray
     return application.exec()
 
 

@@ -18,9 +18,11 @@ from config.paths import get_nova_app_file
 
 
 class JarvisWidgetBackend:
-    def __init__(self, *, agent=None, desktop_service=None):
+    def __init__(self, *, agent=None, desktop_service=None, context_service=None, startup_manager=None):
         self.agent = agent
         self.desktop_service = desktop_service
+        self.context_service = context_service
+        self.startup_manager = startup_manager
         self.notes_file = get_nova_app_file("jarvis_notes.json")
         self.reminders_file = get_nova_app_file("jarvis_reminders.json")
         self.calendar_file = get_nova_app_file("jarvis_calendar.json")
@@ -149,6 +151,119 @@ class JarvisWidgetBackend:
             return self.desktop_service
         from tools.desktop_control import get_desktop_service
         return get_desktop_service()
+
+    def _context(self):
+        if self.context_service is not None:
+            return self.context_service
+        from tools.desktop_context import get_desktop_context_service
+        return get_desktop_context_service()
+
+    def _startup(self):
+        if self.startup_manager is not None:
+            return self.startup_manager
+        from tools.desktop_startup import get_startup_manager
+        return get_startup_manager()
+
+    def _desktop_context(self, action, payload, state):
+        snapshot = self._context().capture_snapshot(persist=False).to_dict()
+        context = snapshot.get("context") or {}
+        items = [
+            {"name": "Active app", "status": context.get("active_app") or "Unknown"},
+            {"name": "Monitoring", "status": snapshot.get("monitoring_state")},
+            {"name": "Privacy", "status": snapshot.get("privacy_mode")},
+        ]
+        items.extend({"name": app, "status": "running"} for app in context.get("important_running_apps") or [])
+        return self._ok({"snapshot": snapshot, "items": items}, notice="Safe desktop context refreshed")
+
+    def _current_mode(self, action, payload, state):
+        if action == "mark_wrong":
+            prediction = state.get("prediction") or {}
+            result = self._context().mark_prediction_wrong(
+                str(prediction.get("mode") or "unknown"), payload.get("actual_mode") or payload.get("query"),
+            )
+            return self._ok({**state, "feedback": result}, notice="Prediction feedback stored without raw context")
+        result = self._context().prediction()
+        prediction = result.get("prediction") or {}
+        items = [{"name": prediction.get("mode", "unknown"), "status": f"{float(prediction.get('confidence') or 0):.0%} confidence"}]
+        items.extend({"name": evidence, "status": "evidence"} for evidence in prediction.get("evidence") or [])
+        return self._ok({**result, "items": items}, notice=f"Predicted mode: {prediction.get('mode', 'unknown')}")
+
+    def _routine_suggestions(self, action, payload, state):
+        selected = self._selected(payload)
+        selected_id = selected.get("id") if isinstance(selected, dict) else str(selected or "")
+        if action == "dismiss":
+            if not selected_id:
+                return self._error("Choose a suggestion to dismiss.")
+            result = self._context().dismiss_suggestion(selected_id)
+            if not result.get("success"):
+                return self._error(result.get("error") or "Suggestion was not found")
+        elif action == "accept":
+            if not selected_id:
+                return self._error("Choose a suggestion to accept.")
+            result = self._context().accept_suggestion(selected_id)
+            if not result.get("success"):
+                return self._error(result.get("error") or "Suggestion was not found")
+        elif action == "disable":
+            habit_id = (selected.get("routine_id") or selected.get("id")) if isinstance(selected, dict) else selected_id
+            result = self._context().habit_disable(str(habit_id or ""), True)
+            if not result.get("success"):
+                return self._error(result.get("error") or "Choose a learned routine to disable.")
+        elif action == "create_skill":
+            habit_id = (selected.get("routine_id") or selected.get("id")) if isinstance(selected, dict) else selected_id
+            result = self._context().create_skill_plan(str(habit_id or ""))
+            return self._ok({"items": [result.get("plan")], "plan": result.get("plan")}, notice="Review-only skill plan created") if result.get("success") else self._error(result.get("error"))
+        suggestions = self._context().suggestions(generate=action in {"refresh", "generate"})
+        habits = self._context().learn_habits()
+        return self._ok({"suggestions": suggestions.get("suggestions") or [], "habits": habits}, notice="Suggestions are review-only and dismissible")
+
+    def _privacy_monitoring(self, action, payload, state):
+        service = self._context()
+        if action == "pause":
+            result = service.pause()
+        elif action == "resume":
+            result = service.resume()
+        elif action == "start":
+            result = service.start(confirm=bool(payload.get("confirm")))
+        elif action == "stop":
+            result = service.stop(confirm=bool(payload.get("confirm")), disable=True)
+        elif action == "privacy":
+            mode = str(payload.get("mode") or payload.get("query") or "standard")
+            if mode.lower() == "off" and not payload.get("confirm"):
+                result = {"success": False, "requires_confirmation": True,
+                          "confirmation": {"action": "Disable standard window-title redaction", "risk": "More title metadata may be stored", "target": "Desktop awareness"}}
+            else:
+                result = service.set_privacy_mode(mode)
+        else:
+            result = {"success": True, "status": service.status().to_dict()}
+        if result.get("requires_confirmation"):
+            return {**result, "data": {"status": service.status().to_dict()},
+                    "pending_prompt": f"After the user approves, perform desktop awareness action {action!r} with explicit confirmation and report its verified status."}
+        if not result.get("success"):
+            return self._error(result.get("error") or "Monitoring action failed")
+        status = service.status().to_dict()
+        items = [{"name": "Monitoring", "status": status.get("state")}, {"name": "Privacy", "status": status.get("privacy_mode")},
+                 {"name": "Safe events stored", "status": status.get("events_stored", 0)}]
+        return self._ok({"status": status, "items": items}, notice=f"Desktop awareness {status.get('state')}")
+
+    def _startup_status(self, action, payload, state):
+        manager = self._startup()
+        if action == "enable":
+            result = manager.enable_plan()
+            if not result.get("success"):
+                return self._error(result.get("error") or "Startup is unavailable")
+            plan = result["plan"]
+            return {"success": True, "data": {"plan": plan},
+                    "confirmation": {"confirmation_id": plan["confirmation_id"], "action": "Start JARVIS with Windows", "risk": plan["risk"], "target": plan["target"]},
+                    "pending_prompt": f"Call desktop_startup_enable_confirmed with confirmation_id={plan['confirmation_id']!r} and confirm=true, then verify desktop_startup_status."}
+        if action == "disable":
+            result = manager.disable(confirm=bool(payload.get("confirm")))
+            if result.get("requires_confirmation"):
+                return {**result, "data": {"status": manager.status().to_dict()},
+                        "pending_prompt": "Call desktop_startup_disable with confirm=true after this approval, then verify desktop_startup_status."}
+        status = manager.status().to_dict()
+        items = [{"name": "Start with Windows", "status": "enabled" if status.get("enabled") else "disabled"},
+                 {"name": "Method", "status": status.get("method")}, {"name": "Start minimized", "status": status.get("start_minimized")}]
+        return self._ok({"status": status, "items": items}, notice=f"Startup {'enabled' if status.get('enabled') else 'disabled'}")
 
     def _system_status(self, action, payload, state):
         desktop = self._desktop().get_state().to_dict()
@@ -353,9 +468,20 @@ class JarvisWidgetBackend:
     def _activity(self, action, payload, state):
         items = self._load(self.activity_file, [])
         if action == "clear":
+            if not payload.get("confirm"):
+                return {"success": True,
+                        "confirmation": {"action": "Clear activity timeline", "risk": "Removes bounded local activity and learning evidence", "target": "JARVIS activity history"},
+                        "pending_prompt": "Call desktop_activity_clear with confirm=true after approval, then refresh the Activity Timeline."}
             items = []
             self._save(self.activity_file, items)
-        return self._ok({"activity": items[-100:]}, notice=f"{len(items[-100:])} activity event(s)")
+            self._context().clear_activity()
+        safe_context = self._context().activity_timeline(60).get("activity") or []
+        context_items = [{"title": item.get("summary") or item.get("event_type"),
+                          "status": item.get("event_type"), "detail": item.get("app_name") or "",
+                          "time": item.get("timestamp")} for item in safe_context]
+        combined = [*items[-100:], *context_items]
+        combined.sort(key=lambda item: str(item.get("time") or ""))
+        return self._ok({"activity": combined[-100:], "raw_metadata_included": False}, notice=f"{len(combined[-100:])} safe activity event(s)")
 
     def _clipboard(self, action, payload, state):
         text = str(payload.get("text") or state.get("text") or "")

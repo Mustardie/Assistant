@@ -520,6 +520,11 @@ _LIST_WIDGETS = {
     "system_monitor": {"placeholder": None, "primary": ("REFRESH", "refresh"), "secondary": None, "keys": ("metrics", "items"), "empty": "Collecting local system metrics…"},
     "code_task": {"placeholder": "Describe a development task…", "primary": ("RUN TESTS", "run_tests"), "secondary": ("OPEN FILE", "open_file"), "keys": ("files", "tests", "items"), "empty": "No active development task."},
     "activity": {"placeholder": "Filter activity…", "primary": ("REFRESH", "refresh"), "secondary": ("CLEAR", "clear"), "keys": ("activity", "items"), "empty": "No JARVIS activity recorded in this session."},
+    "desktop_context": {"placeholder": None, "primary": ("REFRESH", "refresh"), "secondary": None, "keys": ("items",), "empty": "Desktop context is unavailable or monitoring is off."},
+    "current_mode": {"placeholder": "Correct mode (optional)…", "primary": ("REFRESH", "refresh"), "secondary": ("MARK WRONG", "mark_wrong"), "keys": ("items",), "empty": "There is not enough safe evidence to predict a mode."},
+    "routine_suggestions": {"placeholder": None, "primary": ("REFRESH", "refresh"), "secondary": ("DISMISS", "dismiss"), "extra": (("ACCEPT", "accept", {}), ("DISABLE", "disable", {}), ("CREATE SKILL", "create_skill", {})), "keys": ("suggestions", "habits", "items"), "empty": "No useful routine suggestion right now."},
+    "privacy_monitoring": {"placeholder": None, "primary": ("ENABLE", "start"), "secondary": ("REFRESH", "refresh"), "extra": (("STRICT", "privacy", {"mode": "strict"}), ("STANDARD", "privacy", {"mode": "standard"})), "keys": ("items",), "empty": "Desktop awareness is disabled."},
+    "startup_status": {"placeholder": None, "primary": ("ENABLE", "enable"), "secondary": ("DISABLE", "disable"), "keys": ("items",), "empty": "Windows startup status is unavailable."},
     "inbox_item": {"placeholder": "Find recent assignment downloads…", "primary": ("SCAN", "scan"), "secondary": ("INGEST", "ingest"), "keys": ("candidates", "items"), "empty": "No imported or downloaded inbox attachments."},
     "assignment_analysis": {"placeholder": None, "primary": ("ANALYZE", "analyze"), "secondary": ("CREATE PLAN", "plan"), "keys": ("analyses", "instructions", "questions", "items"), "empty": "Ingest an attachment to analyze its assignment instructions."},
     "assignment_plan": {"placeholder": None, "primary": ("REFRESH", "refresh"), "secondary": ("CREATE DRAFT", "draft"), "keys": ("tasks", "steps", "items"), "empty": "No assignment plan has been created."},
@@ -564,15 +569,24 @@ class ListActionWidget(WidgetContent):
         actions = QHBoxLayout()
         actions.addStretch(1)
         self.primary = QPushButton(self.config["primary"][0])
+        self._primary_action = self.config["primary"][1]
         self.primary.setStyleSheet(button_style(accent=True))
         self.primary.clicked.connect(self._primary)
         actions.addWidget(self.primary)
         self.secondary = None
         if self.config.get("secondary"):
             self.secondary = QPushButton(self.config["secondary"][0])
+            self._secondary_action = self.config["secondary"][1]
             self.secondary.setStyleSheet(button_style())
             self.secondary.clicked.connect(self._secondary)
             actions.addWidget(self.secondary)
+        self.extra_buttons = []
+        for label, action, payload in self.config.get("extra", ()):
+            button = QPushButton(label)
+            button.setStyleSheet(button_style())
+            button.clicked.connect(lambda _checked=False, value=action, extra=dict(payload): self.request(value, {**self._payload(), **extra}))
+            actions.addWidget(button)
+            self.extra_buttons.append(button)
         layout.addLayout(actions)
         self.apply_state(state)
 
@@ -585,11 +599,11 @@ class ListActionWidget(WidgetContent):
         }
 
     def _primary(self):
-        self.request(self.config["primary"][1], self._payload())
+        self.request(self._primary_action, self._payload())
 
     def _secondary(self):
         if self.config.get("secondary"):
-            self.request(self.config["secondary"][1], self._payload())
+            self.request(self._secondary_action, self._payload())
 
     def apply_state(self, state):
         super().apply_state(state)
@@ -613,6 +627,24 @@ class ListActionWidget(WidgetContent):
             self.notice.setText(self.config["empty"])
         if self.query and data.get("query") and not self.query.text():
             self.query.setText(str(data["query"]))
+        if state.widget_type == "privacy_monitoring":
+            monitoring = data.get("status") if isinstance(data.get("status"), dict) else {}
+            current = str(monitoring.get("state") or "disabled")
+            if current == "running":
+                self.primary.setText("PAUSE")
+                self._primary_action = "pause"
+                self.secondary.setText("STOP")
+                self._secondary_action = "stop"
+            elif current == "paused":
+                self.primary.setText("RESUME")
+                self._primary_action = "resume"
+                self.secondary.setText("STOP")
+                self._secondary_action = "stop"
+            else:
+                self.primary.setText("ENABLE")
+                self._primary_action = "start"
+                self.secondary.setText("REFRESH")
+                self._secondary_action = "refresh"
 
 
 _TEXT_WIDGETS = {

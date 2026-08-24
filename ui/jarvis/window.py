@@ -251,6 +251,7 @@ class JarvisWindow(QWidget):
             "system_status", "calendar", "reminders", "notes", "app_launcher",
             "transfers", "notifications", "email", "connectors", "tool_inspector",
             "plan_inspector", "automation", "skills", "system_monitor", "activity",
+            "desktop_context", "current_mode", "routine_suggestions", "privacy_monitoring", "startup_status",
         }
         if widget_type == "weather" and state.data.get("location"):
             auto_refresh.add("weather")
@@ -376,6 +377,9 @@ class JarvisWindow(QWidget):
 
     def set_voice_state(self, state: str) -> None:
         self.controller.set_state(state)
+        tray = getattr(self, "_jarvis_tray", None)
+        if tray is not None:
+            tray.set_status(state)
         labels = {
             "listening": {"mic": "Listening now", "task": "Voice capture"},
             "thinking": {"mic": "Ready", "task": "Processing request"},
@@ -428,6 +432,9 @@ class JarvisWindow(QWidget):
     def _handle_event(self, event: JarvisEvent) -> None:
         if event.event_type == JarvisEventType.JARVIS_STATE_CHANGED.value:
             state = event.payload.get("state", "idle")
+            tray = getattr(self, "_jarvis_tray", None)
+            if tray is not None:
+                tray.set_status(state)
             self.core.set_state(state, event.payload.get("detail", ""))
             self.voice_button.set_active(state == "listening")
             detail = event.payload.get("detail") or state.replace("_", " ")
@@ -436,6 +443,14 @@ class JarvisWindow(QWidget):
             self.transcript.setText(str(event.payload.get("text") or ""))
         elif event.event_type == JarvisEventType.CONFIRMATION_REQUIRED.value:
             self.controller.handle_agent_event("confirmation_required", event.payload)
+
+    def closeEvent(self, event) -> None:
+        tray = getattr(self, "_jarvis_tray", None)
+        if tray is not None and tray.available and not tray._quitting:
+            self.hide()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _palette_selected(self, widget_type: str):
         self.request_widget(widget_type)
