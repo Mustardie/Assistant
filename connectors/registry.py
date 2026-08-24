@@ -62,6 +62,7 @@ def _file_profiles(name: str, value: Any) -> tuple[dict, ...]:
         "google_drive": FileSource.GOOGLE_DRIVE,
         "drive": FileSource.GOOGLE_DRIVE,
         "browser": FileSource.BROWSER_DOWNLOAD,
+        "browser_downloads": FileSource.BROWSER_DOWNLOAD,
         "calendar": FileSource.CALENDAR_ATTACHMENT,
         "discord": FileSource.MESSAGING_MEDIA,
         "whatsapp": FileSource.MESSAGING_MEDIA,
@@ -89,6 +90,25 @@ class ConnectorRegistry:
     def names(self) -> list[str]:
         return sorted(self._connectors)
 
+    def describe(self, name: str) -> dict:
+        connector = self._connectors.get(name)
+        if not connector:
+            return {"name": name, "display_name": name, "status": ConnectorStatus.UNAVAILABLE.value, "capabilities": [], "available": False, "reason": "Connector is not installed"}
+        status = self.status(name)
+        capabilities = self.capabilities(name)
+        available_count = sum(1 for item in capabilities if item.get("available"))
+        unavailable_reasons = list(dict.fromkeys(item.get("unavailable_reason") for item in capabilities if not item.get("available") and item.get("unavailable_reason")))
+        return {
+            "name": name,
+            "display_name": getattr(connector, "display_name", "") or name,
+            "status": status.value,
+            "available": status in {ConnectorStatus.READY, ConnectorStatus.DEGRADED} and available_count > 0,
+            "capabilities": capabilities,
+            "available_capabilities": available_count,
+            "reason": unavailable_reasons[0] if status != ConnectorStatus.READY and unavailable_reasons else "",
+            "limitations": unavailable_reasons,
+        }
+
     def status(self, name: str) -> ConnectorStatus:
         connector = self._connectors.get(name)
         if not connector:
@@ -104,7 +124,7 @@ class ConnectorRegistry:
         if not connector:
             return []
         try:
-            return [capability.__dict__.copy() for capability in connector.capabilities()]
+            return [capability.to_dict() for capability in connector.capabilities()]
         except Exception:
             return []
 
@@ -112,24 +132,10 @@ class ConnectorRegistry:
         connector = self._connectors.get(request.connector)
         if not connector:
             return ConnectorActionPlan(request, ConnectorStatus.UNAVAILABLE, False, reason="Connector is not installed")
-        status = self.status(request.connector)
-        if status != ConnectorStatus.READY:
-            return ConnectorActionPlan(request, status, False, reason=f"Connector status is {status.value}")
         try:
-            descriptor = next((item for item in connector.capabilities() if item.name == request.capability), None)
+            return connector.plan_action(request)
         except Exception as exc:
             return ConnectorActionPlan(request, ConnectorStatus.DEGRADED, False, reason=f"Capability discovery failed: {exc}")
-        if descriptor is None:
-            return ConnectorActionPlan(request, status, False, reason="Capability is not supported")
-        confirmation = bool(descriptor.requires_confirmation or descriptor.mutating)
-        return ConnectorActionPlan(
-            request,
-            status,
-            True,
-            requires_confirmation=confirmation,
-            may_retry=bool(not descriptor.mutating and descriptor.idempotent),
-            reason="User confirmation is required" if confirmation and not request.confirmed else "Ready",
-        )
 
     def execute(self, name: str, capability: str, arguments: dict, *, confirmed: bool = False, retries: int = 1) -> ConnectorResult:
         connector = self._connectors.get(name)
@@ -140,16 +146,17 @@ class ConnectorRegistry:
             status = raw_status if isinstance(raw_status, ConnectorStatus) else ConnectorStatus(str(raw_status))
         except Exception as exc:
             return _result_error(name, capability, "status_check_failed", f"Connector '{name}' status check failed: {exc}")
-        if status != ConnectorStatus.READY:
+        if status in {ConnectorStatus.AUTH_REQUIRED, ConnectorStatus.UNAVAILABLE}:
             return _result_error(name, capability, "not_ready", f"Connector '{name}' status is {status.value}")
-        try:
-            descriptor = next((item for item in connector.capabilities() if item.name == capability), None)
-        except Exception as exc:
-            return _result_error(name, capability, "capability_discovery_failed", f"Connector '{name}' capability discovery failed: {exc}")
-        if descriptor is None:
-            return _result_error(name, capability, "unsupported_capability", f"Connector '{name}' does not support '{capability}'")
-        if (descriptor.requires_confirmation or descriptor.mutating) and not confirmed:
+        request = ConnectorRequest(name, capability, dict(arguments or {}), confirmed)
+        plan = self.plan(request)
+        if not plan.supported:
+            code = "missing_input" if plan.missing_inputs else "unsupported_capability"
+            return _result_error(name, capability, code, plan.reason)
+        if plan.requires_confirmation and not confirmed:
             return _result_error(name, capability, "confirmation_required", f"'{capability}' requires user confirmation")
+
+        descriptor = next(item for item in connector.capabilities() if item.name == capability)
 
         safe_to_retry = bool(not descriptor.mutating and descriptor.idempotent)
         attempts = max(1, retries + 1) if safe_to_retry else 1
@@ -158,11 +165,11 @@ class ConnectorRegistry:
         for _ in range(attempts):
             actual_attempts += 1
             try:
-                parameters = inspect.signature(connector.execute).parameters
-                if "confirmed" in parameters:
-                    raw = connector.execute(capability, arguments, confirmed=confirmed)
+                parameters = inspect.signature(connector.execute_action).parameters
+                if "request" in parameters:
+                    raw = connector.execute_action(request)
                 else:
-                    raw = connector.execute(capability, arguments)
+                    raw = connector.execute(capability, arguments, confirmed=confirmed)
                 result = ConnectorResult.normalize(name, capability, raw)
             except Exception as exc:
                 result = _result_error(name, capability, "execution_failed", str(exc), retryable=False)
@@ -177,11 +184,14 @@ class ConnectorRegistry:
         """Read-only connector diagnostic; never invokes a mutating capability."""
         status = self.status(name)
         capabilities = self.capabilities(name)
+        description = self.describe(name)
         return {
             "connector": name,
+            "display_name": description["display_name"],
             "status": status.value,
             "capabilities": capabilities,
             "ready": status == ConnectorStatus.READY,
             "error": None if status == ConnectorStatus.READY else f"Connector status is {status.value}",
             "performed_external_action": False,
+            "limitations": description["limitations"],
         }

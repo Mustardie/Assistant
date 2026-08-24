@@ -125,8 +125,13 @@ class JarvisSettingsView(QWidget):
         "show_memory_sources": True,
         "memory_limit": 5,
         "confirm_destructive": True,
-        "confirm_external_actions": True,
+        "confirm_external_actions": False,
         "confirm_commands": True,
+        "discord_bot_token": "",
+        "discord_default_channel": "",
+        "whatsapp_access_token": "",
+        "whatsapp_phone_number_id": "",
+        "whatsapp_api_version": "v23.0",
         "weather_location": "",
         "notes_autosave": True,
         "activity_history": True,
@@ -175,10 +180,10 @@ class JarvisSettingsView(QWidget):
         body.setSpacing(12)
         nav = QVBoxLayout()
         nav.setSpacing(6)
-        categories = ["Identity", "Intelligence", "Voice", "Interface", "Memory", "Safety & Services"]
+        categories = ["Identity", "Intelligence", "Voice", "Interface", "Memory", "Connectors", "Safety & Services"]
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background:transparent;")
-        builders = [self._identity, self._intelligence, self._voice, self._interface, self._memory, self._safety]
+        builders = [self._identity, self._intelligence, self._voice, self._interface, self._memory, self._connectors, self._safety]
         for index, (name, builder) in enumerate(zip(categories, builders)):
             button = QPushButton(name.upper())
             button.setCheckable(True)
@@ -312,10 +317,43 @@ class JarvisSettingsView(QWidget):
         card.body.addWidget(inspect, 0, Qt.AlignRight)
         layout.addWidget(card)
 
+    def _connectors(self, layout):
+        discord = _SettingsCard(
+            "Discord bot connection",
+            "Uses Discord's official bot API. The bot can read and send in channels it can access, including DMs sent to the bot. Normal user-account tokens are not used.",
+        )
+        discord.row("Bot token", self._line("discord_bot_token", "Discord Developer Portal bot token", secret=True))
+        discord.row("Default channel ID", self._line("discord_default_channel", "Optional server or bot-DM channel ID"))
+        test_discord = QPushButton("TEST DISCORD CONNECTION")
+        test_discord.setStyleSheet(button_style(accent=True))
+        test_discord.clicked.connect(lambda: self.actionRequested.emit("test_connector", {"name": "discord"}))
+        discord.body.addWidget(test_discord, 0, Qt.AlignRight)
+        layout.addWidget(discord)
+
+        whatsapp = _SettingsCard(
+            "WhatsApp connection",
+            "Live send/receive uses Meta's WhatsApp Business Cloud API. Personal chats can be read from an exported chat file without exposing account credentials.",
+        )
+        whatsapp.row("Cloud API access token", self._line("whatsapp_access_token", "Permanent/system-user access token", secret=True))
+        whatsapp.row("Phone-number ID", self._line("whatsapp_phone_number_id", "Meta WhatsApp phone-number ID"))
+        whatsapp.row("Graph API version", self._line("whatsapp_api_version", "v23.0"))
+        test_whatsapp = QPushButton("TEST WHATSAPP CONNECTION")
+        test_whatsapp.setStyleSheet(button_style(accent=True))
+        test_whatsapp.clicked.connect(lambda: self.actionRequested.emit("test_connector", {"name": "whatsapp"}))
+        whatsapp.body.addWidget(test_whatsapp, 0, Qt.AlignRight)
+        layout.addWidget(whatsapp)
+
+        behavior = _SettingsCard(
+            "Message behavior",
+            "An explicit voice/text command or SEND button is authorization to send immediately. Drafts and inferred recipients never send by themselves.",
+        )
+        behavior.body.addWidget(_text("Tokens are stored only in the existing local JARVIS settings file. Environment variables can be used instead.", soft=True, size=9))
+        layout.addWidget(behavior)
+
     def _safety(self, layout):
-        safety = _SettingsCard("Safety gates", "These confirmations cannot be bypassed by an individual widget.")
+        safety = _SettingsCard("Safety gates", "Destructive operations keep their safeguards. Explicitly requested messages do not receive a redundant approval dialog.")
         safety.row("Confirm destructive file actions", self._toggle("confirm_destructive"))
-        safety.row("Confirm messages and external actions", self._toggle("confirm_external_actions"))
+        safety.row("Confirm inferred external actions", self._toggle("confirm_external_actions"), "Does not affect an explicit SEND command or button")
         safety.row("Confirm command execution", self._toggle("confirm_commands"))
         safety.row("Developer controls", self._toggle("developer_mode"))
         layout.addWidget(safety)

@@ -23,6 +23,7 @@ class Intent(str, Enum):
     SKILL_RECORDING = "skill_recording"
     AUTOMATION = "automation_watch_request"
     CODING = "coding_dev_request"
+    INBOX_ASSIGNMENT = "inbox_attachment_assignment"
     AMBIGUOUS = "ambiguous_needs_clarification"
 
 
@@ -79,6 +80,8 @@ class IntentRouter:
         "email": ("gmail_",),
         "calendar": ("calendar_",),
         "drive": ("drive_",),
+        "whatsapp": ("whatsapp",),
+        "discord": ("discord",),
         "dropbox": ("dropbox_",),
         "github": ("github_",),
         "notion": ("notion_",),
@@ -109,6 +112,13 @@ class IntentRouter:
     )
     _DESTRUCTIVE = re.compile(r"\b(delete|remove|erase|send|submit|purchase|buy|shutdown|restart)\b", re.I)
     _VAGUE = re.compile(r"^(do it|fix it|open it|that one|the thing|help)$", re.I)
+    _INBOX_ASSIGNMENT = re.compile(
+        r"(?:\b(?:teacher|school|class|client|coworker)\b.*\b(?:sent|shared|assignment|worksheet)\b|"
+        r"\b(?:whatsapp|discord|email|gmail|inbox|downloaded)\b.*\b(?:assignment|worksheet|homework|attachment|pdf|document)\b|"
+        r"\b(?:analy[sz]e|finish|complete|extract|draft|make final)\b.*\b(?:assignment|worksheet|homework)\b|"
+        r"\bwhat did (?:this|the) assignment ask\b)",
+        re.I,
+    )
 
     def route(self, request: str) -> IntentDecision:
         text = (request or "").strip()
@@ -168,17 +178,30 @@ class IntentRouter:
                 safety_notes=["confirm external side effects configured by the automation"],
             )
 
+        if self._INBOX_ASSIGNMENT.search(text):
+            has_path = bool(re.search(r"[A-Za-z]:[\\/]", text))
+            return IntentDecision(
+                Intent.INBOX_ASSIGNMENT,
+                0.97,
+                likely_required_tools=["inbox_ingest_file"] if has_path else ["inbox_scan_downloads"],
+                memory_relevant=True,
+                safety_notes=["never claim chat access beyond configured bot/API/import sources", "review generated output before submission"],
+            )
+
         lowered = text.lower()
         connector = next((name for name in self._CONNECTORS if re.search(rf"\b{re.escape(name)}\b", lowered)), None)
         if connector:
             prefixes = self._CONNECTORS[connector]
             notes = ["check connector authentication and capabilities before execution"]
             if self._DESTRUCTIVE.search(text):
-                notes.append("sending, deleting, or submitting requires confirmation")
+                if re.search(r"\b(send|message|reply)\b", lowered):
+                    notes.append("the explicit send request is authorization; do not ask for a second confirmation")
+                else:
+                    notes.append("deleting or submitting requires confirmation")
             return IntentDecision(
                 Intent.CONNECTOR,
                 0.93,
-                likely_required_tools=[f"{prefix}*" for prefix in prefixes],
+                likely_required_tools=["connector_action_plan"],
                 memory_relevant=True,
                 safety_notes=notes,
             )

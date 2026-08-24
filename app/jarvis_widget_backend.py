@@ -93,6 +93,13 @@ class JarvisWidgetBackend:
             text = str(payload.get("text") or payload.get("query") or "").strip()
             if not text:
                 return self._error("Describe the event to add.")
+            if not payload.get("confirm"):
+                return {
+                    "success": True,
+                    "confirmation": {"action": "Create calendar event", "risk": "Adds an event to your JARVIS calendar", "target": text},
+                    "pending_prompt": f"Create this calendar event only after confirmation: {text}",
+                    "created": False,
+                }
             events.append({"title": text, "time": "Unscheduled", "created": datetime.now().isoformat(timespec="seconds")})
             self._save(self.calendar_file, events)
         return self._ok({"events": events}, notice=f"{len(events)} local event(s)")
@@ -182,7 +189,7 @@ class JarvisWidgetBackend:
             if not result.success:
                 return self._error(result.error or "Gmail is unavailable")
             values = result.data if isinstance(result.data, list) else [result.data]
-            return self._ok({"emails": values}, notice=f"{len(values)} email(s)")
+            return self._ok({"emails": values, "attachment_profiles": list(result.file_profiles)}, notice=f"{len(values)} email(s)")
         return self._ok()
 
     def _connectors(self, action, payload, state):
@@ -194,13 +201,33 @@ class JarvisWidgetBackend:
             if name == "gmail":
                 from youtube_auth import ensure_youtube_auth
                 ensure_youtube_auth()
+            elif name in {"discord", "whatsapp"}:
+                details = registry.describe(name)
+                if not any(item.get("name") == "connection_info" and item.get("available") for item in details.get("capabilities", [])):
+                    return {
+                        "success": True,
+                        "data": {"connectors": [details]},
+                        "notice": f"Configure {details.get('display_name') or name} credentials in JARVIS Settings → Connectors.",
+                        "open_settings": True,
+                    }
+                result = registry.execute(name, "connection_info", {})
+                if not result.success:
+                    return self._error(result.error or f"Unable to connect {name}")
+                return self._ok({"connectors": [{**details, "connection": result.data}]}, notice=f"{details.get('display_name') or name} connected")
             elif name:
                 return self._error(f"No sign-in flow is registered for {name}")
             else:
                 return self._error("Choose a connector first.")
         values = []
         for name in registry.names():
-            values.append({"name": name, "status": registry.status(name).value, "description": f"{len(registry.capabilities(name))} capabilities"})
+            capabilities = registry.capabilities(name)
+            unavailable = [item.get("unavailable_reason") for item in capabilities if not item.get("available") and item.get("unavailable_reason")]
+            values.append({
+                "name": name,
+                "status": registry.status(name).value,
+                "description": f"{sum(1 for item in capabilities if item.get('available'))}/{len(capabilities)} capabilities available",
+                "limitation": unavailable[0] if unavailable else "",
+            })
         return self._ok({"connectors": values}, notice=f"{len(values)} connector(s) discovered")
 
     def _tool_inspector(self, action, payload, state):
@@ -281,11 +308,9 @@ class JarvisWidgetBackend:
         if action == "draft":
             return {"success": True, "prompt": f"Improve this message draft without sending it:\n\n{text}"}
         if action == "send":
-            return {
-                "success": True,
-                "confirmation": {"action": "Send message", "risk": "Sends content to an external recipient", "target": text or "Unspecified message"},
-                "pending_prompt": f"Send this message using the appropriate connected messaging service: {text}",
-            }
+            if not text:
+                return self._error("Enter a message and recipient first.")
+            return {"success": True, "prompt": f"Send this message now using the explicitly named connected messaging service and recipient. Do not ask for a second confirmation: {text}"}
         return self._ok({"draft": text})
 
     def _terminal(self, action, payload, state):
@@ -327,3 +352,76 @@ class JarvisWidgetBackend:
             return self._error("Agent memory is unavailable")
         values = self.agent.memory_manager.get_relevant_memories(query=query, limit=8)
         return self._ok({"query": query, "memories": values, "used": bool(values)}, notice=f"{len(values)} memory item(s)")
+
+    def _inbox_item(self, action, payload, state):
+        from tools.tool_registry import inbox_ingest_file, inbox_scan_downloads
+
+        if action in {"scan", "refresh"}:
+            query = str(payload.get("query") or state.get("query") or "assignment worksheet homework")
+            source = str(payload.get("source") or state.get("source") or "downloads")
+            result = inbox_scan_downloads(query=query, days=3, limit=15, source=source)
+            return self._ok(result, notice=f"{len(result.get('candidates') or [])} candidate(s)") if result.get("success") else self._error(result.get("error") or "Inbox scan failed")
+        if action == "ingest":
+            selected = self._selected(payload)
+            path = selected.get("path") if isinstance(selected, dict) else str(selected or "")
+            if not path:
+                return self._error("Choose an attachment candidate first.")
+            result = inbox_ingest_file(path, source=payload.get("source") or state.get("source") or "downloads", message=payload.get("message") or "")
+            return self._ok(result, notice="Attachment ingested for review") if result.get("success") else self._error(result.get("error") or "Attachment ingestion failed")
+        return self._ok(state)
+
+    def _assignment_analysis(self, action, payload, state):
+        from tools.tool_registry import assignment_plan, inbox_ingest_file
+
+        assignment_id = str(payload.get("assignment_id") or state.get("assignment_id") or "")
+        if action == "analyze" and payload.get("path"):
+            result = inbox_ingest_file(payload["path"], source=payload.get("source") or "manual_import", message=payload.get("message") or "")
+            return self._ok(result, notice="Assignment analyzed") if result.get("success") else self._error(result.get("error") or "Analysis failed")
+        if action == "plan":
+            if not assignment_id:
+                return self._error("Ingest an attachment before creating a plan.")
+            result = assignment_plan(assignment_id)
+            return self._ok(result.get("plan") or result, notice="Assignment plan created") if result.get("success") else self._error(result.get("error") or "Planning failed")
+        return self._ok(state)
+
+    def _assignment_plan(self, action, payload, state):
+        from tools.tool_registry import assignment_draft, assignment_plan
+
+        assignment_id = str(payload.get("assignment_id") or state.get("assignment_id") or "")
+        if not assignment_id:
+            return self._error("No assignment id is available.")
+        if action == "draft":
+            result = assignment_draft(assignment_id)
+            return self._ok(result.get("output") or result, notice="Draft created; review required") if result.get("success") else self._error(result.get("error") or "Draft generation failed")
+        result = assignment_plan(assignment_id)
+        return self._ok(result.get("plan") or result, notice="Assignment plan refreshed") if result.get("success") else self._error(result.get("error") or "Planning failed")
+
+    def _assignment_draft(self, action, payload, state):
+        from tools.tool_registry import assignment_draft, assignment_export
+
+        assignment_id = str(payload.get("assignment_id") or state.get("assignment_id") or (state.get("output") or {}).get("assignment_id") or "")
+        if not assignment_id:
+            return self._error("No assignment id is available.")
+        if action == "export":
+            result = assignment_export(assignment_id, output_format="docx")
+            return self._ok(result, notice="DOCX exported; not submitted") if result.get("success") else self._error(result.get("error") or "Export failed")
+        result = assignment_draft(assignment_id, response_text=payload.get("text") or "")
+        if not result.get("success"):
+            return self._error(result.get("error") or "Draft generation failed")
+        output = result.get("output") or {}
+        draft_path = Path(str(output.get("draft_path") or ""))
+        draft = draft_path.read_text(encoding="utf-8") if draft_path.is_file() else ""
+        return self._ok({**output, "draft": draft, "assignment_id": assignment_id}, notice="Draft generated; review before submission")
+
+    def _source_files(self, action, payload, state):
+        selected = self._selected(payload)
+        if action == "open" and selected:
+            path = selected.get("local_path") or selected.get("path") if isinstance(selected, dict) else str(selected)
+            target = Path(str(path or ""))
+            if not target.is_file():
+                return self._error("Choose an existing local source file.")
+            if target.suffix.lower() in {".exe", ".msi", ".msix", ".bat", ".cmd", ".ps1"}:
+                return {"success": True, "confirmation": {"action": "Open executable source", "risk": "This can execute downloaded code", "target": str(target)}, "pending_prompt": f"Open {target} only after explicit confirmation."}
+            os.startfile(str(target))
+            return self._ok({"files": state.get("files") or [], "opened": str(target)}, notice="Source opened")
+        return self._ok({"files": state.get("files") or state.get("attachments") or []}, notice="Assignment sources synchronized")

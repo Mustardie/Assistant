@@ -84,6 +84,11 @@ def build_default_registry() -> WidgetRegistry:
         _spec("error_debug", "Diagnostics", "Failure cause, logs, retry, and report actions", actions=("retry", "copy_report"), size=(430, 300)),
         _spec("settings", "JARVIS Settings", "Theme, voice, model, connectors, permissions, and layout", actions=("save", "reset"), implemented=True, size=(440, 620), minimum=(380, 420)),
         _spec("activity", "Activity Timeline", "Recent requests, tools, files, and confirmations", actions=("filter", "clear")),
+        _spec("inbox_item", "Inbox Attachments", "Downloaded, imported, or connector attachment candidates with honest source context", backend="inbox", actions=("scan", "ingest"), size=(470, 350)),
+        _spec("assignment_analysis", "Assignment Analysis", "Extracted instructions, questions, deadlines, subjects, confidence, and gaps", backend="inbox", actions=("analyze", "plan"), size=(500, 390)),
+        _spec("assignment_plan", "Assignment Plan", "Review-first output structure, tasks, sources, assumptions, and missing input", backend="inbox", actions=("refresh", "draft"), size=(500, 390)),
+        _spec("assignment_draft", "Assignment Draft", "Reviewable generated response; submission is always a separate confirmed action", backend="inbox", actions=("generate", "export"), size=(560, 440)),
+        _spec("source_files", "Assignment Sources", "Files and message context used to derive the assignment", backend="inbox", actions=("refresh", "open"), size=(430, 320)),
     ]
     for spec in specs:
         registry.register(spec)

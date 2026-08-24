@@ -130,6 +130,8 @@ def test_settings_cover_jarvis_runtime_safety_and_layout():
         "show_live_transcript", "voice_preload", "targeted_memory",
         "confirm_destructive", "confirm_external_actions", "confirm_commands",
         "layout_snap", "provider", "models", "api_keys", "voice_engine", "hotkey",
+        "discord_bot_token", "discord_default_channel", "whatsapp_access_token",
+        "whatsapp_phone_number_id", "whatsapp_api_version",
     }
     assert required <= JarvisSettingsView.DEFAULTS.keys()
 
@@ -146,7 +148,7 @@ def test_settings_keep_voice_choices_compatible_with_engine(qapp):
 
 def test_new_settings_is_native_jarvis_surface(qapp):
     panel = JarvisSettingsView()
-    assert panel.stack.count() == 6
+    assert panel.stack.count() == 7
     assert "CONTROL MATRIX" in panel.findChildren(QLabel)[0].text()
     assert panel.objectName() == "jarvisSettingsView"
 

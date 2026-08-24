@@ -518,6 +518,10 @@ _LIST_WIDGETS = {
     "system_monitor": {"placeholder": None, "primary": ("REFRESH", "refresh"), "secondary": None, "keys": ("metrics", "items"), "empty": "Collecting local system metrics…"},
     "code_task": {"placeholder": "Describe a development task…", "primary": ("RUN TESTS", "run_tests"), "secondary": ("OPEN FILE", "open_file"), "keys": ("files", "tests", "items"), "empty": "No active development task."},
     "activity": {"placeholder": "Filter activity…", "primary": ("REFRESH", "refresh"), "secondary": ("CLEAR", "clear"), "keys": ("activity", "items"), "empty": "No JARVIS activity recorded in this session."},
+    "inbox_item": {"placeholder": "Find recent assignment downloads…", "primary": ("SCAN", "scan"), "secondary": ("INGEST", "ingest"), "keys": ("candidates", "items"), "empty": "No imported or downloaded inbox attachments."},
+    "assignment_analysis": {"placeholder": None, "primary": ("ANALYZE", "analyze"), "secondary": ("CREATE PLAN", "plan"), "keys": ("analyses", "instructions", "questions", "items"), "empty": "Ingest an attachment to analyze its assignment instructions."},
+    "assignment_plan": {"placeholder": None, "primary": ("REFRESH", "refresh"), "secondary": ("CREATE DRAFT", "draft"), "keys": ("tasks", "steps", "items"), "empty": "No assignment plan has been created."},
+    "source_files": {"placeholder": None, "primary": ("REFRESH", "refresh"), "secondary": ("OPEN", "open"), "keys": ("files", "attachments", "items"), "empty": "No source files are attached to this assignment."},
 }
 
 
@@ -526,7 +530,7 @@ def _item_text(item: Any) -> str:
         return item
     if not isinstance(item, dict):
         return str(item)
-    primary = item.get("title") or item.get("name") or item.get("summary") or item.get("subject") or item.get("path") or item.get("tool") or item.get("label") or item.get("step") or item.get("action") or item.get("connector") or "Item"
+    primary = item.get("title") or item.get("name") or item.get("filename") or item.get("summary") or item.get("subject") or item.get("path") or item.get("tool") or item.get("label") or item.get("step") or item.get("action") or item.get("connector") or "Item"
     secondary = item.get("status") or item.get("time") or item.get("sender") or item.get("detail") or item.get("description") or item.get("value") or ""
     return f"{primary}  ·  {secondary}" if secondary else str(primary)
 
@@ -612,12 +616,13 @@ class ListActionWidget(WidgetContent):
 _TEXT_WIDGETS = {
     "notes": {"placeholder": "Write a note, scratchpad, or task summary…", "primary": ("SAVE", "save"), "secondary": ("COPY", "copy"), "field": "text"},
     "clipboard": {"placeholder": "Clipboard content appears here…", "primary": ("REFRESH", "refresh"), "secondary": ("SUMMARIZE", "summarize"), "field": "text"},
-    "messaging": {"placeholder": "Draft a message. Sending always requires confirmation…", "primary": ("DRAFT", "draft"), "secondary": ("REQUEST SEND", "send"), "field": "draft"},
+    "messaging": {"placeholder": "Name the service, recipient, and message…", "primary": ("IMPROVE DRAFT", "draft"), "secondary": ("SEND NOW", "send"), "field": "draft"},
     "terminal": {"placeholder": "Enter a command. Execution always requires confirmation…", "primary": ("REQUEST RUN", "run"), "secondary": ("COPY OUTPUT", "copy"), "field": "command"},
     "media_review": {"placeholder": "Add review notes or a local media path…", "primary": ("OPEN MEDIA", "open"), "secondary": ("SAVE FEEDBACK", "feedback"), "field": "feedback"},
     "study": {"placeholder": "Paste a question or topic to study…", "primary": ("EXPLAIN", "explain"), "secondary": ("QUIZ ME", "quiz"), "field": "text"},
     "quick_answer": {"placeholder": "Ask for a calculation, fact, definition, or conversion…", "primary": ("ANSWER", "ask"), "secondary": ("COPY", "copy"), "field": "answer"},
     "error_debug": {"placeholder": "Failure details and recovery notes appear here…", "primary": ("RETRY", "retry"), "secondary": ("COPY REPORT", "copy_report"), "field": "report"},
+    "assignment_draft": {"placeholder": "Generated assignment draft appears here for review…", "primary": ("GENERATE", "generate"), "secondary": ("EXPORT DOCX", "export"), "field": "draft"},
 }
 
 

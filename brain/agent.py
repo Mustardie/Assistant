@@ -155,6 +155,16 @@ class Agent:
 
         return False
 
+    def _is_inbox_assignment_request(self, user: str) -> bool:
+        normalized = str(user or "").lower()
+        return bool(
+            any(source in normalized for source in ("teacher", "whatsapp", "discord", "email", "gmail", "downloaded"))
+            and any(item in normalized for item in ("assignment", "worksheet", "homework", "attachment", "pdf", "document"))
+        ) or bool(
+            any(action in normalized for action in ("analyze", "analyse", "finish", "complete", "make final", "what did"))
+            and any(item in normalized for item in ("assignment", "worksheet", "homework"))
+        )
+
     def _classify_intent(self, user: str) -> str:
         if self._is_file_request(user):
             return "local_file"
@@ -286,6 +296,12 @@ class Agent:
         }
 
     def _build_intent_hint(self, user: str) -> str | None:
+        if self._is_inbox_assignment_request(user):
+            return (
+                "This is an inbox attachment/assignment request. Use inbox_scan_downloads "
+                "or inbox_ingest_file first, preserve source context, generate only reviewable "
+                "drafts, and never send or submit automatically."
+            )
         if self._is_file_request(user):
             return (
                 "This looks like a local file or folder request. "
@@ -340,6 +356,23 @@ class Agent:
                 return True
 
             self._record_tool_result("youtube_recommend", result)
+            safe_print(result)
+            return True
+
+        if self._is_inbox_assignment_request(user):
+            source = "whatsapp" if "whatsapp" in user.lower() else "discord" if "discord" in user.lower() else "downloads"
+            success, result = run_tool("inbox_scan_downloads", {"query": user, "days": 3, "limit": 10, "source": source})
+            self._record_tool_result("inbox_scan_downloads", result)
+            if success and isinstance(result, dict):
+                candidates = result.get("candidates") or []
+                if len(candidates) == 1:
+                    self._speak(f"I found one likely assignment file: {Path(candidates[0]['path']).name}. Review it before I ingest and draft answers.")
+                elif candidates:
+                    self._speak(f"I found {len(candidates)} possible assignment files. Choose the correct one so I do not guess.")
+                else:
+                    self._speak(result.get("limitation") or "I could not find a recent assignment download. Download or export it, or provide the local path.")
+            else:
+                self._speak(str(result))
             safe_print(result)
             return True
 

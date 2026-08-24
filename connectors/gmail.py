@@ -14,6 +14,7 @@ from connectors.base import Connector, ConnectorCapability, ConnectorResult, Con
 
 class GmailConnector(Connector):
     name = "gmail"
+    display_name = "Gmail"
 
     def __init__(self, backend, auth_check: Callable[[], bool] | None = None):
         self.backend = backend
@@ -39,21 +40,61 @@ class GmailConnector(Connector):
 
     def capabilities(self) -> list[ConnectorCapability]:
         return [
-            ConnectorCapability("read", "Read recent email"),
-            ConnectorCapability("search", "Search email"),
-            ConnectorCapability("summary", "Summarize recent email"),
-            ConnectorCapability("reply", "Draft or send a reply", mutating=True, requires_confirmation=True),
-            ConnectorCapability("send", "Send a new email", mutating=True, requires_confirmation=True),
-            ConnectorCapability("archive", "Archive a message", mutating=True, requires_confirmation=True),
-            ConnectorCapability("delete", "Delete a message", mutating=True, requires_confirmation=True),
+            ConnectorCapability("read", "List recent email metadata and body", requires_auth=True, input_schema={"properties": {"limit": {"type": "integer"}}}),
+            ConnectorCapability("search", "Search email metadata and body", requires_auth=True, input_schema={"required": ["query"], "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}}),
+            ConnectorCapability("read_message", "Read one email by message id", requires_auth=True, input_schema={"required": ["message_id"]}),
+            ConnectorCapability("list_attachments", "List attachment metadata without downloading content", requires_auth=True, input_schema={"required": ["message_id"]}),
+            ConnectorCapability("summary", "Summarize recent email", requires_auth=True),
+            ConnectorCapability("draft_reply", "Prepare a reply preview without sending", requires_auth=True, risk_level="medium", input_schema={"required": ["command"]}),
+            ConnectorCapability("send_reply", "Send a confirmed reply", mutating=True, requires_confirmation=True, idempotent=False, risk_level="high", requires_auth=True, input_schema={"required": ["command"]}),
+            ConnectorCapability("reply", "Send a confirmed reply (legacy capability)", mutating=True, requires_confirmation=True, idempotent=False, risk_level="high", requires_auth=True, input_schema={"required": ["command"]}),
+            ConnectorCapability("send", "Send a new email", mutating=True, requires_confirmation=True, idempotent=False, risk_level="high", requires_auth=True, input_schema={"required": ["to", "subject", "body"]}),
+            ConnectorCapability("archive", "Archive a message", mutating=True, requires_confirmation=True, idempotent=False, risk_level="high", requires_auth=True, input_schema={"required": ["message_id"]}),
+            ConnectorCapability("delete", "Delete a message", mutating=True, requires_confirmation=True, idempotent=False, risk_level="critical", requires_auth=True, input_schema={"required": ["message_id"]}),
         ]
+
+    @staticmethod
+    def _attachment_metadata(raw_message: dict, message_id: str) -> list[dict]:
+        attachments = []
+        stack = list((raw_message.get("payload") or {}).get("parts") or [])
+        while stack:
+            part = stack.pop()
+            stack.extend(part.get("parts") or [])
+            filename = str(part.get("filename") or "").strip()
+            body = part.get("body") or {}
+            attachment_id = body.get("attachmentId")
+            if filename or attachment_id:
+                attachments.append({
+                    "id": attachment_id or f"{message_id}:{part.get('partId') or len(attachments)}",
+                    "attachment_id": attachment_id,
+                    "message_id": message_id,
+                    "filename": filename or "unnamed-attachment",
+                    "mime_type": part.get("mimeType") or "application/octet-stream",
+                    "size": body.get("size"),
+                    "downloaded": False,
+                    "content_inspected": False,
+                })
+        return attachments
 
     def execute(self, capability: str, arguments: dict, *, confirmed: bool = False) -> ConnectorResult:
         try:
             arguments = dict(arguments or {})
             if confirmed and capability in {"send", "reply"}:
                 arguments["confirm"] = True
-            if capability == "summary":
+            if capability == "read_message":
+                value = self.backend.get_email_by_id(arguments["message_id"])
+            elif capability == "list_attachments":
+                message_id = str(arguments["message_id"])
+                service = getattr(self.backend, "service", None)
+                if service is None or not hasattr(service, "get_message"):
+                    value = {"success": False, "error": "Gmail backend cannot expose raw attachment metadata"}
+                else:
+                    value = {"success": True, "data": {"attachments": self._attachment_metadata(service.get_message(message_id), message_id)}}
+            elif capability == "draft_reply":
+                value = self.backend.reply(arguments["command"], draft_mode=True, confirm=False)
+            elif capability == "send_reply":
+                value = self.backend.reply(arguments["command"], draft_mode=False, confirm=confirmed)
+            elif capability == "summary":
                 limit = arguments.get("limit", 10)
                 if arguments.get("unread"):
                     value = self.backend.summarize_unread(limit=limit)

@@ -83,6 +83,14 @@ class JarvisUIController:
             ensure("task_progress", data={"goal": text, "steps": [], "status": "planning"})
         if re.search(r"\b(email|gmail|inbox)\b", lower):
             ensure("email", data={"query": text})
+        if re.search(
+            r"(?:\b(?:teacher|whatsapp|discord|email|downloaded)\b.*\b(?:assignment|worksheet|homework|attachment)\b|"
+            r"\b(?:analy[sz]e|finish|complete|make final)\b.*\b(?:assignment|worksheet|homework)\b)",
+            lower,
+        ):
+            ensure("inbox_item", data={"query": text, "candidates": []}, loading=True)
+            ensure("assignment_analysis", data={"analyses": [], "status": "Waiting for an attachment"})
+            ensure("source_files", data={"files": []})
         if re.search(r"\b(connector|account|connection|sign in)\b", lower):
             ensure("connectors")
         return created
@@ -181,6 +189,24 @@ class JarvisUIController:
                             elif raw.get("status") == "ok" and raw.get("result"):
                                 results = [raw.get("result")]
                         self.manager.update(file_widget.widget_id, loading=False, empty=not bool(results), data={"results": results})
+                tool = payload.get("tool")
+                raw = payload.get("result") or {}
+                if tool == "inbox_scan_downloads" and isinstance(raw, dict):
+                    widget = self.manager.create("inbox_item")
+                    self.manager.update(widget.widget_id, loading=False, empty=not bool(raw.get("candidates")), data=raw)
+                elif tool == "inbox_ingest_file" and isinstance(raw, dict):
+                    analysis_widget = self.manager.create("assignment_analysis")
+                    self.manager.update(analysis_widget.widget_id, loading=False, data={"analyses": raw.get("analyses") or [], "item": raw.get("item"), "assignment_id": raw.get("assignment_id")})
+                    source_widget = self.manager.create("source_files")
+                    attachments = (raw.get("item") or {}).get("attachments") or []
+                    self.manager.update(source_widget.widget_id, data={"files": attachments, "assignment_id": raw.get("assignment_id")})
+                elif tool == "assignment_plan" and isinstance(raw, dict):
+                    plan_value = raw.get("plan") or raw
+                    widget = self.manager.create("assignment_plan")
+                    self.manager.update(widget.widget_id, loading=False, data=plan_value)
+                elif tool in {"assignment_draft", "assignment_export"} and isinstance(raw, dict):
+                    widget = self.manager.create("assignment_draft")
+                    self.manager.update(widget.widget_id, loading=False, data={"output": raw.get("output") or raw, "status": "Review required before submission"})
                 self.set_state(JarvisState.THINKING)
             inspector = self.manager.find_type("tool_inspector")
             if inspector:

@@ -88,3 +88,48 @@ def test_file_results_and_targeted_memory_update_existing_widgets(tmp_path):
     memory = manager.find_type("memory_recall")
     assert memory is not None
     assert memory.data["used"] is True
+
+
+def test_file_intent_results_update_file_intelligence_widget(tmp_path):
+    controller, manager, _ = _controller(tmp_path)
+    controller.route_request("Find the Minecraft crash log")
+    widget = manager.find_type("file_search")
+    assert widget is not None
+    controller.handle_agent_event(
+        "tool_finished",
+        {
+            "tool": "file_intent_search",
+            "result": {
+                "success": True,
+                "results": [{"path": r"C:\Games\.minecraft\logs\latest.log", "summary": "Crash log from Minecraft.", "risk": "low"}],
+            },
+        },
+    )
+    state = manager.get(widget.widget_id)
+    assert state.loading is False
+    assert state.data["results"][0]["summary"] == "Crash log from Minecraft."
+
+
+def test_inbox_assignment_request_and_events_open_review_widgets(tmp_path):
+    controller, manager, _ = _controller(tmp_path)
+    controller.route_request("Teacher sent an assignment on WhatsApp, finish it")
+    assert manager.find_type("inbox_item") is not None
+    assert manager.find_type("assignment_analysis") is not None
+    assert manager.find_type("source_files") is not None
+
+    controller.handle_agent_event(
+        "tool_finished",
+        {
+            "tool": "inbox_ingest_file",
+            "result": {
+                "success": True,
+                "assignment_id": "assignment-1",
+                "item": {"attachments": [{"filename": "worksheet.pdf", "local_path": r"C:\Downloads\worksheet.pdf"}]},
+                "analyses": [{"short_summary": "School worksheet", "instructions": ["Answer all questions"]}],
+            },
+        },
+    )
+    analysis = manager.find_type("assignment_analysis")
+    sources = manager.find_type("source_files")
+    assert analysis.data["assignment_id"] == "assignment-1"
+    assert sources.data["files"][0]["filename"] == "worksheet.pdf"

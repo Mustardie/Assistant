@@ -121,6 +121,7 @@ class JarvisWindow(QWidget):
         self._settings = self._load_settings()
         self.settings_panel.load(self._settings)
         self._settings = self.settings_panel.settings()
+        self._sync_connector_environment(self._settings)
         self._settings_emit_timer = QTimer(self)
         self._settings_emit_timer.setSingleShot(True)
         self._settings_emit_timer.timeout.connect(lambda: self.settingsChanged.emit(dict(self._settings)))
@@ -181,8 +182,31 @@ class JarvisWindow(QWidget):
             temporary.replace(_SETTINGS_FILE)
         except Exception:
             logger.exception("Unable to save JARVIS settings")
+        self._sync_connector_environment(self._settings)
         self._apply_ui_settings(self._settings)
         self._settings_emit_timer.start(450)
+
+    @staticmethod
+    def _sync_connector_environment(settings: dict) -> None:
+        connector_environment = {
+            "discord_bot_token": "JARVIS_DISCORD_BOT_TOKEN",
+            "discord_default_channel": "JARVIS_DISCORD_DEFAULT_CHANNEL",
+            "whatsapp_access_token": "JARVIS_WHATSAPP_ACCESS_TOKEN",
+            "whatsapp_phone_number_id": "JARVIS_WHATSAPP_PHONE_NUMBER_ID",
+            "whatsapp_api_version": "JARVIS_WHATSAPP_API_VERSION",
+        }
+        for setting_name, environment_name in connector_environment.items():
+            value = str(settings.get(setting_name) or "").strip()
+            if value:
+                os.environ[environment_name] = value
+            else:
+                os.environ.pop(environment_name, None)
+        try:
+            from connectors.defaults import reset_default_registry
+
+            reset_default_registry()
+        except Exception:
+            logger.exception("Unable to reload connector configuration")
 
     def _apply_ui_settings(self, settings: dict):
         animate = bool(settings.get("core_animation", True)) and not bool(settings.get("reduced_motion", False))
@@ -319,6 +343,8 @@ class JarvisWindow(QWidget):
         if result.get("notice"):
             data["notice"] = result["notice"]
         self.widget_manager.update(widget_id, loading=False, empty=False, error=None, data=data)
+        if result.get("open_settings"):
+            self.open_settings()
         confirmation = result.get("confirmation")
         if isinstance(confirmation, dict):
             confirmation_id = f"widget:{widget_id}:{time.time_ns()}"
@@ -453,6 +479,16 @@ class JarvisWindow(QWidget):
         elif action == "test_voice":
             self.close_settings()
             self._voice_toggle()
+        elif action == "test_connector":
+            self.close_settings()
+            state = self.request_widget("connectors")
+            if state is not None:
+                self.widget_manager.update(state.widget_id, loading=True, error=None)
+                self.widgetAction.emit(
+                    state.widget_id,
+                    "connect",
+                    {"selected": {"name": str((payload or {}).get("name") or "")}},
+                )
         else:
             self.widgetAction.emit("settings", action, dict(payload or {}))
 

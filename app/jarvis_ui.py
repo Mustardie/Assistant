@@ -54,6 +54,17 @@ def _apply_saved_runtime_environment() -> None:
         os.environ["KOKORO_VOICE" if engine == "kokoro" else "PIPER_VOICE"] = voice
     if data.get("speed") is not None:
         os.environ["TTS_SPEED"] = str(data["speed"])
+    connector_environment = {
+        "discord_bot_token": "JARVIS_DISCORD_BOT_TOKEN",
+        "discord_default_channel": "JARVIS_DISCORD_DEFAULT_CHANNEL",
+        "whatsapp_access_token": "JARVIS_WHATSAPP_ACCESS_TOKEN",
+        "whatsapp_phone_number_id": "JARVIS_WHATSAPP_PHONE_NUMBER_ID",
+        "whatsapp_api_version": "JARVIS_WHATSAPP_API_VERSION",
+    }
+    for setting_name, environment_name in connector_environment.items():
+        value = data.get(setting_name)
+        if value:
+            os.environ[environment_name] = str(value)
 
 
 _apply_saved_runtime_environment()

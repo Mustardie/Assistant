@@ -6,6 +6,7 @@ import platform
 import re
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from recommendation.errors import RecommendationConfigurationError
@@ -889,17 +890,15 @@ def connector_list():
     registry = default_registry()
     return {
         "success": True,
-        "connectors": [
-            {"name": name, "status": registry.status(name).value, "capabilities": registry.capabilities(name)}
-            for name in registry.names()
-        ],
+        "connectors": [registry.describe(name) for name in registry.names()],
     }
 
 
 def connector_status(name):
     from connectors.defaults import default_registry
 
-    return {"success": True, "connector": name, "status": default_registry().status(name).value}
+    description = default_registry().describe(name)
+    return {"success": True, "connector": name, "status": description["status"], "details": description}
 
 
 def connector_capabilities(name):
@@ -936,6 +935,89 @@ def connector_plan(name, capability, arguments=None, confirm=False):
 
     request = ConnectorRequest(name, capability, arguments or {}, bool(confirm))
     return asdict(default_registry().plan(request))
+
+
+def connector_action_plan(request):
+    from connectors.planner import ConnectorActionPlanner
+
+    return ConnectorActionPlanner().choose(str(request)).to_dict()
+
+
+_inbox_service_instance = None
+
+
+def _inbox_service():
+    global _inbox_service_instance
+    if _inbox_service_instance is None:
+        from tools.inbox_intelligence import InboxIntelligenceService
+
+        _inbox_service_instance = InboxIntelligenceService()
+    return _inbox_service_instance
+
+
+def inbox_scan_downloads(query="assignment worksheet homework", days=3, limit=12, source="downloads"):
+    from tools.inbox_models import InboxSource
+
+    if str(source).lower() in {InboxSource.WHATSAPP.value, InboxSource.DISCORD.value}:
+        return _inbox_service().scan_limited_source(str(source).lower(), query=str(query), days=float(days), limit=int(limit))
+    return _inbox_service().scan_downloads(query=str(query), days=float(days), limit=int(limit))
+
+
+def inbox_ingest_file(path, source="manual_import", message="", sender="", channel="", timestamp=""):
+    return _inbox_service().ingest_file(
+        path,
+        source=source,
+        message=message,
+        sender=sender,
+        channel=channel,
+        timestamp=timestamp,
+    ).to_dict()
+
+
+def inbox_ingest_folder(path, source="folder_watch", message="", limit=25):
+    return _inbox_service().ingest_folder(path, source=source, message=message, limit=int(limit))
+
+
+def inbox_analyze(path, source="manual_import"):
+    from tools.inbox_models import InboxSource
+
+    source_value = InboxSource(str(source))
+    return {"success": True, "analysis": _inbox_service().analyze_attachment(path, source=source_value).to_dict()}
+
+
+def assignment_extract(assignment_id):
+    return _inbox_service().extract_tasks(str(assignment_id))
+
+
+def assignment_plan(assignment_id):
+    return {"success": True, "plan": _inbox_service().create_plan(str(assignment_id)).to_dict()}
+
+
+def assignment_draft(assignment_id, response_text=""):
+    return {"success": True, "output": asdict(_inbox_service().generate_draft(str(assignment_id), response_text=response_text))}
+
+
+def assignment_export(assignment_id, output_format="docx"):
+    return _inbox_service().export(str(assignment_id), output_format=str(output_format))
+
+
+def assignment_report(assignment_id):
+    return _inbox_service().generate_report(str(assignment_id))
+
+
+def assignment_submission_draft(assignment_id, connector, recipient, message, attachment_paths=None):
+    return {
+        "success": True,
+        "submission": asdict(_inbox_service().submission_draft(
+            str(assignment_id),
+            connector=str(connector),
+            recipient=str(recipient),
+            message=str(message),
+            attachment_paths=attachment_paths,
+        )),
+        "sent": False,
+        "requires_confirmation": True,
+    }
 
 
 def pause_indexing():
@@ -1121,8 +1203,20 @@ TOOLS = {
     "connector_status": connector_status,
     "connector_capabilities": connector_capabilities,
     "connector_plan": connector_plan,
+    "connector_action_plan": connector_action_plan,
     "connector_execute": connector_execute,
     "connector_test": connector_test,
+
+    "inbox_scan_downloads": inbox_scan_downloads,
+    "inbox_ingest_file": inbox_ingest_file,
+    "inbox_ingest_folder": inbox_ingest_folder,
+    "inbox_analyze": inbox_analyze,
+    "assignment_extract": assignment_extract,
+    "assignment_plan": assignment_plan,
+    "assignment_draft": assignment_draft,
+    "assignment_export": assignment_export,
+    "assignment_report": assignment_report,
+    "assignment_submission_draft": assignment_submission_draft,
 
     "type_text": type_text,
     "press_key": press_key,

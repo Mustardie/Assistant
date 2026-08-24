@@ -1797,7 +1797,8 @@ class AgentLoop:
                         "tool call in `step` now. Only use ask_user if information genuinely "
                         "required to proceed is missing or ambiguous, and only require "
                         "confirmation for destructive/sensitive actions (deleting data, "
-                        "sending messages/emails, purchases, shutdown/restart)."
+                        "purchases, shutdown/restart). An explicit user command to send a "
+                        "message is already authorization; never ask them to approve it twice."
                     ),
                 })
                 self._consecutive_guard_firings += 1

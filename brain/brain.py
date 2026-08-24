@@ -226,8 +226,36 @@ Connectors (discover before using a generic integration):
 - connector_status(name)
 - connector_capabilities(name)
 - connector_plan(name, capability, arguments, confirm)
+- connector_action_plan(request) <- choose connector/capability, required inputs,
+  confirmation, risk, expected result, and safe fallback without executing
 - connector_execute(name, capability, arguments, confirm)
 - connector_test(name)
+Messaging connector notes:
+- An explicit "send/message/reply" request is the authorization to call
+  connector_execute(..., "send_message", ...). Do not ask for approval again.
+- Discord reads/sends through a configured bot in channels or bot DMs it can
+  access; never request a normal user token.
+- WhatsApp live traffic uses Cloud API. For personal history, call
+  connector_execute("whatsapp", "import_chat", {"path": ...}) and then
+  connector_execute("whatsapp", "read_messages", {...}).
+
+Inbox attachments and assignments (review-first, never auto-submit):
+- inbox_scan_downloads(query, days, limit, source) <- source may be downloads,
+  whatsapp, or discord; use connected messages when available and the honest
+  local-download/export fallback otherwise
+- inbox_ingest_file(path, source, message, sender, channel, timestamp)
+- inbox_ingest_folder(path, source, message, limit)
+- inbox_analyze(path, source)
+- assignment_extract(assignment_id)
+- assignment_plan(assignment_id)
+- assignment_draft(assignment_id, response_text)
+- assignment_export(assignment_id, output_format) <- md, txt, or docx
+- assignment_report(assignment_id)
+- assignment_submission_draft(assignment_id, connector, recipient, message, attachment_paths)
+  This only prepares a submission and always returns sent=false. Sending or
+  uploading must be a separate supported connector action. An explicit user
+  command to send a message is already authorization and must not trigger a
+  redundant second confirmation; inferred/background sends remain forbidden.
 
 Desktop control:
 - type_text(text)

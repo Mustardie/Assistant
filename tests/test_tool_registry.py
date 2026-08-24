@@ -69,3 +69,10 @@ def test_run_tool_returns_false_when_tool_reports_failure(monkeypatch):
     success, result = run_tool("failing", {})
     assert success is False
     assert result["error"] == "failed honestly"
+
+
+def test_run_tool_returns_false_for_error_shaped_result(monkeypatch):
+    monkeypatch.setitem(TOOLS, "silent_failure", lambda: {"error": "backend failed"})
+    success, result = run_tool("silent_failure", {})
+    assert success is False
+    assert result["error"] == "backend failed"
