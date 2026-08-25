@@ -20,6 +20,7 @@ no test in this file needs Premiere, FFmpeg, a GPU, a model or real footage.
 """
 from __future__ import annotations
 
+import pathlib
 from dataclasses import replace
 
 import pytest
@@ -1112,3 +1113,60 @@ def test_the_comparison_counts_and_never_scores(episode, cut, style):
     text = report_module.render_comparison(comparison).lower()
     assert "score" not in text
     assert "better" not in text
+
+
+def test_the_report_says_what_a_proxy_could_not_show():
+    """"What is placeholder-only" is incomplete without "and what a proxy
+    could not show you either".
+
+    Built rather than planned: whether a given fixture happens to earn a
+    callout is not what this is about, and a conditional skip would leave the
+    assertion untested on the day it mattered.
+    """
+    plan = VisualLayerPlan(name="x", layer="high", cut_duration=120.0)
+    arrow = treatment(effect="arrow_callout",
+                      payload={"target": "creeper", "shape": "arrow"})
+    arrow.accepted = True
+    arrow.target_output = "premiere_plan"
+    plan.treatments = [arrow]
+
+    preview = preview_module.build_preview_plan(plan)
+    assert preview.invisible, "an arrow is the canonical FFmpeg-can't case"
+
+    built = report_module.build_report(plan, preview=preview)
+    answer = built.answers[3]["answer"]
+    assert "FFmpeg" in answer
+
+
+def test_the_report_works_without_a_preview_plan(episode, cut, style):
+    plan = plan_for(episode, cut, style)
+    built = report_module.build_report(plan)
+    assert len(built.answers) == len(report_module.QUESTIONS)
+
+
+def test_the_documented_counts_match_the_code():
+    """The docs quote four numbers. Two of them were wrong when written.
+
+    Pinned here rather than trusted, because a prose count is the one kind of
+    claim nothing else in this system checks -- and "thirty-four effects" read
+    exactly as plausibly as "thirty-six".
+    """
+    import inspect
+
+    from editing.visuals import safety as safety_source
+
+    assert len(EFFECT_TYPES) == 36
+    assert len(VISUAL_MOMENT_TYPES) == 20
+
+    dispatched = [
+        line.strip().rstrip(",")
+        for line in inspect.getsource(safety_source.check_all).splitlines()
+        if line.strip().startswith("_") and line.strip().endswith(",")
+    ]
+    assert len(dispatched) == 13
+
+    readme = pathlib.Path(__file__).resolve().parents[2] / "editing" / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    assert "thirty-six effects" in text
+    assert "thirteen safety checks" in text
+    assert "Thirty-six treatments" in text

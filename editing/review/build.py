@@ -306,7 +306,12 @@ def _visuals(package: ReviewPackage, state, visual_plan, final_edit) -> None:
         "moments": int(summary.get("moments") or 0),
         "untreated_moments": int(summary.get("untreated_moments") or 0),
         "effects_per_minute": float(summary.get("effects_per_minute") or 0.0),
+        "callouts_per_minute": float(
+            summary.get("callouts_per_minute") or 0.0),
+        "ceiling": float(summary.get("ceiling") or 0.0),
         "by_effect": dict(summary.get("by_effect") or {}),
+        "by_family": dict(summary.get("by_family") or {}),
+        "by_moment_kind": dict(summary.get("by_moment_kind") or {}),
         "by_reject_reason": dict(summary.get("by_reject_reason") or {}),
         "placeholder_only": int(summary.get("placeholder_only") or 0),
         "premiere_operations": int(composed.get("premiere_operations") or 0),
@@ -323,17 +328,54 @@ def _visuals(package: ReviewPackage, state, visual_plan, final_edit) -> None:
         ),
     }
 
+    # What FFmpeg could and could not show. Read off the preview plan rather
+    # than re-derived, so the review folder and the visual report cannot
+    # disagree about which effects are invisible in a proxy.
+    preview = final_edit.execution.preview if final_edit is not None else None
+    if preview is not None:
+        preview_stats = preview.stats()
+        section["preview"] = {
+            "burnable": preview_stats["burnable"],
+            "sidecar_only": preview_stats["sidecar_only"],
+            "invisible": preview_stats["invisible"],
+            "burned_in": False,
+            "sidecar_path": preview.sidecar_path,
+            "note": preview.burn_in_note,
+            "limitations": [
+                f"{item.effect}: {item.reason}"
+                for item in preview.items if item.reason
+            ][:20],
+        }
+    else:
+        section["preview"] = {
+            "burnable": 0, "sidecar_only": 0, "invisible": 0,
+            "burned_in": False, "sidecar_path": "",
+            "note": "No preview plan was built for this run "
+                    "(--visual-mode proxy_preview builds one).",
+            "limitations": [],
+        }
+
     if visual_plan is not None:
         from editing.visuals import report as visual_report
 
         premiere = None
         if final_edit is not None:
             premiere = final_edit.execution.premiere
-        built = visual_report.build_report(visual_plan, premiere=premiere)
+        built = visual_report.build_report(
+            visual_plan, premiere=premiere, preview=preview)
         section.update({
             "answers": built.answers,
             "overdone_risks": built.overdone_risks,
             "manual_checks": built.manual_checks,
+        })
+        stats = visual_plan.stats()
+        section.update({
+            "callouts_per_minute": stats["callouts_per_minute"],
+            "by_family": stats["by_family"],
+            "by_moment_kind": stats["by_moment_kind"],
+            "by_effect": stats["by_effect"],
+            "by_reject_reason": stats["by_reject_reason"],
+            "ceiling": visual_plan.config.max_effects_per_minute,
         })
     elif enabled:
         section["answers"] = [{

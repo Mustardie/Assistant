@@ -13,7 +13,7 @@
                   VisualComparisonReport
     moments.py    what the earlier passes recorded, resolved onto the cut
     treatments.py which effects suit which moment, and what each style is for
-    safety.py     the fourteen rules that stop this being embarrassing
+    safety.py     the thirteen rules that stop this being embarrassing
     plan.py       one visual pass: detect, propose, check, thin
     compose.py    the final edit composer
     premiere.py   the operation plan, validated offline

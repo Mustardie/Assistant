@@ -4191,7 +4191,7 @@ Episode-layer findings are resolved through `segment_ids` unless the memory's
 own `timebase` says its numbers are sequence time. Guessing would place every
 finding *somewhere*, and every number would be a number and all of them wrong.
 
-### Thirty-four treatments
+### Thirty-six treatments
 
 | Family | Effects |
 |---|---|
@@ -4219,9 +4219,16 @@ already approved. There is no path that writes copy the footage cannot support
 `fast_funny` is the only style whose defaults turn meme effects on — it is the
 one style that reads a freeze-frame label as the point rather than as noise.
 
-### The fourteen safety rules
+### Why a treatment gets refused
 
-They run in a fixed order and record what they saw whether or not they acted.
+Three places can refuse one, and they land in the same closed vocabulary so a
+report can group them:
+
+* the **style and layer filter**, before a candidate is built —
+  `style_forbids`, `layer_forbids`, `no_evidence`;
+* the **thirteen safety checks**, which look at one treatment in context, run
+  in a fixed order, and record what they saw whether or not they acted;
+* the **density budget**, after everything else passed — `density_limit`.
 
 | Refusal | Means |
 |---|---|
@@ -4259,6 +4266,13 @@ python -m editing.cli visuals show-rejected --latest --reason hides_hud
 python -m editing.cli visuals show-final --latest
 python -m editing.cli visuals export-premiere-plan --latest
 ```
+
+Each family has both spellings — `--allow-callouts` / `--no-callouts`,
+`--allow-freeze-frames` / `--no-freeze-frames`, `--allow-replays` /
+`--no-replays`. All three are on by default, so the `--no-` form is the one
+that changes anything; asking for both at once is a usage error rather than a
+silent winner. `--allow-screen-shake` has no partner because shake is the one
+family that is off by default.
 
 ```
 MOMENTS THAT GOT NOTHING (8)
@@ -4402,7 +4416,7 @@ remembered.
 ## 30. What the visual layer does not do yet
 
 * **It has never been run against real footage with a real vision model.**
-  Twenty moment kinds, thirty-four effects, fourteen safety rules and a
+  Twenty moment kinds, thirty-six effects, thirteen safety checks and a
   scoring formula, all calibrated against fixtures and generated footage.
 * **It draws nothing.** No preview render, no Premiere execution. The plan is
   intentions.
@@ -4819,8 +4833,8 @@ folder that fails is recorded and skipped past; re-running with `--resume` is a
 separate decision you make after reading the summary.
 
 **The visual layer draws nothing, and has never seen real footage.** Twenty
-moment kinds, thirty-four effects, fourteen safety rules and a scoring formula,
-calibrated against fixtures. Its Premiere operations validate against the
+moment kinds, thirty-six effects, thirteen safety checks and a scoring
+formula, calibrated against fixtures. Its Premiere operations validate against the
 catalog and have never been executed; its FFmpeg side is a capability statement
 with the filters recorded rather than run. See §30 for the full list.
 

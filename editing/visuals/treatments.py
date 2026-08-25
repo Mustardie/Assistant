@@ -1,6 +1,6 @@
 """The treatment library: which effects suit which moment, and how strongly.
 
-Thirty-four effects, and a table saying which of them a moment kind can earn.
+Thirty-six effects, and a table saying which of them a moment kind can earn.
 Kept as data rather than as branches for the same reason the stage table is:
 the whole policy is readable in one screen, and a style that forbids an effect
 forbids it once, in one place.

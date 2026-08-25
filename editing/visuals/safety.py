@@ -1,8 +1,14 @@
 """The rules that stop this layer being embarrassing.
 
-Fourteen deterministic checks. They run in a fixed order, they record what they
-saw whether or not they acted, and the first one is about the HUD because that
-is the one a style may not override.
+Thirteen deterministic checks. They run in a fixed order, they record what
+they saw whether or not they acted, and the first one is about the HUD because
+that is the one a style may not override.
+
+They are not the only thing that can refuse a treatment. The style and layer
+filter in ``treatments.py`` refuses before a candidate is ever built, and the
+density budget in ``plan.py`` refuses after these have all passed. All three
+land in the same closed vocabulary, so a report can group them; only these
+thirteen are *checks* in the sense of looking at one treatment in context.
 
 ## Lower before refusing
 

@@ -1074,3 +1074,122 @@ def test_the_batch_carries_the_visual_settings():
         batch, BatchCandidate(folder="/clips/ep01", video_files=2))
     assert run.visual_layer == "balanced"
     assert run.visual_mode == "premiere_plan"
+
+
+# ---------------------------------------------------------------------------
+# Session 12 -- the flag aliases and the review package's visual detail
+# ---------------------------------------------------------------------------
+
+
+def test_both_spellings_of_each_family_switch_parse():
+    """--no-callouts is the one that acts; --allow-callouts is the one people
+    reach for when turning a feature on."""
+    from editing.cli import _auto_config, build_parser
+
+    parser = build_parser()
+    allowed = _auto_config(parser.parse_args([
+        "auto", "run", "--folder", "D:/c", "--visual-layer", "balanced",
+        "--allow-freeze-frames", "--allow-callouts", "--allow-replays",
+    ]))
+    assert allowed.allow_freeze_frames is True
+    assert allowed.allow_callouts is True
+    assert allowed.allow_replays is True
+
+    refused = _auto_config(parser.parse_args([
+        "auto", "run", "--folder", "D:/c", "--visual-layer", "balanced",
+        "--no-freeze-frames", "--no-callouts", "--no-replays",
+    ]))
+    assert refused.allow_freeze_frames is False
+    assert refused.allow_callouts is False
+    assert refused.allow_replays is False
+
+
+@pytest.mark.parametrize("family", ["freeze-frames", "callouts", "replays"])
+def test_asking_for_a_family_both_ways_is_a_usage_error(family):
+    """Silently picking a winner would be worse than refusing."""
+    from editing.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "auto", "run", "--folder", "D:/c",
+            f"--allow-{family}", f"--no-{family}",
+        ])
+
+
+def test_the_family_switches_reach_the_visuals_command_too():
+    from editing.cli import build_parser
+
+    args = build_parser().parse_args([
+        "visuals", "plan", "--visual-layer", "high", "--no-callouts",
+    ])
+    assert args.no_callouts is True
+    assert args.visual_layer == "high"
+
+
+def test_the_review_package_carries_a_density_summary(runner, auto_config):
+    from editing.review import store as review_store
+
+    state = run_once(runner, with_visuals(auto_config))
+    package = review_store.load_package(runner.config, state.run_id)
+    visuals = package.visuals
+
+    for key in ("effects_per_minute", "callouts_per_minute", "ceiling",
+                "by_family", "by_moment_kind", "by_effect", "moments",
+                "untreated_moments"):
+        assert key in visuals, key
+    assert visuals["ceiling"] > 0
+
+
+def test_the_review_package_carries_the_ffmpeg_limitations(runner,
+                                                           auto_config):
+    from editing.review import store as review_store
+
+    state = run_once(runner, with_visuals(auto_config))
+    package = review_store.load_package(runner.config, state.run_id)
+    preview = package.visuals.get("preview") or {}
+
+    for key in ("burnable", "sidecar_only", "invisible", "burned_in", "note"):
+        assert key in preview, key
+    # The one invariant this whole layer rests on.
+    assert preview["burned_in"] is False
+
+
+def test_a_run_without_a_preview_plan_still_says_what_it_could_not_show(
+    runner, auto_config
+):
+    """plan_only builds no preview, and the package says so rather than
+    leaving the reader to wonder."""
+    from editing.review import store as review_store
+
+    state = run_once(runner, replace(
+        auto_config, visual_layer="balanced", visual_mode="plan_only"))
+    package = review_store.load_package(runner.config, state.run_id)
+    preview = package.visuals.get("preview") or {}
+
+    assert preview["burned_in"] is False
+    assert "proxy_preview" in preview["note"]
+
+
+def test_the_review_index_prints_the_density_and_the_limits(runner,
+                                                            auto_config):
+    from editing.review import store as review_store
+
+    state = run_once(runner, with_visuals(auto_config))
+    text = review_store.index_path(
+        runner.config, state.run_id).read_text("utf-8")
+
+    assert "**Density**" in text
+    assert "**What a proxy can and cannot show**" in text
+    assert "could be burned into a preview render — and none was" in text
+    assert "**Watch for, in the visual layer**" in text
+
+
+def test_the_review_index_never_claims_a_visual_effect_is_in_the_video(
+    runner, auto_config
+):
+    from editing.review import store as review_store
+
+    state = run_once(runner, with_visuals(auto_config))
+    text = review_store.index_path(
+        runner.config, state.run_id).read_text("utf-8")
+    assert "has been drawn, rendered or executed" in text

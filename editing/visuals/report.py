@@ -307,7 +307,11 @@ def build_report(
     premiere: Optional[PremiereVisualOperationPlan] = None,
     preview=None,
 ) -> VisualReport:
-    """The six questions, each with what this plan actually did."""
+    """The six questions, each with what this plan actually did.
+
+    ``preview`` sharpens the fourth answer: "what is placeholder-only" is
+    incomplete without "and what a proxy could not show you either".
+    """
     stats = plan.stats()
     answers: list[str] = []
 

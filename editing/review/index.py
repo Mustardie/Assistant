@@ -101,6 +101,52 @@ def render_index(package: ReviewPackage) -> str:
             for line in risks:
                 add(f"- {line}")
             add("")
+
+        add("**Density**")
+        add("")
+        add(f"- {visuals.get('accepted', 0)} treatment(s) at "
+            f"{visuals.get('effects_per_minute', 0):.2f} a minute "
+            f"(ceiling {visuals.get('ceiling', 0):.2f}), "
+            f"{visuals.get('callouts_per_minute', 0):.2f} callouts a minute")
+        if visuals.get("by_family"):
+            add("- by family: " + ", ".join(
+                f"{count} {family}" for family, count in
+                sorted(visuals["by_family"].items(), key=lambda kv: -kv[1])))
+        if visuals.get("by_moment_kind"):
+            add("- on: " + ", ".join(
+                f"{count} {kind.replace('_', ' ')}" for kind, count in
+                sorted(visuals["by_moment_kind"].items(),
+                       key=lambda kv: -kv[1])[:8]))
+        add(f"- {visuals.get('untreated_moments', 0)} of "
+            f"{visuals.get('moments', 0)} moment(s) earned nothing")
+        add("")
+
+        preview = visuals.get("preview") or {}
+        add("**What a proxy can and cannot show**")
+        add("")
+        add(f"- {preview.get('burnable', 0)} could be burned into a preview "
+            "render — and none was")
+        add(f"- {preview.get('sidecar_only', 0)} can only be a marker beside "
+            "the video")
+        add(f"- {preview.get('invisible', 0)} FFmpeg cannot show in any form")
+        if preview.get("sidecar_path"):
+            add(f"- markers: `{preview['sidecar_path']}`")
+        add("")
+        for line in (preview.get("limitations") or [])[:6]:
+            add(f"  - {line}")
+        if preview.get("limitations"):
+            add("")
+        add(f"> {preview.get('note', '')}")
+        add("")
+
+        checks = visuals.get("manual_checks") or []
+        if checks:
+            add("**Watch for, in the visual layer**")
+            add("")
+            for line in checks:
+                add(f"- {line}")
+            add("")
+
         add(f"> {visuals.get('not_rendered', '')}")
         add("")
 

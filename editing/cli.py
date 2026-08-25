@@ -4141,15 +4141,36 @@ def _add_visuals(parser: argparse.ArgumentParser) -> None:
         "--max-callouts-per-minute", dest="max_callouts_per_minute",
         type=float, default=0.0,
         help="ceiling on arrows, circles and boxes (0 = the style's own)")
-    group.add_argument(
+    # Each family has both spellings. On by default, so ``--no-*`` is the one
+    # that changes anything -- but ``--allow-*`` is what a person reaches for
+    # when turning a feature on, and a flag that exists in somebody's head and
+    # not in the parser produces an error message instead of a run. The pairs
+    # are mutually exclusive so ``--allow-callouts --no-callouts`` is a usage
+    # error rather than a silent winner.
+    freeze = group.add_mutually_exclusive_group()
+    freeze.add_argument(
         "--no-freeze-frames", dest="no_freeze_frames", action="store_true",
         help="never plan a freeze frame")
-    group.add_argument(
+    freeze.add_argument(
+        "--allow-freeze-frames", dest="no_freeze_frames",
+        action="store_false",
+        help="permit freeze frames (the default)")
+
+    callouts = group.add_mutually_exclusive_group()
+    callouts.add_argument(
         "--no-callouts", dest="no_callouts", action="store_true",
         help="never plan an arrow, a circle or a box")
-    group.add_argument(
+    callouts.add_argument(
+        "--allow-callouts", dest="no_callouts", action="store_false",
+        help="permit callouts (the default)")
+
+    replays = group.add_mutually_exclusive_group()
+    replays.add_argument(
         "--no-replays", dest="no_replays", action="store_true",
         help="never plan a replay marker")
+    replays.add_argument(
+        "--allow-replays", dest="no_replays", action="store_false",
+        help="permit replay markers (the default)")
     group.add_argument(
         "--allow-screen-shake", dest="allow_screen_shake",
         action="store_true",

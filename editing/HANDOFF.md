@@ -141,8 +141,8 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
      questions in order, and batch mode over a whole library of footage.
                                                     ↓
      Session 12 is the first layer that decides where the edit should *point
-     at something*. Twenty moment kinds read off every plan above, thirty-four
-     treatments, fourteen safety rules — and most of what it considers is
+     at something*. Twenty moment kinds read off every plan above, thirty-six
+     treatments, thirteen safety checks — and most of what it considers is
      refused, with the rule that refused it. It draws nothing: the Premiere
      operations are proposals validated offline and the FFmpeg side is a
      capability statement.
@@ -480,13 +480,13 @@ considers.
 - `editing/visuals/`
   - `schema.py` — `VisualMoment`, `VisualEffectCandidate`, `VisualTreatment`,
     `VisualSafetyCheck`, `VisualLayerPlan`, `VisualConfig`, twenty moment
-    kinds, thirty-four effects, the closed refusal vocabulary
+    kinds, thirty-six effects, the closed refusal vocabulary
   - `execution.py` — `PremiereVisualOperationPlan`,
     `FFmpegVisualPreviewPlan`, `VisualExecutionPlan`, `FinalEditPlan`,
     `VisualReport`, `VisualComparisonReport`
   - `moments.py` — what the earlier passes recorded, resolved onto the cut
   - `treatments.py` — which effects suit which moment, per style
-  - `safety.py` — the fourteen rules that stop this being embarrassing
+  - `safety.py` — the thirteen rules that stop this being embarrassing
   - `plan.py` — detect → propose → check → thin
   - `compose.py` — the final edit composer
   - `premiere.py` — the operation plan, validated offline against the catalog
@@ -1370,7 +1370,7 @@ both export formats -- but **not** yet against a real review of real footage.
     executed. This is deliberate for a first planning layer and it is also the
     largest remaining gap between "creative final-edit plan" and "final edit".
 40. **It has never seen real footage with a real vision model.** Twenty moment
-    kinds, thirty-four effects, fourteen safety rules and a scoring formula,
+    kinds, thirty-six effects, thirteen safety checks and a scoring formula,
     all calibrated against fixtures and generated footage. Whether the moments
     it finds are the moments you would have picked is unknown, and
     `visuals show-rejected` exists largely so that can be found out.
@@ -1613,7 +1613,8 @@ Useful flags on `auto run`:
 | `--visual-layer` | `off` (default), `minimal`, `balanced`, `high` |
 | `--visual-mode` | `plan_only` (default), `proxy_preview`, `premiere_plan`, `hybrid` |
 | `--max-effects-per-minute` / `--max-callouts-per-minute` | override the style's own ceilings |
-| `--no-freeze-frames` / `--no-callouts` / `--no-replays` | turn a family off |
+| `--no-freeze-frames` / `--no-callouts` / `--no-replays` | turn a family off (all three are on by default) |
+| `--allow-freeze-frames` / `--allow-callouts` / `--allow-replays` | the same switches said the other way. Both spellings at once is a usage error |
 | `--allow-screen-shake` | permit shake. Off by default, and usually refused anyway |
 | `--export-premiere-visual-plan` | write the operation plan even in a mode that would not |
 | `--asset-library <path>` | a library other than `<model dir>/assets` |
