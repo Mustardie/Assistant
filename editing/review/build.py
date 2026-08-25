@@ -37,6 +37,8 @@ def build_package(
     checks: Optional[GateReport] = None,
     caption_plan=None,
     audio_plan=None,
+    visual_plan=None,
+    final_edit=None,
     copy_files: bool = True,
 ) -> ReviewPackage:
     """Gather one run into a review package. Writes nothing by itself."""
@@ -58,9 +60,10 @@ def build_package(
     _video(package, state)
     _items(config, package, state, folder, copy_files=copy_files)
     _checks(package, checks)
+    _visuals(package, state, visual_plan, final_edit)
     _headline(package, state, caption_plan, audio_plan)
-    _changed(package, state, caption_plan, audio_plan)
-    _watch_for(package, state, caption_plan, audio_plan)
+    _changed(package, state, caption_plan, audio_plan, visual_plan)
+    _watch_for(package, state, caption_plan, audio_plan, visual_plan)
     _weak_points(package, state, checks)
     _decisions(package, state, checks)
     _commands(package)
@@ -79,6 +82,8 @@ def write_package(
     checks: Optional[GateReport] = None,
     caption_plan=None,
     audio_plan=None,
+    visual_plan=None,
+    final_edit=None,
 ) -> tuple:
     """Build the package, copy what belongs in it, write the index.
 
@@ -89,6 +94,7 @@ def write_package(
     package = build_package(
         config, state, checks=checks,
         caption_plan=caption_plan, audio_plan=audio_plan,
+        visual_plan=visual_plan, final_edit=final_edit,
     )
     written = [store.save_package(config, package)]
     written.append(store.save_index(
@@ -144,6 +150,27 @@ CANDIDATES = (
      "subtitles", "load this beside the proxy to see the captions"),
     ("audio", "Audio polish report", "artifacts/polish/{name}.audio.txt",
      "report", "which sounds were planned, and what is missing"),
+    ("visuals", "Visual layer report",
+     "artifacts/visuals/{name}.visuals.txt", "report",
+     "which moments earned emphasis, and which were refused"),
+    ("visuals_json", "Visual plan",
+     "artifacts/visuals/{name}.visuals.json", "plan",
+     "every moment and every treatment, refusals included"),
+    ("visual_markers", "Visual markers",
+     "artifacts/visuals/{name}.visuals.md", "notes",
+     "where each effect would land, while you watch the proxy"),
+    ("final_edit", "Final edit plan",
+     "artifacts/visuals/{name}.final.txt", "report",
+     "the cut, the captions, the sound and the visuals, clip by clip"),
+    ("final_edit_json", "Final edit plan, as JSON",
+     "artifacts/visuals/{name}.final.json", "plan",
+     "the same thing, for a script"),
+    ("visual_premiere", "Premiere visual plan",
+     "artifacts/visuals/{name}.premiere.json", "plan",
+     "the operations Premiere could run. Nothing has been executed"),
+    ("visual_compare", "Visual comparison",
+     "artifacts/visuals/{name}.compare.json", "plan",
+     "the visual layer against the cut without it"),
     ("audio_json", "Audio polish plan", "artifacts/polish/{name}.audio.json",
      "plan", "every cue considered, with its reason"),
     ("director", "Director report", "artifacts/director/{name}.plan.txt",
@@ -258,6 +285,67 @@ def _checks(package: ReviewPackage, checks: Optional[GateReport]) -> None:
     }
 
 
+def _visuals(package: ReviewPackage, state, visual_plan, final_edit) -> None:
+    """The creative visual layer, as the six questions the index asks.
+
+    Read from the plan object when one was handed in, and from the stage
+    summary otherwise -- a package rebuilt days later still has the stage
+    summary, and half an answer beats none.
+    """
+    summary = _summary(state, "visual_plan")
+    composed = _summary(state, "final_edit_plan")
+    enabled = str(getattr(state.config, "visual_layer", "off")) != "off"
+
+    section = {
+        "enabled": enabled,
+        "ran": bool(summary),
+        "layer": summary.get("layer",
+                             getattr(state.config, "visual_layer", "off")),
+        "accepted": int(summary.get("accepted") or 0),
+        "rejected": int(summary.get("rejected") or 0),
+        "moments": int(summary.get("moments") or 0),
+        "untreated_moments": int(summary.get("untreated_moments") or 0),
+        "effects_per_minute": float(summary.get("effects_per_minute") or 0.0),
+        "by_effect": dict(summary.get("by_effect") or {}),
+        "by_reject_reason": dict(summary.get("by_reject_reason") or {}),
+        "placeholder_only": int(summary.get("placeholder_only") or 0),
+        "premiere_operations": int(composed.get("premiere_operations") or 0),
+        "premiere_unsupported": int(composed.get("premiere_unsupported") or 0),
+        "busy_segments": int(composed.get("busy_segments") or 0),
+        # Loud, and always present: a plan of intentions must never read as a
+        # video with effects in it.
+        "rendered": False,
+        "executed": False,
+        "not_rendered": (
+            "No effect in this plan has been drawn, rendered or executed. The "
+            "Premiere operations are proposals validated offline; the FFmpeg "
+            "side is a capability statement and a marker file."
+        ),
+    }
+
+    if visual_plan is not None:
+        from editing.visuals import report as visual_report
+
+        premiere = None
+        if final_edit is not None:
+            premiere = final_edit.execution.premiere
+        built = visual_report.build_report(visual_plan, premiere=premiere)
+        section.update({
+            "answers": built.answers,
+            "overdone_risks": built.overdone_risks,
+            "manual_checks": built.manual_checks,
+        })
+    elif enabled:
+        section["answers"] = [{
+            "question": "What visual effects were added?",
+            "answer": (
+                f"{section['accepted']} treatment(s) from "
+                f"{section['moments']} moment(s); {section['rejected']} were "
+                "refused. The visual report has the detail."),
+        }]
+    package.visuals = section
+
+
 def _headline(package: ReviewPackage, state, caption_plan, audio_plan) -> None:
     """What was produced, in four or five sentences."""
     run = state.config
@@ -336,7 +424,8 @@ def _headline(package: ReviewPackage, state, caption_plan, audio_plan) -> None:
     package.headline = out
 
 
-def _changed(package: ReviewPackage, state, caption_plan, audio_plan) -> None:
+def _changed(package: ReviewPackage, state, caption_plan, audio_plan,
+             visual_plan=None) -> None:
     """What this edit did to the footage, as counts."""
     out: list[str] = []
     retention = _summary(state, "retention_cut")
@@ -391,6 +480,16 @@ def _changed(package: ReviewPackage, state, caption_plan, audio_plan) -> None:
             + ", ".join(f"{count} x {kind}" for kind, count in kinds.items())
             + ". None of it plays in the proxy."
         )
+    if visual_plan is not None and visual_plan.accepted:
+        out.append(
+            "Visual treatments planned: "
+            + ", ".join(f"{count} x {effect.replace('_', ' ')}"
+                        for effect, count in sorted(
+                            visual_plan.by_effect().items(),
+                            key=lambda kv: -kv[1])[:6])
+            + f". {len(visual_plan.rejected)} were refused, and none of it is "
+            "in any video."
+        )
     if not out:
         out.append(
             "Nothing was reshaped, captioned or scored. This is the "
@@ -399,7 +498,8 @@ def _changed(package: ReviewPackage, state, caption_plan, audio_plan) -> None:
     package.changed = out
 
 
-def _watch_for(package: ReviewPackage, state, caption_plan, audio_plan) -> None:
+def _watch_for(package: ReviewPackage, state, caption_plan, audio_plan,
+               visual_plan=None) -> None:
     """What a person should be looking at while the proxy plays."""
     out: list[str] = []
     retention = _summary(state, "retention_cut")
@@ -432,6 +532,9 @@ def _watch_for(package: ReviewPackage, state, caption_plan, audio_plan) -> None:
     if audio_plan is not None:
         from editing.polish import report as polish_report
         out.extend(polish_report.audio_checks(audio_plan))
+    if visual_plan is not None and visual_plan.accepted:
+        from editing.visuals import report as visual_report
+        out.extend(visual_report.manual_checks(visual_plan))
     if not out:
         out.append(
             "Watch the whole thing once without stopping. This run made no "
@@ -488,6 +591,18 @@ def _decisions(package: ReviewPackage, state, checks) -> None:
         out.append(
             "The output failed a check that says it is not usable. Fix that "
             "before reviewing anything else."
+        )
+    visuals = package.visuals or {}
+    if visuals.get("accepted"):
+        out.append(
+            f"Decide whether the {visuals['accepted']} visual treatment(s) "
+            "are worth executing. Nothing has been drawn, and the Premiere "
+            "plan is inspectable before anything runs."
+        )
+    if visuals.get("placeholder_only"):
+        out.append(
+            f"{visuals['placeholder_only']} treatment(s) are notes and "
+            "nothing else. Do them by hand or drop them."
         )
     if not package.video_exists and package.video:
         out.append(

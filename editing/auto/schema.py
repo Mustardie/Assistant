@@ -63,6 +63,10 @@ STAGE_ORDER = (
     # belongs beside the video.
     "caption_polish",
     "audio_polish",
+    # The visual layer reads the captions and the sound: a callout over a
+    # caption is a refusal it can only make once both exist.
+    "visual_plan",
+    "final_edit_plan",
     "render_proxy",
     # The checks look at the output, so they come after the thing that
     # produces it.
@@ -263,6 +267,26 @@ class AutoRunConfig:
     music_bed: bool = True
     #: Whether the plan asks for that bed to duck under speech.
     ducking: bool = True
+
+    #: Where the edit points at something: a zoom onto the creeper, a card
+    #: naming the objective, an arrow at the thing nobody would notice.
+    #: ``off`` by default; ``balanced`` is the intended setting and ``high``
+    #: is the one that reads as over-edited.
+    visual_layer: str = "off"
+    #: What the composer does with the result. ``plan_only`` is the default and
+    #: none of the four executes anything.
+    visual_mode: str = "plan_only"
+    #: Ceiling on picture-changing effects a minute. 0 means the style's own.
+    max_effects_per_minute: float = 0.0
+    #: Ceiling on callouts a minute. 0 means the style's own.
+    max_callouts_per_minute: float = 0.0
+    #: Switches for the four families a person most often wants off.
+    allow_freeze_frames: bool = True
+    allow_callouts: bool = True
+    allow_replays: bool = True
+    allow_screen_shake: bool = False
+    #: Write the Premiere visual operation plan even in a mode that would not.
+    export_premiere_visual_plan: bool = False
 
     #: Render a watchable proxy of the rough cut with FFmpeg. Off by default
     #: because it is the only stage that costs minutes of CPU and produces
@@ -737,6 +761,10 @@ class AutoRunReport:
     checks: dict = field(default_factory=dict)
     #: Where the review folder is, and what it says to look at first.
     review: dict = field(default_factory=dict)
+    #: What the creative visual layer planned, and what it refused. Always
+    #: filled -- "this edit has no visual treatment in it" is a fact about
+    #: the edit.
+    visuals: dict = field(default_factory=dict)
     #: The thirteen questions a person has after a run, each with its answer.
     answers: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

@@ -471,6 +471,17 @@ class EditingConfig:
         return self.output_dir / "render"
 
     @property
+    def visuals_dir(self) -> Path:
+        """The creative visual layer: moments, treatments and the final plan.
+
+        Its own directory for the same reason ``polish_dir`` is: a visual plan
+        is one opinion about what belongs on top of a cut, and re-running it
+        must never be able to overwrite the cut underneath. Everything here is
+        derived and can be rebuilt in a second.
+        """
+        return self.output_dir / "visuals"
+
+    @property
     def polish_dir(self) -> Path:
         """Caption and audio polish plans, and the caption sidecar.
 
@@ -497,7 +508,7 @@ class EditingConfig:
             self.roughcut_dir, self.review_dir, self.critic_dir,
             self.layers_dir, self.asset_library_dir, self.episode_dir,
             self.feedback_dir, self.render_dir, self.director_dir,
-            self.retention_dir, self.polish_dir,
+            self.retention_dir, self.polish_dir, self.visuals_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

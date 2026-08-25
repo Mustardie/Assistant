@@ -22,6 +22,11 @@ Commands, in the order a session normally uses them::
                 finished run leaves behind: one index, five questions
     polish      captions | audio | show-rejected | show-missing
                 -- key-moment captions and restrained sound. Plans only
+    visuals     plan | report | show-accepted | show-rejected |
+                export-premiere-plan | show-final
+                -- the creative visual layer: which moments earn emphasis,
+                which are refused, and what Premiere could do about it. Draws
+                nothing and executes nothing
     style       list | show <preset>   -- the editing styles available
     layers      build | report | export | dry-run | execute --yes |
                 show-deferred | show-density   -- a styled, layered edit
@@ -1872,6 +1877,18 @@ def _auto_config(args) -> AutoRunConfig:
         music_bed=not getattr(args, "no_music_bed", False),
         ducking=not getattr(args, "no_ducking", False),
         review_package=not getattr(args, "no_review_package", False),
+        visual_layer=getattr(args, "visual_layer", "") or "off",
+        visual_mode=getattr(args, "visual_mode", "") or "plan_only",
+        max_effects_per_minute=float(
+            getattr(args, "max_effects_per_minute", 0.0) or 0.0),
+        max_callouts_per_minute=float(
+            getattr(args, "max_callouts_per_minute", 0.0) or 0.0),
+        allow_freeze_frames=not getattr(args, "no_freeze_frames", False),
+        allow_callouts=not getattr(args, "no_callouts", False),
+        allow_replays=not getattr(args, "no_replays", False),
+        allow_screen_shake=getattr(args, "allow_screen_shake", False),
+        export_premiere_visual_plan=getattr(
+            args, "export_premiere_visual_plan", False),
     )
 
 
@@ -2067,6 +2084,8 @@ def cmd_auto(args) -> int:
             transcribe=args.transcribe,
             captions=args.captions,
             audio_polish=args.audio_polish,
+            visual_layer=args.visual_layer,
+            visual_mode=args.visual_mode,
         )
         summary = batch_run.run_batch(
             runner.config, batch, runner=runner, say=_reporter(args))
@@ -2305,6 +2324,156 @@ def cmd_polish(args) -> int:
         return EXIT_OK
 
     raise EditingError("Unknown polish command")
+
+
+def cmd_visuals(args) -> int:
+    """The creative visual layer: plan it, read it, see what was refused."""
+    from editing.visuals import report as visual_report
+    from editing.visuals import schema as visual_schema
+
+    command = args.visuals_command
+    if getattr(args, "latest", False) and not getattr(args, "run", ""):
+        args.run = _auto_runner(args).latest_run_id() or ""
+    pipeline = _run_scoped_pipeline(args)
+    style = style_presets.get(args.style) if args.style else style_presets.get()
+
+    # -- plan -------------------------------------------------------------
+    if command == "plan":
+        settings = pipeline.visual_config(
+            style, layer=args.visual_layer, mode=args.visual_mode,
+            max_effects_per_minute=(args.max_effects_per_minute or None),
+            max_callouts_per_minute=(args.max_callouts_per_minute or None),
+            allow_freeze_frames=(False if args.no_freeze_frames else None),
+            allow_callouts=(False if args.no_callouts else None),
+            allow_replays=(False if args.no_replays else None),
+            allow_screen_shake=(True if args.allow_screen_shake else None),
+        )
+        visuals, final = pipeline.plan_visuals(
+            name=args.name, style=style, settings=settings,
+            run_id=getattr(args, "run", "") or "")
+        if args.export_premiere_visual_plan and \
+                final.execution.premiere is None:
+            pipeline.export_visual_premiere_plan(
+                name=args.name, visuals=visuals)
+
+        if args.json:
+            _emit({"success": True, "visuals": visuals.to_dict(),
+                   "final": final.to_dict()})
+            return EXIT_OK
+        print(visual_report.render(visuals, limit=args.limit))
+        print()
+        print(f"  Written to {pipeline.config.visuals_dir}")
+        return EXIT_OK
+
+    # -- report -----------------------------------------------------------
+    if command == "report":
+        visuals = pipeline.load_visual_plan(name=args.name)
+        if args.json:
+            from editing.visuals import store as visuals_store
+
+            built = visual_report.build_report(
+                visuals,
+                premiere=visuals_store.premiere_or_none(
+                    pipeline.config, name=args.name))
+            _emit({"success": True, **built.to_dict()})
+            return EXIT_OK
+        print(visual_report.render(visuals, limit=args.limit))
+        return EXIT_OK
+
+    # -- show-final -------------------------------------------------------
+    if command == "show-final":
+        final = pipeline.load_final_edit(name=args.name)
+        if args.json:
+            _emit({"success": True, **final.to_dict()})
+            return EXIT_OK
+        print(visual_report.render_final(final, limit=args.limit))
+        return EXIT_OK
+
+    # -- show-accepted ----------------------------------------------------
+    if command == "show-accepted":
+        visuals = pipeline.load_visual_plan(name=args.name)
+        accepted = sorted(visuals.accepted, key=lambda t: t.start)
+        if args.effect:
+            accepted = [t for t in accepted if t.effect == args.effect]
+        if args.json:
+            _emit({"success": True, "count": len(accepted),
+                   "accepted": [t.to_dict() for t in accepted[:args.limit]]})
+            return EXIT_OK
+        print(f"{len(accepted)} treatment(s) planned:\n")
+        for treatment in accepted[:args.limit]:
+            print(f"  {treatment.line()}")
+            for note in treatment.safety_notes[:2]:
+                print(f"      note: {note[:120]}")
+        if len(accepted) > args.limit:
+            print(f"  ... and {len(accepted) - args.limit} more.")
+        print("\n  by effect:")
+        for effect, count in sorted(visuals.by_effect().items(),
+                                    key=lambda kv: -kv[1]):
+            print(f"    {count:>4}  {effect}")
+        print(f"\n  {visual_schema.NOT_RENDERED}")
+        return EXIT_OK
+
+    # -- show-rejected ----------------------------------------------------
+    if command == "show-rejected":
+        visuals = pipeline.load_visual_plan(name=args.name)
+        rejected = sorted(visuals.rejected, key=lambda t: t.start)
+        if args.reason:
+            rejected = [t for t in rejected if t.reject_reason == args.reason]
+        if args.json:
+            _emit({"success": True, "count": len(rejected),
+                   "rejected": [t.to_dict() for t in rejected[:args.limit]]})
+            return EXIT_OK
+        print(f"{len(rejected)} treatment(s) were refused:\n")
+        for treatment in rejected[:args.limit]:
+            print(f"  {treatment.line()}")
+        if len(rejected) > args.limit:
+            print(f"  ... and {len(rejected) - args.limit} more.")
+        print("\n  by reason:")
+        for code, count in sorted(visuals.by_reject_reason().items(),
+                                  key=lambda kv: -kv[1]):
+            print(f"    {count:>4}  {code:<26} "
+                  f"{visual_report.REASONS.get(code, '')}")
+        return EXIT_OK
+
+    # -- export-premiere-plan ---------------------------------------------
+    if command == "export-premiere-plan":
+        plan = pipeline.export_visual_premiere_plan(name=args.name)
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+
+        from editing.visuals import store as visuals_store
+
+        print(f"Premiere visual plan for '{args.name}'")
+        print(f"  operations  : {plan.operation_count}")
+        print(f"  treatments  : "
+              f"{len({e.treatment_id for e in plan.operations})}")
+        print(f"  unsupported : {len(plan.unsupported)}")
+        print(f"  dry run     : "
+              f"{'passed' if plan.dry_run_passed else 'NOT passed'}")
+        if plan.dry_run_error:
+            print(f"  error       : {plan.dry_run_error.get('error')}")
+            if plan.dry_run_error.get("hint"):
+                print(f"  hint        : {plan.dry_run_error['hint']}")
+        if plan.by_op():
+            print("\n  by operation:")
+            for name, count in sorted(plan.by_op().items(),
+                                      key=lambda kv: -kv[1]):
+                print(f"    {count:>4}  {name}")
+        if plan.unsupported:
+            print("\n  cannot be expressed:")
+            for entry in plan.unsupported[:args.limit]:
+                print(f"    {entry.effect} at {entry.start:.1f}s")
+                print(f"      why : {entry.reason[:140]}")
+                print(f"      else: {entry.alternative[:140]}")
+        for warning in plan.warnings:
+            print(f"\n  ! {warning}")
+        print(f"\n  Written to "
+              f"{visuals_store.premiere_path(pipeline.config, args.name)}")
+        print("  NOTHING HAS BEEN EXECUTED. This is a plan.")
+        return EXIT_OK
+
+    raise EditingError("Unknown visuals command")
 
 
 def cmd_episode(args) -> int:
@@ -3943,6 +4112,57 @@ def _add_polish(parser: argparse.ArgumentParser) -> None:
         help="do not ask for the bed to duck under speech")
 
 
+def _add_visuals(parser: argparse.ArgumentParser) -> None:
+    """Visual layer flags, shared by ``auto run``, ``batch`` and ``visuals``.
+
+    Defined once so the three cannot drift: a run that spelled
+    ``--visual-layer`` differently from a batch would be a run nobody could
+    reproduce by hand.
+    """
+    from editing.visuals import schema as visual_schema
+
+    group = parser.add_argument_group("visual layer")
+    group.add_argument(
+        "--visual-layer", dest="visual_layer", default="off",
+        choices=list(visual_schema.VISUAL_LAYERS),
+        help="balanced is the intended setting; high lets one moment carry "
+             "three effects and is the one that reads as over-edited")
+    group.add_argument(
+        "--visual-mode", dest="visual_mode", default="plan_only",
+        choices=list(visual_schema.COMPOSER_MODES),
+        help="plan_only (default) composes a final edit plan; proxy_preview "
+             "adds a marker file; premiere_plan adds an operation plan. None "
+             "of them executes anything")
+    group.add_argument(
+        "--max-effects-per-minute", dest="max_effects_per_minute", type=float,
+        default=0.0,
+        help="ceiling on picture-changing effects (0 = the style's own)")
+    group.add_argument(
+        "--max-callouts-per-minute", dest="max_callouts_per_minute",
+        type=float, default=0.0,
+        help="ceiling on arrows, circles and boxes (0 = the style's own)")
+    group.add_argument(
+        "--no-freeze-frames", dest="no_freeze_frames", action="store_true",
+        help="never plan a freeze frame")
+    group.add_argument(
+        "--no-callouts", dest="no_callouts", action="store_true",
+        help="never plan an arrow, a circle or a box")
+    group.add_argument(
+        "--no-replays", dest="no_replays", action="store_true",
+        help="never plan a replay marker")
+    group.add_argument(
+        "--allow-screen-shake", dest="allow_screen_shake",
+        action="store_true",
+        help="permit screen shake. Off by default: it is the effect most "
+             "often refused by the safety pass and the most annoying one "
+             "when it is not")
+    group.add_argument(
+        "--export-premiere-visual-plan", dest="export_premiere_visual_plan",
+        action="store_true",
+        help="write the Premiere visual operation plan even in a mode that "
+             "would not. It still executes nothing")
+
+
 def _add_model(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("model")
     group.add_argument("--backend", choices=sorted(set(qwen.BACKENDS) | {"mock"}),
@@ -4688,6 +4908,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not gather this run into a review folder. On by default: it "
              "creates nothing new and is what makes a run inspectable")
     _add_polish(au_run)
+    _add_visuals(au_run)
     au_run.add_argument("--skip-assets", action="store_true",
                         help="skip the asset pass entirely")
     au_run.add_argument("--force-new-run", action="store_true",
@@ -4810,6 +5031,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--render-proxy", dest="render_proxy", action="store_true",
         help="render a watchable proxy for each folder")
     _add_polish(au_batch)
+    _add_visuals(au_batch)
     _add_model(au_batch)
     _add_common(au_batch)
     au_batch.set_defaults(func=cmd_auto)
@@ -4901,6 +5123,73 @@ def build_parser() -> argparse.ArgumentParser:
     _add_polish_ref(po_miss)
     _add_common(po_miss)
     po_miss.set_defaults(func=cmd_polish)
+
+    # -- visuals ---------------------------------------------------------
+    visuals = subparsers.add_parser(
+        "visuals",
+        help="the creative visual layer: which moments earn emphasis, which "
+             "are refused, and what Premiere could do about it. Draws nothing",
+    )
+    visuals_subs = visuals.add_subparsers(
+        dest="visuals_command", required=True)
+
+    def _add_visuals_ref(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--name", default="structure")
+        parser.add_argument(
+            "--run", help="read and write inside this auto run's artifacts")
+        parser.add_argument(
+            "--latest", action="store_true",
+            help="use the most recent auto run (the default when no --run is "
+                 "given)")
+        parser.add_argument(
+            "--style", choices=style_presets.names(),
+            help="style preset whose visual taste to use")
+        parser.add_argument("--limit", type=int, default=40)
+
+    vi_plan = visuals_subs.add_parser(
+        "plan", help="find the moments that earn emphasis, and refuse most")
+    _add_visuals_ref(vi_plan)
+    _add_visuals(vi_plan)
+    _add_common(vi_plan)
+    vi_plan.set_defaults(func=cmd_visuals)
+
+    vi_report = visuals_subs.add_parser(
+        "report", help="the full visual report, including what it refused")
+    _add_visuals_ref(vi_report)
+    _add_common(vi_report)
+    vi_report.set_defaults(func=cmd_visuals)
+
+    vi_final = visuals_subs.add_parser(
+        "show-final",
+        help="the final edit plan: the cut, the captions, the sound and the "
+             "visuals, clip by clip")
+    _add_visuals_ref(vi_final)
+    _add_common(vi_final)
+    vi_final.set_defaults(func=cmd_visuals)
+
+    vi_acc = visuals_subs.add_parser(
+        "show-accepted", help="every treatment that survived every rule")
+    _add_visuals_ref(vi_acc)
+    vi_acc.add_argument("--effect", help="only this effect type")
+    _add_common(vi_acc)
+    vi_acc.set_defaults(func=cmd_visuals)
+
+    vi_rej = visuals_subs.add_parser(
+        "show-rejected",
+        help="every treatment that was refused, and the rule that refused it")
+    _add_visuals_ref(vi_rej)
+    vi_rej.add_argument(
+        "--reason", help="only this refusal code (see the plan's summary)")
+    _add_common(vi_rej)
+    vi_rej.set_defaults(func=cmd_visuals)
+
+    vi_export = visuals_subs.add_parser(
+        "export-premiere-plan",
+        help="the operations Premiere could run, validated offline. Executes "
+             "nothing")
+    _add_visuals_ref(vi_export)
+    _add_common(vi_export)
+    vi_export.set_defaults(func=cmd_visuals)
 
     # -- episode ---------------------------------------------------------
     episode = subparsers.add_parser(

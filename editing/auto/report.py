@@ -52,6 +52,12 @@ LIMITATIONS = (
     "measured, no file is listened to, and nothing it plans is in the proxy.",
     "The reliability checks look at shape, not at taste. Passing all fifteen "
     "says the output is well-formed, not that the edit is good.",
+    "The visual layer plans and draws nothing. Its Premiere operations are "
+    "proposals validated offline, its FFmpeg side is a capability statement, "
+    "and no effect it plans is in any video.",
+    "A callout knows what to point at and never where. The vision pass names "
+    "entities and does not localise them, so every callout lands at the "
+    "centre of the frame with a note saying so.",
 )
 
 
@@ -99,6 +105,7 @@ def build_report(
     report.feedback = _feedback_section(config, state, pipeline)
     report.captions = _captions_section(state)
     report.audio = _audio_section(state)
+    report.visuals = _visuals_section(state)
     report.checks = _checks_section(state)
     report.review = _review_section(config, state)
     report.check_in_premiere = _check_list(state)
@@ -481,6 +488,85 @@ def _audio_section(state: AutoRunState) -> dict:
     return section
 
 
+def _visuals_section(state: AutoRunState) -> dict:
+    """What the creative visual layer planned, and what it refused.
+
+    Filled whether or not the stage ran. "This edit has no visual treatment in
+    it" is a fact about the edit, and a report that only mentioned the layer
+    when it ran would make its absence invisible.
+    """
+    section = {
+        "enabled": state.config.visual_layer != "off",
+        "ran": False,
+        "layer": state.config.visual_layer,
+        "mode": state.config.visual_mode,
+        "moments": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "lowered": 0,
+        "untreated_moments": 0,
+        "effects_per_minute": 0.0,
+        "callouts_per_minute": 0.0,
+        "ceiling": 0.0,
+        "by_effect": {},
+        "by_moment_kind": {},
+        "by_reject_reason": {},
+        "placeholder_only": 0,
+        "premiere_operations": 0,
+        "premiere_unsupported": 0,
+        "premiere_dry_run_passed": False,
+        "preview_burnable": 0,
+        "busy_segments": 0,
+        # Loud, and always present: a plan of intentions must never read as a
+        # video with effects in it.
+        "rendered": False,
+        "executed": False,
+        "run_with_visuals": (
+            "python -m editing.cli auto run --folder "
+            f"{state.config.footage_folder or '<folder>'} "
+            f"--visual-layer balanced --style {state.config.style} "
+            "--no-premiere"),
+        "note": (
+            "Nothing here has been drawn, rendered or executed. The Premiere "
+            "operations are proposals validated offline; the FFmpeg side is a "
+            "capability statement and a marker file."
+        ),
+    }
+
+    result = state.stage("visual_plan")
+    if result is not None and result.summary:
+        section["ran"] = result.ok
+        for key in ("layer", "base", "moments", "considered", "accepted",
+                    "rejected", "lowered", "untreated_moments",
+                    "effects_per_minute", "callouts_per_minute", "ceiling",
+                    "by_family", "by_effect", "by_moment_kind",
+                    "by_reject_reason", "placeholder_only"):
+            if key in result.summary:
+                section[key] = result.summary[key]
+        section["report_command"] = (
+            f"python -m editing.cli visuals report --run {state.run_id}")
+        section["accepted_command"] = (
+            f"python -m editing.cli visuals show-accepted --run {state.run_id}")
+        section["rejected_command"] = (
+            f"python -m editing.cli visuals show-rejected --run {state.run_id}")
+    if result is not None and result.status in ("blocked", "failed"):
+        section["blocked_reason"] = (
+            result.failure.why if result.failure else result.note)
+
+    composed = state.stage("final_edit_plan")
+    if composed is not None and composed.summary:
+        for key in ("mode", "segments", "busy_segments",
+                    "untouched_segments", "premiere_operations",
+                    "premiere_unsupported", "premiere_dry_run_passed",
+                    "preview_burnable"):
+            if key in composed.summary:
+                section[key] = composed.summary[key]
+        section["export_command"] = (
+            f"python -m editing.cli visuals export-premiere-plan "
+            f"--run {state.run_id}")
+    return section
+
+
 def _checks_section(state: AutoRunState) -> dict:
     """The reliability gates, summarised."""
     section = {
@@ -562,6 +648,8 @@ QUESTIONS = (
     "What dead air was removed?",
     "Were captions added?",
     "Were sound effects or music added?",
+    "What visual treatments were planned?",
+    "What can be executed in Premiere later?",
     "What warnings remain?",
     "What should I watch manually?",
 )
@@ -580,6 +668,7 @@ def _answers(state: AutoRunState, report: AutoRunReport) -> list[dict]:
     retention = report.retention or {}
     captions = report.captions or {}
     audio = report.audio or {}
+    visuals = report.visuals or {}
     checks = report.checks or {}
 
     answers: list[str] = []
@@ -688,6 +777,40 @@ def _answers(state: AutoRunState, report: AutoRunReport) -> list[dict]:
     else:
         answers.append("No. Audio polish was off for this run.")
 
+    if visuals.get("accepted"):
+        answers.append(
+            f"{visuals['accepted']} treatment(s) from "
+            f"{visuals.get('moments', 0)} moment(s) at "
+            f"{visuals.get('effects_per_minute', 0):.2f} a minute; "
+            f"{visuals.get('rejected', 0)} were refused. NONE of it is in any "
+            "video -- the plan is intentions, not frames."
+        )
+    elif visuals.get("enabled"):
+        answers.append(
+            "The visual layer ran and every treatment was refused. The plan "
+            "names the rule for each."
+        )
+    else:
+        answers.append("None. The visual layer was off for this run.")
+
+    if visuals.get("premiere_operations"):
+        answers.append(
+            f"{visuals['premiere_operations']} Premiere operation(s), dry run "
+            + ("passed" if visuals.get("premiere_dry_run_passed")
+               else "NOT passed")
+            + f". {visuals.get('premiere_unsupported', 0)} treatment(s) have "
+            "no catalog representation. Nothing has been executed."
+        )
+    elif visuals.get("enabled"):
+        answers.append(
+            "No Premiere visual plan was built. --visual-mode premiere_plan "
+            "builds one; it still executes nothing."
+        )
+    else:
+        answers.append(
+            "Nothing visual was planned, so there is nothing to execute."
+        )
+
     warning_count = len(report.warnings)
     if checks.get("ran"):
         answers.append(
@@ -718,6 +841,10 @@ def _answers(state: AutoRunState, report: AutoRunReport) -> list[dict]:
         watch.append("every caption against what is actually said")
     if audio.get("accepted"):
         watch.append("every cue against the commentary, by ear")
+    if visuals.get("accepted"):
+        watch.append(
+            f"the {visuals.get('busy_segments', 0)} busiest clip(s), where "
+            "the visual layer stacked most")
     if not watch:
         watch.append("the whole thing once, without stopping")
     answers.append("Watch " + ", ".join(watch) + ".")
@@ -844,6 +971,9 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
         modes.append(f"captions={run.captions}")
     if run.audio_polish != "off":
         modes.append(f"audio-polish={run.audio_polish}")
+    if run.visual_layer != "off":
+        modes.append(f"visual-layer={run.visual_layer}")
+        modes.append(f"visual-mode={run.visual_mode}")
     add(f"modes      : {', '.join(modes) if modes else 'none'}")
     add("")
 
@@ -1118,6 +1248,66 @@ def render(state: AutoRunState, report: AutoRunReport) -> str:
     add(f"  {audio.get('note', '')}")
     add("")
 
+    # -- what the edit points at --------------------------------------------
+    visuals = report.visuals or {}
+    add(_THIN)
+    add("WHERE THE EDIT POINTS AT SOMETHING")
+    add(_THIN)
+    if visuals.get("accepted"):
+        add(f"  {visuals['accepted']} treatment(s) from "
+            f"{visuals.get('moments', 0)} moment(s), at "
+            f"{visuals.get('effects_per_minute', 0):.2f} a minute "
+            f"(ceiling {visuals.get('ceiling', 0):.2f}).")
+        if visuals.get("by_effect"):
+            add("  effects: " + ", ".join(
+                f"{count} x {name.replace('_', ' ')}"
+                for name, count in sorted(
+                    visuals["by_effect"].items(), key=lambda kv: -kv[1])[:6]))
+        if visuals.get("by_moment_kind"):
+            add("  on     : " + ", ".join(
+                f"{count} {kind.replace('_', ' ')}"
+                for kind, count in sorted(
+                    visuals["by_moment_kind"].items(),
+                    key=lambda kv: -kv[1])[:6]))
+        add(f"  refused: {visuals.get('rejected', 0)}"
+            + (", " + ", ".join(
+                f"{count} {code}" for code, count in sorted(
+                    visuals.get("by_reject_reason", {}).items(),
+                    key=lambda kv: -kv[1])[:4])
+               if visuals.get("by_reject_reason") else ""))
+        add(f"  {visuals.get('untreated_moments', 0)} moment(s) earned "
+            f"nothing; {visuals.get('lowered', 0)} treatment(s) were softened "
+            "rather than refused.")
+        if visuals.get("premiere_operations"):
+            add(f"  Premiere: {visuals['premiere_operations']} operation(s), "
+                "dry run "
+                + ("passed" if visuals.get("premiere_dry_run_passed")
+                   else "NOT passed")
+                + f", {visuals.get('premiere_unsupported', 0)} treatment(s) "
+                "it cannot express.")
+        add("  ! NOTHING HERE IS IN ANY VIDEO. The Premiere operations are "
+            "proposals")
+        add("    validated offline, and no effect has been drawn or rendered.")
+        add(f"  why each : {visuals.get('rejected_command', '')}")
+    elif visuals.get("enabled"):
+        add(f"  {visuals.get('moments', 0)} moment(s) were found and every "
+            "treatment was refused.")
+        if visuals.get("by_reject_reason"):
+            add("  refused: " + ", ".join(
+                f"{code}={count}" for code, count in sorted(
+                    visuals["by_reject_reason"].items(),
+                    key=lambda kv: -kv[1])[:6]))
+    elif visuals.get("blocked_reason"):
+        add("  The visual layer did not run: "
+            + str(visuals["blocked_reason"])[:140])
+    else:
+        add("  No visual treatment was planned. To find the moments that earn")
+        add("  emphasis -- a death, a reveal, a creeper on screen -- and "
+            "refuse most:")
+        add(f"    {visuals.get('run_with_visuals', '')}")
+    add(f"  {visuals.get('note', '')}")
+    add("")
+
     # -- the checks ---------------------------------------------------------
     checks = report.checks or {}
     add(_THIN)
@@ -1360,6 +1550,20 @@ def _headlines(state: AutoRunState, report: AutoRunReport) -> list[str]:
                "files" if audio_section.get("plays_anything")
                else " -- all of them placeholders, so nothing plays")
             + ". None of it is in the proxy."
+        )
+
+    visual_section = report.visuals or {}
+    if visual_section.get("accepted"):
+        out.append(
+            f"{visual_section['accepted']} visual treatment(s) were planned "
+            f"from {visual_section.get('moments', 0)} moment(s), and "
+            f"{visual_section.get('rejected', 0)} were refused. None of it is "
+            "in any video."
+        )
+    elif visual_section.get("enabled"):
+        out.append(
+            "The visual layer ran and refused every treatment; the plan names "
+            "the rule for each."
         )
 
     checks = report.checks or {}

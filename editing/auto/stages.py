@@ -273,6 +273,32 @@ STAGES = (
                        "--audio-polish placeholders",
     ),
     AutoStage(
+        name="visual_plan",
+        summary="Find the moments that earn visual emphasis, and refuse most",
+        # After the polish passes because a callout over a caption is a
+        # refusal it can only make once the captions exist.
+        requires=("roughcut_build",),
+        config_keys=("name", "style", "visual_layer",
+                     "max_effects_per_minute", "max_callouts_per_minute",
+                     "allow_freeze_frames", "allow_callouts", "allow_replays",
+                     "allow_screen_shake", "captions", "audio_polish",
+                     "retention_cut", "retention_mode"),
+        artifacts=("visuals/structure.visuals.json",),
+        critical=False,
+        manual_command="python -m editing.cli visuals plan "
+                       "--visual-layer balanced",
+    ),
+    AutoStage(
+        name="final_edit_plan",
+        summary="Compose the cut, the captions, the sound and the visuals",
+        requires=("visual_plan",),
+        config_keys=("name", "style", "visual_mode",
+                     "export_premiere_visual_plan"),
+        artifacts=("visuals/structure.final.json",),
+        critical=False,
+        manual_command="python -m editing.cli visuals report --latest",
+    ),
+    AutoStage(
         name="render_proxy",
         summary="Render a watchable proxy of the rough cut with FFmpeg",
         requires=("roughcut_build",),
@@ -400,6 +426,11 @@ CAPTION_STAGES = ("caption_polish",)
 
 #: The audio polish, on its own. Opt-in via ``--audio-polish``.
 AUDIO_STAGES = ("audio_polish",)
+
+#: The creative visual layer and the composer it feeds. Opt-in via
+#: ``--visual-layer``: deciding where somebody's video should zoom, flash and
+#: point at things is the least default-able thing in this system.
+VISUAL_STAGES = ("visual_plan", "final_edit_plan")
 
 #: The review package. Opt-*out* -- the only late addition that is on by
 #: default -- because it creates nothing new, costs a fraction of a second,
@@ -1477,6 +1508,17 @@ def run_render_proxy(pipeline, run, context) -> tuple:
             job.output_path, name=run.name, plan=caption_plan)
         sidecar = str(written) if written is not None else ""
 
+    # And the visual marker file, for the same reason: no treatment in that
+    # plan is in the video either, and a file beside it is the honest way to
+    # see where each one would land.
+    visual_markers = ""
+    visuals = context.get("visual_plan")
+    final = context.get("final_edit")
+    if visuals is not None and final is not None and job.output_path:
+        written = pipeline.visual_markers_beside(
+            job.output_path, name=run.name, visuals=visuals, final=final)
+        visual_markers = str(written) if written is not None else ""
+
     result = job.result
     return (
         [job.output_path, job.notes_path],
@@ -1485,6 +1527,7 @@ def run_render_proxy(pipeline, run, context) -> tuple:
             "video": job.output_path,
             "notes": job.notes_path,
             "subtitles": sidecar,
+            "visual_markers": visual_markers,
             "clips": len(job.segments),
             "duration": job.duration,
             "quality": settings.quality,
@@ -1630,6 +1673,137 @@ def run_audio_polish(pipeline, run, context) -> tuple:
     )
 
 
+def run_visual_plan(pipeline, run, context) -> tuple:
+    """Find the moments that earn visual emphasis, and refuse most of them.
+
+    Non-critical, like every other polish pass: losing the visual layer costs
+    the visual layer. The cut, the captions and the sound are untouched by it.
+    """
+    from editing.style import presets as style_presets
+
+    style = style_presets.get(run.style)
+    settings = pipeline.visual_config(
+        style, layer=run.visual_layer, mode=run.visual_mode,
+        max_effects_per_minute=(run.max_effects_per_minute or None),
+        max_callouts_per_minute=(run.max_callouts_per_minute or None),
+        allow_freeze_frames=run.allow_freeze_frames,
+        allow_callouts=run.allow_callouts,
+        allow_replays=run.allow_replays,
+        allow_screen_shake=run.allow_screen_shake,
+    )
+    cut, base = _polish_cut(pipeline, run, context)
+
+    visuals, final = pipeline.plan_visuals(
+        name=run.name,
+        timeline=context.get("timeline"),
+        cut=cut,
+        style=style,
+        settings=settings,
+        director_plan=context.get("director_plan"),
+        retention_plan=context.get("retention_cut_plan"),
+        caption_plan=context.get("caption_plan"),
+        audio_plan=context.get("audio_plan"),
+        memory=context.get("episode_memory"),
+        retention_findings=context.get("retention_plan"),
+        base=base,
+        run_id=str(context.get("run_id") or ""),
+    )
+    context["visual_plan"] = visuals
+    context["final_edit"] = final
+
+    stats = visuals.stats()
+    return (
+        [str(pipeline.config.visuals_dir / f"{run.name}.visuals.json")],
+        {
+            "layer": visuals.layer,
+            "base": base,
+            "moments": stats["moments"],
+            "considered": stats["considered"],
+            "accepted": stats["accepted"],
+            "rejected": stats["rejected"],
+            "lowered": stats["lowered"],
+            "untreated_moments": stats["untreated_moments"],
+            "effects_per_minute": stats["effects_per_minute"],
+            "callouts_per_minute": stats["callouts_per_minute"],
+            "ceiling": settings.max_effects_per_minute,
+            "by_family": stats["by_family"],
+            "by_effect": stats["by_effect"],
+            "by_moment_kind": stats["by_moment_kind"],
+            "by_reject_reason": stats["by_reject_reason"],
+            "placeholder_only": stats["placeholder_only"],
+            # Loud on purpose, for the same reason the caption stage's
+            # ``burned_in`` is: a plan of intentions must never read as a
+            # video with effects in it.
+            "rendered": False,
+        },
+        list(visuals.warnings),
+    )
+
+
+def run_final_edit_plan(pipeline, run, context) -> tuple:
+    """Compose the cut, the captions, the sound and the visuals into one plan.
+
+    The composer already ran inside ``visual_plan`` -- they share a pass
+    because the composer needs the plan object rather than the file. This
+    stage exists to report on it separately and to write the Premiere
+    operation plan when the run asked for one it would not otherwise get.
+    """
+    from editing.visuals import store as visuals_store
+
+    final = context.get("final_edit")
+    if final is None:
+        final = pipeline.final_edit_or_none(name=run.name)
+    if final is None:
+        raise StageBlocked(
+            "there is no final edit plan to report on",
+            "the visual pass produced no plan, so there is nothing to "
+            "compose.",
+            code="no_visual_plan",
+            next_command="python -m editing.cli visuals plan "
+                         "--visual-layer balanced",
+        )
+
+    outputs = [str(visuals_store.final_path(pipeline.config, run.name))]
+
+    # ``--export-premiere-visual-plan`` is the switch for somebody who planned
+    # in a mode that does not build one but wants it anyway. It still executes
+    # nothing.
+    premiere = final.execution.premiere
+    if premiere is None and run.export_premiere_visual_plan:
+        premiere = pipeline.export_visual_premiere_plan(
+            name=run.name, visuals=context.get("visual_plan"))
+        final.execution.premiere = premiere
+        visuals_store.save_final(pipeline.config, final, name=run.name)
+    if premiere is not None:
+        outputs.append(
+            str(visuals_store.premiere_path(pipeline.config, run.name)))
+
+    stats = final.stats()
+    return (
+        outputs,
+        {
+            "mode": final.mode,
+            "segments": stats["segments"],
+            "busy_segments": stats["busy_segments"],
+            "untouched_segments": stats["untouched_segments"],
+            "visual_treatments": stats["visual_treatments"],
+            "captions": stats["captions"],
+            "audio_cues": stats["audio_cues"],
+            "premiere_operations": (
+                premiere.operation_count if premiere else 0),
+            "premiere_unsupported": len(premiere.unsupported) if premiere else 0,
+            "premiere_dry_run_passed": (
+                bool(premiere.dry_run_passed) if premiere else False),
+            "preview_burnable": stats["execution_preview_burnable"],
+            "placeholder_only": stats["execution_placeholder_only"],
+            # Same reason as above, and the field the report reads to refuse
+            # to claim otherwise.
+            "executed": False,
+        },
+        list(final.warnings),
+    )
+
+
 def run_reliability_gates(pipeline, run, context) -> tuple:
     """Check whether this run produced something usable.
 
@@ -1717,6 +1891,8 @@ def run_review_package(pipeline, run, context) -> tuple:
         checks=context.get("gate_report"),
         caption_plan=context.get("caption_plan"),
         audio_plan=context.get("audio_plan"),
+        visual_plan=context.get("visual_plan"),
+        final_edit=context.get("final_edit"),
     )
     context["review_package"] = package
 
@@ -1743,6 +1919,8 @@ def run_review_package(pipeline, run, context) -> tuple:
 RUNNERS["retention_cut"] = run_retention_cut
 RUNNERS["caption_polish"] = run_caption_polish
 RUNNERS["audio_polish"] = run_audio_polish
+RUNNERS["visual_plan"] = run_visual_plan
+RUNNERS["final_edit_plan"] = run_final_edit_plan
 RUNNERS["render_proxy"] = run_render_proxy
 RUNNERS["reliability_gates"] = run_reliability_gates
 RUNNERS["feedback_start"] = run_feedback_start

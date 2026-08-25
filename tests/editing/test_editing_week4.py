@@ -23,7 +23,7 @@ import pytest
 from editing.auto import report as auto_report
 from editing.auto import stages as auto_stages
 from editing.auto.runner import AutoRunner
-from editing.auto.schema import STAGE_ORDER, AutoRunConfig
+from editing.auto.schema import STAGE_ORDER, AutoRunConfig, AutoRunState
 from editing.visual.frames import ExtractedFrames
 
 
@@ -750,3 +750,327 @@ def test_an_unknown_audio_mode_is_refused_by_the_parser():
     with pytest.raises(SystemExit):
         build_parser().parse_args(
             ["auto", "run", "--folder", "D:/c", "--audio-polish", "loud"])
+
+
+# ---------------------------------------------------------------------------
+# Session 12 -- the creative visual layer, through the pipeline
+# ---------------------------------------------------------------------------
+#
+# Two stages, both opt-in and both non-critical. The properties worth asserting
+# end to end are the ones a unit test cannot see: that they are genuinely off
+# by default, that they read the cut *and the polish* this run produced, and
+# that a run with them on completes with nothing installed and executes
+# nothing.
+
+
+def with_visuals(auto_config, **overrides) -> AutoRunConfig:
+    return replace(
+        auto_config, visual_layer="balanced", visual_mode="hybrid",
+        captions="key_moments", audio_polish="placeholders", **overrides)
+
+
+def test_the_visual_layer_is_off_unless_it_is_asked_for(runner, auto_config):
+    """Deciding where somebody's video zooms is not a default."""
+    state = run_once(runner, auto_config)
+
+    for name in ("visual_plan", "final_edit_plan"):
+        result = state.stage(name)
+        assert result is not None and result.status == "skipped"
+        assert "--visual-layer" in result.note
+
+
+def test_visuals_default_to_off_in_the_run_config():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args(
+        ["auto", "run", "--folder", "D:/clips"])
+    run = _auto_config(args)
+    assert run.visual_layer == "off"
+    assert run.visual_mode == "plan_only"
+    # Screen shake is the one family off even when the layer is on.
+    assert run.allow_screen_shake is False
+
+
+def test_the_visual_stages_run_after_the_polish_they_read():
+    """A callout over a caption is a refusal it can only make once both
+    exist."""
+    assert STAGE_ORDER.index("caption_polish") < \
+        STAGE_ORDER.index("visual_plan")
+    assert STAGE_ORDER.index("audio_polish") < STAGE_ORDER.index("visual_plan")
+    assert STAGE_ORDER.index("visual_plan") < \
+        STAGE_ORDER.index("final_edit_plan")
+    assert STAGE_ORDER.index("final_edit_plan") < \
+        STAGE_ORDER.index("render_proxy")
+
+
+def test_no_visual_stage_requires_premiere_ffmpeg_or_a_model():
+    for name in ("visual_plan", "final_edit_plan"):
+        stage = auto_stages.stage(name)
+        assert stage.requires_premiere is False
+        assert stage.requires_ffmpeg is False
+        assert stage.requires_model is False
+        assert stage.critical is False
+
+
+def test_a_run_with_visuals_completes_with_nothing_installed(
+    runner, auto_config
+):
+    state = run_once(runner, with_visuals(auto_config))
+    assert state.status in ("complete", "blocked"), state.stats()
+
+    visual = state.stage("visual_plan")
+    composed = state.stage("final_edit_plan")
+    assert visual.ok, visual.note
+    assert composed.ok, composed.note
+    assert visual.summary["moments"] > 0
+
+
+def test_the_visual_layer_reads_the_retention_cut_when_there_is_one(
+    runner, auto_config
+):
+    state = run_once(runner, with_visuals(
+        auto_config, retention_cut=True, retention_mode="retention"))
+    assert state.stage("visual_plan").summary["base"] == "retention"
+
+
+def test_the_visual_layer_reads_the_rough_cut_otherwise(runner, auto_config):
+    state = run_once(runner, with_visuals(auto_config))
+    assert state.stage("visual_plan").summary["base"] == "roughcut"
+
+
+def test_the_visual_plan_lands_inside_the_run(runner, auto_config):
+    state = run_once(runner, with_visuals(auto_config))
+    for stage in ("visual_plan", "final_edit_plan"):
+        outputs = state.stage(stage).outputs
+        assert outputs
+        for path in outputs:
+            assert state.run_id in path
+            assert Path(path).exists()
+
+
+def test_the_visual_stage_never_claims_to_have_rendered(runner, auto_config):
+    state = run_once(runner, with_visuals(auto_config))
+    assert state.stage("visual_plan").summary["rendered"] is False
+    assert state.stage("final_edit_plan").summary["executed"] is False
+
+
+def test_hybrid_mode_builds_a_premiere_plan_that_validates(runner,
+                                                           auto_config):
+    """Offline, against the real catalog, with no host application."""
+    state = run_once(runner, with_visuals(auto_config))
+    summary = state.stage("final_edit_plan").summary
+    if not summary.get("premiere_operations"):
+        pytest.skip("nothing was planned, so there is nothing to validate")
+    assert summary["premiere_dry_run_passed"] is True
+
+
+def test_every_refused_treatment_is_inspectable(runner, auto_config):
+    from editing.visuals import store as visuals_store
+
+    state = run_once(runner, with_visuals(auto_config))
+    pipeline = runner.pipeline_for(state)
+    plan = visuals_store.load_plan(pipeline.config, name="structure")
+    assert plan.rejected
+    for refused in plan.rejected:
+        assert refused.reject_reason
+        assert refused.reject_detail
+
+
+def test_a_run_with_visuals_executes_nothing(runner, auto_config):
+    state = run_once(runner, with_visuals(auto_config))
+    assert all(not gate.executed for gate in state.gates)
+    assert all(not gate.ready for gate in state.gates)
+
+
+def test_the_render_writes_a_visual_marker_file_beside_the_video(
+    runner, auto_config, fake_ffmpeg
+):
+    """Nothing in the visual plan is in the video, so a file beside it is the
+    honest way to see where each effect would land."""
+    state = run_once(runner, with_visuals(auto_config, render_proxy=True))
+    render = state.stage("render_proxy")
+    assert render.ok, render.note
+
+    if not state.stage("visual_plan").summary["accepted"]:
+        pytest.skip("nothing was planned, so there is no marker file")
+    markers = render.summary.get("visual_markers") or ""
+    assert markers.endswith(".visuals.md")
+    assert Path(markers).exists()
+    assert Path(markers).parent == Path(render.summary["video"]).parent
+
+
+def test_the_report_carries_the_visual_section(runner, auto_config):
+    state = run_once(runner, with_visuals(auto_config))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    text = auto_report.render(state, report)
+
+    assert "WHERE THE EDIT POINTS AT SOMETHING" in text
+    assert report.visuals["ran"] is True
+    assert report.visuals["rendered"] is False
+
+
+def test_the_report_says_when_visuals_are_off_and_how_to_turn_them_on(
+    runner, auto_config
+):
+    state = run_once(runner, auto_config)
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    assert report.visuals["enabled"] is False
+    assert "--visual-layer balanced" in report.visuals["run_with_visuals"]
+
+
+def test_the_report_never_says_a_visual_effect_is_in_the_video(
+    runner, auto_config
+):
+    state = run_once(runner, with_visuals(auto_config))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+    text = auto_report.render(state, report)
+    if report.visuals["accepted"]:
+        assert "NOTHING HERE IS IN ANY VIDEO" in text
+
+
+def test_the_report_answers_the_two_new_questions(runner, auto_config):
+    state = run_once(runner, with_visuals(auto_config))
+    report = auto_report.build_report(
+        runner.config, state, runner.pipeline_for(state))
+
+    questions = [entry["question"] for entry in report.answers]
+    assert "What visual treatments were planned?" in questions
+    assert "What can be executed in Premiere later?" in questions
+    assert len(report.answers) == len(auto_report.QUESTIONS)
+
+
+def test_the_review_package_carries_the_visual_report(runner, auto_config):
+    from editing.review import store as review_store
+
+    state = run_once(runner, with_visuals(auto_config))
+    package = review_store.load_package(runner.config, state.run_id)
+
+    assert package.visuals["enabled"] is True
+    assert package.visuals["rendered"] is False
+    assert package.visuals.get("answers")
+
+
+def test_the_review_index_answers_the_six_visual_questions(runner,
+                                                           auto_config):
+    from editing.review import store as review_store
+
+    state = run_once(runner, with_visuals(auto_config))
+    text = review_store.index_path(
+        runner.config, state.run_id).read_text("utf-8")
+
+    assert "## 3b. What the edit points at" in text
+    assert "What visual effects were added?" in text
+    assert "Which moments got no visuals, and why?" in text
+    assert "What can be executed in Premiere later?" in text
+    assert "What might be cringe or overdone?" in text
+
+
+def test_the_review_index_has_no_visual_section_when_visuals_are_off(
+    runner, auto_config
+):
+    from editing.review import store as review_store
+
+    state = run_once(runner, auto_config)
+    text = review_store.index_path(
+        runner.config, state.run_id).read_text("utf-8")
+    assert "## 3b." not in text
+
+
+def test_an_old_run_without_visuals_still_loads(config, tmp_path):
+    """A run folder written before this session must still read back."""
+    from editing.auto import store as auto_store
+    from editing.auto.schema import AutoRunConfig as RunConfig
+
+    run = RunConfig(footage_folder=str(tmp_path), style="minimal_clean")
+    state = auto_store.create(config, run, "old-run")
+    document = state.to_dict()
+    # Strip every field this session added, as an older state.json would.
+    for key in ("visual_layer", "visual_mode", "max_effects_per_minute",
+                "max_callouts_per_minute", "allow_freeze_frames",
+                "allow_callouts", "allow_replays", "allow_screen_shake",
+                "export_premiere_visual_plan"):
+        document["config"].pop(key, None)
+
+    restored = AutoRunState.from_dict(document)
+    assert restored.config.visual_layer == "off"
+    assert restored.config.visual_mode == "plan_only"
+
+
+def test_the_visual_flags_reach_the_run_config():
+    from editing.cli import _auto_config, build_parser
+
+    args = build_parser().parse_args([
+        "auto", "run", "--folder", "D:/clips",
+        "--visual-layer", "high", "--visual-mode", "premiere_plan",
+        "--max-effects-per-minute", "2.5",
+        "--max-callouts-per-minute", "1.0",
+        "--no-freeze-frames", "--no-callouts", "--no-replays",
+        "--allow-screen-shake", "--export-premiere-visual-plan",
+    ])
+    run = _auto_config(args)
+
+    assert run.visual_layer == "high"
+    assert run.visual_mode == "premiere_plan"
+    assert run.max_effects_per_minute == 2.5
+    assert run.max_callouts_per_minute == 1.0
+    assert run.allow_freeze_frames is False
+    assert run.allow_callouts is False
+    assert run.allow_replays is False
+    assert run.allow_screen_shake is True
+    assert run.export_premiere_visual_plan is True
+
+
+def test_the_command_from_the_brief_parses():
+    from editing.cli import build_parser
+
+    args = build_parser().parse_args([
+        "auto", "run", "--folder", "E:/Clips/Test", "--director",
+        "--retention-cut", "--captions", "key_moments",
+        "--audio-polish", "placeholders", "--visual-layer", "balanced",
+        "--render-proxy", "--no-premiere",
+    ])
+    assert args.visual_layer == "balanced"
+    assert args.render_proxy is True
+    assert args.no_premiere is True
+
+
+def test_the_visuals_commands_from_the_brief_parse():
+    from editing.cli import build_parser
+
+    parser = build_parser()
+    plan = parser.parse_args([
+        "visuals", "plan", "--run", "r1", "--style", "cinematic_minecraft",
+        "--visual-layer", "balanced",
+    ])
+    assert plan.visuals_command == "plan"
+    assert plan.run == "r1"
+    assert plan.visual_layer == "balanced"
+
+    for command in ("report", "show-accepted", "show-rejected",
+                    "export-premiere-plan", "show-final"):
+        args = parser.parse_args(["visuals", command, "--latest"])
+        assert args.visuals_command == command
+        assert args.latest is True
+
+
+def test_an_unknown_visual_layer_is_refused_by_the_parser():
+    from editing.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["auto", "run", "--folder", "D:/c", "--visual-layer", "maximum"])
+
+
+def test_the_batch_carries_the_visual_settings():
+    from editing.batch.run import run_config_for
+    from editing.batch.schema import BatchCandidate, BatchConfig
+
+    batch = BatchConfig(root="/clips", visual_layer="balanced",
+                        visual_mode="premiere_plan")
+    run = run_config_for(
+        batch, BatchCandidate(folder="/clips/ep01", video_files=2))
+    assert run.visual_layer == "balanced"
+    assert run.visual_mode == "premiere_plan"

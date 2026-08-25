@@ -50,6 +50,8 @@ def render(summary: BatchSummary, *, limit: int = 60) -> str:
         modes.append(f"captions={config.captions}")
     if config.audio_polish != "off":
         modes.append(f"audio={config.audio_polish}")
+    if config.visual_layer != "off":
+        modes.append(f"visuals={config.visual_layer}")
     add(f"modes    : {', '.join(modes) if modes else 'none'}")
     add(f"folders  : {stats['folders']} "
         f"({stats['completed']} completed, {stats['failed']} failed, "

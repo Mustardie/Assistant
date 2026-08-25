@@ -62,6 +62,14 @@ footage → Premiere mapping → local Whisper transcript → Qwen3-VL vision �
        one review folder with an index: what to watch, what changed, what is
        weak, and what needs you -- and the whole thing again over every folder
        under a root, in batch
+                                                    ↓
+      optionally: the creative visual layer reads every plan above and decides
+      where the edit should point at something -- a zoom onto the creeper, a
+      card naming the objective -- refusing most of what it considers
+                                                    ↓
+     cut + captions + sound + visuals -> one FinalEditPlan, a Premiere
+     operation plan validated offline, and an honest note that none of it
+     has been drawn
 ```
 
 **Nothing runs unless you say so, twice.** Every plan is validated offline
@@ -147,6 +155,20 @@ configuration to every footage folder under a root, skips what is already done,
 survives a folder that breaks, and never overwrites finished work. See
 [§24 batch mode](#24-batch-mode).
 
+**The edit can point at things.** The creative visual layer reads every plan
+above -- the director's decisions, the cold open, the captions, the sound, the
+episode memory, the vision events -- and finds the moments that earn emphasis:
+a death worth freezing, a creeper worth ringing, an objective worth naming. It
+then refuses most of what it considered, and says why for each. Off by default.
+See [§26 the creative visual layer](#26-the-creative-visual-layer).
+
+**Nothing that layer plans is ever drawn.** Its Premiere operations are
+proposals validated offline against the catalog; its FFmpeg side is a
+capability statement and a marker file beside the proxy. `burned_in` is False
+everywhere and no code path sets it True. See
+[§28 the Premiere visual plan](#28-the-premiere-visual-plan) and
+[§29 FFmpeg preview](#29-ffmpeg-preview-what-it-can-and-cannot-show).
+
 **The critic pass is one iteration, not a loop.** It exists to catch the obvious
 mistakes an automatic assembly makes — a zoom that crops the HUD, a caption over
 the action, a beat cut a moment early. It is not trying to converge on a
@@ -164,11 +186,12 @@ which order they go in.
 python -m editing.cli auto run --folder D:/Footage/ep12 --style cinematic_minecraft
 ```
 
-That runs twenty-nine stages — discovery, transcripts, audio, vision,
+That runs thirty-one stages — discovery, transcripts, audio, vision,
 timeline, recommendations, rough cut, critic, style layers, asset placement,
-episode memory, retention plan, caption polish, audio polish, proxy render,
-reliability checks, review package — and writes a plan and an offline dry run
-for each of the four things that could touch Premiere.
+episode memory, retention plan, caption polish, audio polish, the visual layer,
+the final edit plan, proxy render, reliability checks, review package — and
+writes a plan and an offline dry run for each of the four things that could
+touch Premiere.
 
 **It executes nothing.** Not by accident, and not by default. Execution is four
 separate decisions:
@@ -225,6 +248,8 @@ footage before committing an afternoon to it.
   . retention_cut          skipped  --retention-cut was not set
   . caption_polish         skipped  --captions was not set
   . audio_polish           skipped  --audio-polish was not set
+  . visual_plan            skipped  --visual-layer was not set
+  . final_edit_plan        skipped  --visual-layer was not set
   . render_proxy           skipped  --render-proxy was not set
   + reliability_gates      passed   status=warn, usable=True, passed=9
   . feedback_start         skipped  --feedback was not set
@@ -235,13 +260,15 @@ footage before committing an afternoon to it.
 ```
 
 `transcribe`, `director_plan`, `retention_cut`, `caption_polish`,
-`audio_polish`, `render_proxy` and the three `feedback_*` stages are the
-opt-*in* ones, each for its own reason. The retention wiring reshapes the
+`audio_polish`, `visual_plan`, `final_edit_plan`, `render_proxy` and the three
+`feedback_*` stages are the opt-*in* ones, each for its own reason. The retention wiring reshapes the
 episode, which is not something to do to somebody's footage by default.
 Transcription loads a speech model and takes minutes per episode, so it waits
 to be asked — but the story layer is blind without it, so turn it on unless you
 already have transcripts. The director needs a model endpoint. Putting text and
-sound on your video is not a default. Rendering costs minutes of CPU and
+sound on your video is not a default, and deciding where it should zoom, flash
+and point at things is the least default-able thing in the system. Rendering
+costs minutes of CPU and
 hundreds of megabytes. Feedback starts a review a person is expected to finish,
 so `auto run --feedback` asks for it and the run report otherwise just tells
 you how much would be worth reviewing.
@@ -252,7 +279,10 @@ together they are the difference between a run you can inspect and forty files
 whose layout you have to learn. `--no-review-package` turns the second off.
 
 ```bash
-python -m editing.cli auto run --folder D:/Footage/ep12     --transcribe --director --retention-cut --render-proxy     --captions key_moments --audio-polish placeholders --no-premiere
+python -m editing.cli auto run --folder D:/Footage/ep12 \
+    --transcribe --director --retention-cut --render-proxy \
+    --captions key_moments --audio-polish placeholders \
+    --visual-layer balanced --no-premiere
 ```
 
 That hears the footage, has a model choose the cut, reshapes it like an
@@ -263,8 +293,9 @@ folder with an index — without Premiere being opened once. See
 [§19 retention wiring](#19-retention-structure-wiring),
 [§20 captions](#20-key-moment-captions),
 [§21 sound](#21-minimal-music-and-sfx-polish),
-[§22 the checks](#22-reliability-checks) and
-[§23 the review package](#23-the-review-package).
+[§22 the checks](#22-reliability-checks),
+[§23 the review package](#23-the-review-package) and
+[§26 the visual layer](#26-the-creative-visual-layer).
 
 ### The run folder
 
@@ -433,6 +464,9 @@ clearing a run's artifacts while a sequence built from them is still open.
   in `assets` mode, matches. Nothing is mixed, levelled or heard.
 - **Its reliability checks judge shape, not taste.** Fifteen green ticks mean
   the output is well-formed, not that the edit is good.
+- **It draws no visual effect.** The visual layer plans; the Premiere
+  operations are proposals validated offline and the FFmpeg side is a
+  capability statement.
 
 ---
 
@@ -479,6 +513,10 @@ python -m editing.cli polish captions --captions key_moments   # the few lines
 python -m editing.cli polish show-rejected                # and every refusal
 python -m editing.cli polish audio --audio-polish placeholders # where sound goes
 python -m editing.cli polish show-missing                 # the shopping list
+
+python -m editing.cli visuals plan --visual-layer balanced # where to point
+python -m editing.cli visuals show-rejected               # and what it refused
+python -m editing.cli visuals export-premiere-plan        # what Premiere could do
 
 python -m editing.cli auto show-checks                    # is the output usable?
 python -m editing.cli review package                      # gather it into one folder
@@ -4080,7 +4118,308 @@ this section says so rather than implying the two are connected.
 
 ---
 
-## 26. Where outputs go
+## 26. The creative visual layer
+
+Everything before this decided *what footage is in the edit*. This decides
+where the edit should **point at something** — a zoom onto the creeper, a card
+naming the objective, an arrow at the thing nobody would otherwise notice. It
+is off by default.
+
+```bash
+python -m editing.cli auto run --folder D:/Footage/ep12 \
+    --director --retention-cut --captions key_moments \
+    --audio-polish placeholders --visual-layer balanced --no-premiere
+```
+
+**Nothing it plans is drawn, rendered or executed.** The Premiere operations
+are proposals validated offline; the FFmpeg side is a capability statement and
+a marker file. There is no code path in the package that burns an effect into a
+video, and `burned_in` is `False` everywhere.
+
+### Four rules
+
+**Every treatment names the moment it is for.** No effect comes from a clock, a
+beat grid or "every N seconds". A candidate exists because the director
+accepted a decision there, the retention pass moved that footage to the front,
+the caption pass found a payoff line, or the vision pass saw a creeper. No
+evidence, no effect.
+
+**Every refusal is kept** — including the moments the style never offered
+anything for. "Two effects" and "twenty candidates, eighteen refused, here is
+why" are different reports, and only the second one distinguishes taste from a
+bug.
+
+**The HUD is protected before anything else.** Minecraft's health, hunger and
+hotbar are information the viewer is reading. No style may override the check
+that keeps them on screen.
+
+**One moment gets one gesture.** A freeze frame *with* a label is a single
+effect in the library, not two stacked on the same second. The second candidate
+for a moment is refused with `too_close_to_another`, and the report says so in
+those words.
+
+### Four layers
+
+| `--visual-layer` | What it does |
+|---|---|
+| `off` | Nothing. The default |
+| `minimal` | Cards and the occasional slow zoom. Almost nothing else |
+| `balanced` | The intended setting: emphasis where the episode earns it |
+| `high` | More of everything, still inside every safety rule. Not a default, and every plan says so |
+
+The layer scales the *style's own* density rather than replacing it, so
+`--visual-layer high` on `minimal_clean` is still quieter than `balanced` on
+`fast_funny`. Picking a style keeps meaning something.
+
+### Twenty moments
+
+Detected only from what an earlier pass recorded — the vision events, the audio
+events, the transcript, the director's accepted decisions, the retention cut,
+the caption plan, the episode memory:
+
+`panic` · `death_or_fail` · `danger` · `reveal` · `discovery` · `payoff` ·
+`callback` · `funny_reaction` · `banter_spike` · `objective_start` ·
+`objective_complete` · `confusing_transition` · `grind_montage` ·
+`boring_compression` · `important_find` · `villager_chaos` · `near_death` ·
+`cliffhanger` · `opening_hook` · `recap`
+
+Two layers noticing the same death produce **one** moment carrying both pieces
+of evidence — otherwise a single death earns a zoom, a freeze frame and an
+arrow.
+
+Episode-layer findings are resolved through `segment_ids` unless the memory's
+own `timebase` says its numbers are sequence time. Guessing would place every
+finding *somewhere*, and every number would be a number and all of them wrong.
+
+### Thirty-four treatments
+
+| Family | Effects |
+|---|---|
+| emphasis | `zoom_punch` `quick_punch_in` `slow_zoom_hold` `crop_pan` `freeze_frame` `freeze_frame_label` |
+| callout | `arrow_callout` `circle_highlight` `box_highlight` `label_tag` `danger_warning_label` `objective_label` `entity_callout` |
+| card | `title_card` `objective_card` `progress_card` `recap_card` `chapter_card` `setup_payoff_card` `later_card` |
+| motion | `screen_shake` `impact_flash` `speed_ramp` `montage_marker` `letterbox` `dramatic_pause` |
+| replay | `replay_marker` `instant_replay` |
+| minecraft | `hardcore_warning` `totem_reminder` `health_emphasis` `villager_danger_meter` `progression_counter` `build_progress_card` `day_counter` `coordinates_card` |
+
+**A card with nothing to say is not built.** Its words come from the objective
+somebody stated, the entity the vision pass named, or a caption line that was
+already approved. There is no path that writes copy the footage cannot support
+— the same rule Session 8's hook text follows.
+
+### What each style is for
+
+| Style | Reaches for | Never uses |
+|---|---|---|
+| `cinematic_minecraft` | slow zooms, letterbox, cards, montage markers, dramatic pauses | screen shake, impact flash, freeze-frame labels, punch zooms |
+| `fast_funny` | punch zooms, freeze-frame labels, impact flashes, arrows, replay markers | letterbox, recap cards, coordinate cards |
+| `documentary_story` | objective cards, recap cards, chapter cards, progress cards, slow zooms | screen shake, impact flash, punch zooms, instant replay |
+| `minimal_clean` | title and objective cards, slow zooms, chapter cards, montage markers | everything else |
+
+`fast_funny` is the only style whose defaults turn meme effects on — it is the
+one style that reads a freeze-frame label as the point rather than as noise.
+
+### The fourteen safety rules
+
+They run in a fixed order and record what they saw whether or not they acted.
+
+| Refusal | Means |
+|---|---|
+| `hides_hud` | It would cover a full-screen menu, or scale the HUD off the frame |
+| `unknown_target` | A callout with nothing named on screen to point at |
+| `low_confidence` | The moment was not certain enough |
+| `low_transcript_confidence` | The speech behind it was unclear |
+| `weak_visual_label` | The vision pass named nothing, and this changes the picture |
+| `clip_too_short` | The clip cannot carry it |
+| `too_long` | Longer than the duration ceiling |
+| `interrupts_action` | A freeze mid-fight stops the thing the viewer came for |
+| `shake_during_combat` | Shaking the frame while there is something to aim at |
+| `caption_overlap` | A caption is already on screen there |
+| `repeated_effect` | The same effect too many times |
+| `hook_already_polished` | The opening already carries a cold open, a caption and a sting |
+| `too_close_to_another` | Too close to another effect, or a second gesture on one moment |
+| `density_limit` | The budget was full and stronger moments filled it |
+| `style_forbids` / `layer_forbids` | This style or this run does not use that effect |
+| `no_evidence` | Nothing to fill the effect with |
+
+**Lower before refusing.** A punch too strong for the moment becomes a *softer*
+punch, not no punch. A card too long for the clip is shortened. Only the checks
+where a softer version would still be wrong — a callout pointing at nothing, an
+overlay across an open inventory — refuse outright, and every softened
+treatment carries the rule that softened it.
+
+### Reading it
+
+```bash
+python -m editing.cli visuals plan --visual-layer balanced --style fast_funny
+python -m editing.cli visuals report --latest
+python -m editing.cli visuals show-accepted --latest
+python -m editing.cli visuals show-rejected --latest
+python -m editing.cli visuals show-rejected --latest --reason hides_hud
+python -m editing.cli visuals show-final --latest
+python -m editing.cli visuals export-premiere-plan --latest
+```
+
+```
+MOMENTS THAT GOT NOTHING (8)
+  [   0.00] opening_hook         right so today we are going to find some dia
+      why  : the opening already carries 2 other treatment(s) -- a caption, a
+             sting, a cold open -- and a viewer meets all of them in the first
+             few seconds
+  [   7.50] reveal               ...
+      why  : a circle_highlight needs something to point at and the vision
+             pass named nothing on screen here
+  [  27.50] payoff               ...
+      why  : a caption ("...we go that is what...") is on screen at 25.0s, and
+             a setup_payoff_card there would be a second thing to read at once
+```
+
+---
+
+## 27. The final edit plan
+
+The composer assembles the cut, the captions, the sound and the visuals into
+one object, so there is one file to read to find out what the edit *is* rather
+than five and a mental model of how they relate.
+
+```bash
+python -m editing.cli visuals show-final --latest
+```
+
+| `--visual-mode` | What it produces |
+|---|---|
+| `off` | Nothing |
+| `plan_only` | The `FinalEditPlan` alone. The default |
+| `proxy_preview` | Also the FFmpeg capability statement and a marker file |
+| `premiere_plan` | Also a Premiere operation plan, validated offline |
+| `hybrid` | Both |
+
+**None of them executes anything.** `premiere_plan` produces a *plan*; running
+it is a separate, explicit act behind its own `--yes`.
+
+Each segment carries the treatment, caption and cue ids landing on it, plus
+notes for the three situations worth a second look: a clip the pacing layer
+asked to be left alone now carrying a treatment, a retimed clip carrying one
+too, and a clip carrying more than two things at once.
+
+```
+[  25.00-  35.00] payoff           BUSY
+    visuals : 2 slow_zoom_hold, label_tag
+    captions: 1
+    note    : 2 treatment(s) and 1 caption(s) on one clip: this is the first
+              place to look if the edit feels over-worked.
+```
+
+---
+
+## 28. The Premiere visual plan
+
+```bash
+python -m editing.cli visuals export-premiere-plan --latest
+```
+
+Every accepted treatment, as operations from the catalog in §0 — validated
+offline, inspectable before anything runs, and **executed by nothing**.
+
+| Treatment | Operation |
+|---|---|
+| zooms and pushes | `animate` on `Motion > Scale` with an easing curve |
+| freeze frames | `clip.freeze`, plus `text.create` when it carries a label |
+| callouts | `graphic.shape` (arrow, circle, rounded rect) |
+| labels and cards | `text.create`, with `graphic.shape` for the plate |
+| impact flash | a full-frame `graphic.shape` at high opacity |
+| letterbox | two black `graphic.shape` bars |
+| speed ramps | `clip.speed_ramp` with three points |
+| markers | `marker.add` |
+
+Overlays land on **V3** — above the rough cut's V1 and the style layer's V2 —
+so the whole visual pass can be removed by deleting one track.
+
+### What the catalog cannot express
+
+Listed with the reason rather than approximated:
+
+* **`screen_shake`** — a shake is a per-frame position wobble. `animate` moves
+  a parameter from one value to another along a curve, and the catalog has no
+  primitive for generating thirty small moves.
+* **`instant_replay`** — replaying a range means playing footage twice, which
+  is a change to the *cut* rather than an overlay on it.
+* **`crop_pan`** — a pan across a scaled frame needs Position and Scale
+  animated together with a known crop origin, and this system does not know
+  where in the frame the subject is.
+
+### A callout knows *what*, never *where*
+
+The vision pass names entities; it does not localise them. Every callout
+operation therefore lands at the centre of the frame with
+`POSITION IS A GUESS, move it by hand` in its note, and the plan warns once for
+the batch. Emitting a confident-looking coordinate would be the one dishonest
+thing in the file.
+
+---
+
+## 29. FFmpeg preview: what it can and cannot show
+
+**Nothing is burned in.** The proxy renderer encodes each segment and joins
+them with the concat demuxer, which is what makes it survive a folder of
+mismatched game capture. Overlaying anything would mean a second full re-encode
+of the joined file with a filtergraph — a different strategy with its own
+failure modes, and one this session does not build.
+
+So `--visual-mode proxy_preview` produces three things:
+
+1. a **capability statement** per treatment,
+2. a **marker file** written beside the proxy as `render.visuals.md`,
+3. `burned_in = False`, with no code path that sets it True.
+
+| Verdict | Meaning | Examples |
+|---|---|---|
+| `burn_in` | A documented filter exists and would be clean on one segment | cards, labels, letterbox, impact flash, box highlight, freeze frames |
+| `sidecar` | Representable only as a marker beside the video | zooms, speed ramps, screen shake, replay and montage markers |
+| `none` | FFmpeg has no way to express it at all | arrows, circles, entity callouts, instant replay |
+
+The filter fragments for the `burn_in` set are **recorded rather than run**, so
+a later session wiring a real preview render does not have to re-derive them
+and a reader can see exactly what was and was not claimed.
+
+```
+| time     | effect            | what                     | shown in the proxy         |
+|----------|-------------------|--------------------------|----------------------------|
+| 00:30.00 | `freeze_frame`    | FREEZE FRAME (low)       | no — could be, and is not  |
+| 01:00.00 | `quick_punch_in`  | QUICK PUNCH IN (low)     | no — this line is the only sign of it |
+```
+
+### How the preview differs from a final edit
+
+The proxy is **the cut and its original audio**. It has no captions in it, no
+sound effects, no music, no graphics and no visual treatment. Watching it tells
+you whether the *cut* works; it tells you nothing about whether the edit does,
+and every report in this system repeats that rather than assuming you
+remembered.
+
+---
+
+## 30. What the visual layer does not do yet
+
+* **It has never been run against real footage with a real vision model.**
+  Twenty moment kinds, thirty-four effects, fourteen safety rules and a
+  scoring formula, all calibrated against fixtures and generated footage.
+* **It draws nothing.** No preview render, no Premiere execution. The plan is
+  intentions.
+* **It does not know where anything is on screen.** Every callout is a target
+  without a position.
+* **It does not look at the frame before deciding.** The HUD checks read what
+  the vision pass recorded, not the picture.
+* **It has no memory across effects.** Each treatment is checked against the
+  ones already kept and against nothing else, so six safe zooms are six safe
+  zooms and possibly one too many. `visuals report` flags that under "what
+  might be overdone" and stops there.
+* **It cannot invent a shake, a replay or a crop pan** — see §28.
+* **Nothing measures whether any of it helps.** It counts what it planned.
+
+---
+
+## 31. Where outputs go
 
 Default root `data/editing/` (`--output-dir` or `EDITING_OUTPUT_DIR`):
 
@@ -4136,9 +4475,17 @@ data/editing/
 ├── polish/structure.captions.srt   ← the sidecar subtitles, in sequence time
 ├── polish/structure.audio.json     ← every cue judged, and what is missing
 ├── polish/structure.audio.txt      ← the readable audio polish report
+├── visuals/structure.visuals.json  ← every moment and treatment, refusals too
+├── visuals/structure.visuals.txt   ← the readable visual report
+├── visuals/structure.visuals.md    ← the marker file, for watching the proxy
+├── visuals/structure.final.json    ← the FinalEditPlan: cut + captions + sound
+├── visuals/structure.final.txt     ← the readable final-edit report
+├── visuals/structure.premiere.json ← operations Premiere could run. Not run
+├── visuals/structure.compare.json  ← the visual layer against the bare cut
 ├── render/jobs/<job_id>/           ← one proxy render, and how it was made
 │   ├── render.mp4                  ← watch this
 │   ├── render.srt                  ← load this beside it: captions are not in it
+│   ├── render.visuals.md           ← and this: no effect is in it either
 │   ├── review_notes.md             ← write on this while you watch
 │   ├── report.md   result.json     what was produced, and what was not
 │   ├── segments.json               every source range, in play order
@@ -4180,7 +4527,7 @@ Errors exit non-zero with `code` and `hint` fields to branch on.
 
 ---
 
-## 27. Caching
+## 32. Caching
 
 Re-running does **not** re-analyse unchanged footage. A cache key is the SHA-256
 of:
@@ -4230,7 +4577,7 @@ that window.
 
 ---
 
-## 28. Tests
+## 33. Tests
 
 ```bash
 python -m pytest tests/editing -q        # 2060 tests, ~130s
@@ -4470,6 +4817,16 @@ way, not a detection.
 **Batch mode is sequential and has no retry.** Twenty folders in order. A
 folder that fails is recorded and skipped past; re-running with `--resume` is a
 separate decision you make after reading the summary.
+
+**The visual layer draws nothing, and has never seen real footage.** Twenty
+moment kinds, thirty-four effects, fourteen safety rules and a scoring formula,
+calibrated against fixtures. Its Premiere operations validate against the
+catalog and have never been executed; its FFmpeg side is a capability statement
+with the filters recorded rather than run. See §30 for the full list.
+
+**A callout knows what to point at and never where.** The vision pass names
+entities and does not localise them, so every callout lands at the centre of
+the frame with a note saying so and a person moves it.
 
 **The retention wiring inherits Session 8's calibration.** Its risk thresholds,
 hook scores and severity bands were tuned against intuition. Until now that

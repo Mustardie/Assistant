@@ -544,6 +544,11 @@ class AutoRunner:
             return "--captions was not set"
         if run.audio_polish == "off" and name in stages_module.AUDIO_STAGES:
             return "--audio-polish was not set"
+        # Inverted too, and the least default-able switch in the system:
+        # deciding where somebody's video should zoom, flash and point at
+        # things is not something to do because nobody said otherwise.
+        if run.visual_layer == "off" and name in stages_module.VISUAL_STAGES:
+            return "--visual-layer was not set"
         # The one late addition that is opt-*out*: it creates nothing, costs a
         # fraction of a second, and is what makes a run inspectable.
         if (not run.review_package

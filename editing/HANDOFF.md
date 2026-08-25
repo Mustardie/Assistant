@@ -1,6 +1,6 @@
 # Editing Brain V1 — session handoff
 
-Context for continuing this work in a new chat. Updated 2026-08-24 (Session 11).
+Context for continuing this work in a new chat. Updated 2026-08-25 (Session 12).
 
 ---
 
@@ -8,7 +8,7 @@ Context for continuing this work in a new chat. Updated 2026-08-24 (Session 11).
 
 ```cmd
 cd /d E:\Assistant
-python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 2060 passed
+python -m pytest tests/editing -q --basetemp=%TEMP%\pt    REM expect 2183 passed
 
 REM hear the footage first -- the story layer is blind without this:
 pip install faster-whisper
@@ -39,6 +39,13 @@ python -m editing.cli auto run --folder D:\Footage	est --mock --no-premiere ^
 python -m editing.cli auto show-checks                REM is it usable?
 python -m editing.cli review open-latest              REM one folder, one index
 
+REM and decide where the edit should point at something:
+python -m editing.cli auto run --folder D:\Footage\test --mock --no-premiere ^
+    --retention-cut --retention-mode retention ^
+    --captions key_moments --audio-polish placeholders --visual-layer balanced
+python -m editing.cli visuals report --latest      REM what it planned
+python -m editing.cli visuals show-rejected --latest    REM and what it refused
+
 REM or do the whole library at once:
 python -m editing.cli auto batch --root E:\Clips --dry-run
 
@@ -54,7 +61,7 @@ Everything below is detail behind that.
 ## Where the work lives
 
 **Good branch: `claude/editing-brain-v1-structure-7p33pm`.**
-This has all fourteen sessions and 2060 passing editing tests.
+This has all fifteen sessions and 2183 passing editing tests.
 
 **Do not build on `vishal-session3-roughcut`.** It has the Session 3 rough-cut
 code but is missing the entire `editing/audio/` and `editing/recommend/`
@@ -75,7 +82,7 @@ git push --force-with-lease origin vishal-session3-roughcut
 
 ---
 
-## What was built, in fourteen sessions
+## What was built, in fifteen sessions
 
 ```
 footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
@@ -132,6 +139,13 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
      and recording why. Then fifteen checks asking whether the run produced a
      usable thing, one review folder with an index that answers the five
      questions in order, and batch mode over a whole library of footage.
+                                                    ↓
+     Session 12 is the first layer that decides where the edit should *point
+     at something*. Twenty moment kinds read off every plan above, thirty-four
+     treatments, fourteen safety rules — and most of what it considers is
+     refused, with the rule that refused it. It draws nothing: the Premiere
+     operations are proposals validated offline and the FFmpeg side is a
+     capability statement.
 ```
 
 | Session | Package | What it added |
@@ -150,6 +164,7 @@ footage → Premiere mapping → transcript → Qwen3-VL vision ─┐
 | 10C | `director/` | a model chooses the cut; twelve rules decide what it may do |
 | 10D | `retention/` | cold open, compressed sag, protected setups, harder dead air |
 | 11 | `polish/`, `reliability/`, `review/`, `batch/` | key-moment captions, restrained sound, fifteen checks, a review folder, batch mode |
+| 12 | `visuals/` | where the edit points at something: moments, treatments, safety rules, a final edit plan, a Premiere operation plan |
 
 ### Session 7 — the auto pipeline
 
@@ -440,7 +455,7 @@ what exists **usable, reviewable and reliable**.
   batch-report`
 - `editing/config.py` gains `polish_dir`; `editing/schema.py` gains
   `as_text_list`
-- 229 new tests (2060 total)
+- 229 new tests (2060 at that point)
 
 ```cmd
 python -m editing.cli auto run --folder D:\Footage\ep12 ^
@@ -454,6 +469,48 @@ what the earlier passes recorded, then refuse most of them against named rules,
 and every refusal stays in the plan with the rule that made it. A pass that
 placed four captions out of sixty candidates and a pass that is broken both
 print "4"; only the refusal list tells them apart.
+
+### Session 12 — the creative visual layer
+
+The first layer that decides where the edit should **point at something**
+rather than what footage is in it. One package, two stages, and no new brain:
+it reads every plan the earlier sessions produce and refuses most of what it
+considers.
+
+- `editing/visuals/`
+  - `schema.py` — `VisualMoment`, `VisualEffectCandidate`, `VisualTreatment`,
+    `VisualSafetyCheck`, `VisualLayerPlan`, `VisualConfig`, twenty moment
+    kinds, thirty-four effects, the closed refusal vocabulary
+  - `execution.py` — `PremiereVisualOperationPlan`,
+    `FFmpegVisualPreviewPlan`, `VisualExecutionPlan`, `FinalEditPlan`,
+    `VisualReport`, `VisualComparisonReport`
+  - `moments.py` — what the earlier passes recorded, resolved onto the cut
+  - `treatments.py` — which effects suit which moment, per style
+  - `safety.py` — the fourteen rules that stop this being embarrassing
+  - `plan.py` — detect → propose → check → thin
+  - `compose.py` — the final edit composer
+  - `premiere.py` — the operation plan, validated offline against the catalog
+  - `preview.py` — what FFmpeg could show, and the sidecar marker file
+  - `report.py`, `store.py`, `run.py`
+- Two new stages: `visual_plan`, `final_edit_plan` — 31 in total
+- New command: `visuals plan|report|show-accepted|show-rejected|show-final|
+  export-premiere-plan`
+- `editing/config.py` gains `visuals_dir`
+- 123 new tests (2183 total)
+
+```cmd
+python -m editing.cli auto run --folder D:\Footage\ep12 ^
+    --director --retention-cut --captions key_moments ^
+    --audio-polish placeholders --visual-layer balanced --no-premiere
+python -m editing.cli visuals report --latest
+python -m editing.cli visuals show-rejected --latest
+python -m editing.cli visuals export-premiere-plan --latest
+```
+
+**Nothing it plans is drawn, rendered or executed.** The Premiere operations
+are proposals validated offline against the real catalog; the FFmpeg side is a
+capability statement with the filter fragments recorded rather than run.
+`burned_in` is False everywhere and no code path sets it True.
 
 ---
 
@@ -1035,20 +1092,120 @@ stage counts and the checks are for. Conflating the two would make a batch
 summary that could not distinguish "this folder crashed" from "this folder
 produced an edit with a blocked critic".
 
+### From Session 12
+
+**No effect without evidence, and the evidence is always somebody else's
+record.** There is no detector in `moments.py` that looks at footage. The
+vision pass, the audio pass, the director, the retention wiring and the caption
+pass have all already looked, and this reads their conclusions. A twenty-first
+way to decide "this is a reveal" would disagree with the twenty that exist, and
+the disagreement would surface as an arrow pointing at nothing.
+
+**One moment gets one gesture.** A freeze frame *with* a label is a single
+effect in the library, not two stacked on the same second. The consequence is
+that `--visual-layer high` means *more moments treated and stronger
+intensities*, not more effects per moment — and that is the right trade,
+because a death carrying a zoom, a freeze and an arrow is exactly the failure
+this layer exists to prevent. The refusal says so in those words rather than
+"0.0s from the other effect", which was true and useless.
+
+**Two layers noticing one death produce one moment.** `_merge` folds by
+`(kind, second)` and keeps the strongest evidence. Without it a caption-sourced
+death and a vision-sourced death each earn their own effect.
+
+**The HUD check runs first and no style may override it.** Two ways an effect
+damages the HUD -- covering it and scaling it off the frame -- and both are
+checked. The one exception is a freeze on a death screen: the frame a viewer
+wants held is the one with the death message on it, and holding it covers
+nothing that was not already full-screen.
+
+**Lower before refusing.** A punch too strong becomes a softer punch; a card
+too long for the clip is shortened. Refusing outright throws away a real
+observation the earlier passes paid for. Only the checks where a softer version
+would still be wrong -- a callout pointing at nothing, an overlay across an
+open inventory -- refuse.
+
+**A callout knows what to point at and never where.** The vision pass names
+entities; it does not localise them. Every callout operation lands at the
+centre of the frame with `POSITION IS A GUESS` in its note. Emitting a
+confident-looking coordinate would be the one dishonest thing in the file, and
+the safety pass adds the same note to the treatment so it survives into the
+report.
+
+**A card with nothing to say is not built.** `_payload` returns `None` and the
+candidate never exists. A card with invented words on it is worse than no card,
+and this is the mechanism rather than a habit.
+
+**Style is a filter, not a generator.** A style narrows what the evidence is
+allowed to become and can never make the layer produce more than the evidence
+justifies. The layer multiplies the style's own density rather than replacing
+it, so `high` on `minimal_clean` stays quieter than `balanced` on `fast_funny`
+-- picking a style keeps meaning something.
+
+**`fast_funny` is the only style whose defaults turn meme effects on.** The
+switch lives on the configuration rather than the style, so a bare
+`VisualConfig` refuses a punch zoom whatever style it is handed. That is the
+right default and it is worth knowing when reading a test.
+
+**A moment the style never offered anything for is still recorded.** `_propose_all`
+emits a rejected treatment carrying `style_forbids` / `layer_forbids` /
+`no_evidence`. Otherwise "why did this death get nothing" is unanswerable
+without reading the style tables.
+
+**`animate` addresses a parameter as (component, property), not as a path.**
+`{"property": "Motion > Scale"}` fails the catalog validator with a precise
+message; `{"component": "Motion", "property": "Scale"}` is the shape. The
+offline validation caught this before anything ran, which is the entire reason
+it is wired in.
+
+**The catalog's refusals are inherited rather than worked around.** Screen
+shake, instant replay and crop pan have no catalog representation, and they are
+listed as unsupported with the reason and an alternative -- the same stance
+`premiere/catalog.py` takes about `color.preset` and `color.curves`.
+
+**Nothing is burned into the proxy, and the reason is the render strategy.**
+The renderer encodes each segment and joins them with the concat demuxer, which
+is what makes it survive mismatched game capture. Overlaying anything means a
+second full re-encode with a filtergraph. The filter fragments for the burnable
+set are *recorded* so a later session does not re-derive them, and writing a
+filter string into a plan is not the same as running it -- `preview.py` is
+careful never to blur the two.
+
+**`FFmpegVisualPreviewPlan.from_dict` ignores a `burned_in: true` in the
+document.** A plan claiming a burned-in effect is one this package could not
+have written, and reading it back would launder somebody's hand edit into a
+claim the reports repeat.
+
+**The composer is `compose_final_edit`, not `compose`.** The module is
+`editing.visuals.compose`, and a function of the same name in `__init__`
+shadows the module for anyone doing `from editing.visuals import compose`. One
+of the two had to be renamed and the function is the cheaper one.
+
+**A caller that hands in a cut knows which one it is.** `plan_visuals` takes an
+explicit `base` and only decides when it has to; recomputing it relabelled a
+retention cut as a rough cut, and the report printed the wrong one.
+
+**Assignment to segments is by time, not by `placement_id`.** A caption or a
+cue knows when it is, and the clip it sits on is whichever is playing then --
+which is also the only assignment that stays right when a plan is read against
+a cut that has since been rebuilt.
+
 ---
 
 ## Current state
 
-- **2060 editing tests**, ~130s, needing no FFmpeg, GPU, model server, Premiere,
+- **2183 editing tests**, ~190s, needing no FFmpeg, GPU, model server, Premiere,
   Whisper or real media
-- `tests/premiere/` passes too (277 there, 2337 across both suites)
+- `tests/premiere/` passes too (277 there, 2460 across both suites)
 - 13 failures elsewhere in `tests/` (file manager, gmail, agent loop, llm
   client) are pre-existing and unrelated
 - `editing/README.md` is the full user documentation (~4750 lines); §0 covers
   auto mode, §16 the feedback collector, §17 the proxy render, §18 the
   director pass, §19 the retention wiring, §20 key-moment captions, §21 the
   audio polish, §22 the reliability checks, §23 the review package, §24 batch
-  mode and §25 running without Premiere
+  mode, §25 running without Premiere, §26 the creative visual layer, §27 the
+  final edit plan, §28 the Premiere visual plan, §29 FFmpeg preview honesty
+  and §30 what the visual layer does not do yet
 
 **Note on running the tests here:** pytest's default temp root
 (`%LOCALAPPDATA%\Temp\pytest-of-nadel`) is not writable in this environment and
@@ -1062,7 +1219,11 @@ verified the same way on generated footage with subtitles: a full run with
 --render-proxy` produced a proxy, a caption sidecar beside it, 11 of 15 checks
 passing with one warning, and a review index answering all five questions;
 `auto batch` over two folders completed both in 7 seconds and skipped them both
-on the next pass.
+on the next pass. Session 12 was verified the same way: a full 31-stage run
+with `--visual-layer balanced --visual-mode hybrid` found 9 moments, planned 2
+treatments and refused 18 -- for unknown targets, caption overlap, an opening
+already carrying enough, one-gesture-per-moment and the density budget -- and
+its Premiere operation plan validated offline against the real catalog.
 `render roughcut` was verified separately on footage deliberately mixing
 1080p60-with-audio and 720p30-with-no-audio: 15.06s produced against 15.0s
 planned, joined by stream copy, audio continuous across all three segments. The full gate chain
@@ -1203,6 +1364,34 @@ both export formats -- but **not** yet against a real review of real footage.
     are right on generated footage. Whether the four captions a real episode
     earns are the right four is the same open question as gap 33, and one
     evening with VLC would answer it.
+39. **The visual layer draws nothing.** No preview render, no Premiere
+    execution. Its Premiere operations validate against the catalog and have
+    never been run; its FFmpeg filter fragments are recorded rather than
+    executed. This is deliberate for a first planning layer and it is also the
+    largest remaining gap between "creative final-edit plan" and "final edit".
+40. **It has never seen real footage with a real vision model.** Twenty moment
+    kinds, thirty-four effects, fourteen safety rules and a scoring formula,
+    all calibrated against fixtures and generated footage. Whether the moments
+    it finds are the moments you would have picked is unknown, and
+    `visuals show-rejected` exists largely so that can be found out.
+41. **A callout knows what to point at and never where.** The vision pass names
+    entities and does not localise them. Every callout lands at the centre of
+    the frame with a note saying so. Localisation would need either a
+    detection model or a person, and neither is wired.
+42. **The visual layer has no memory across effects.** Each treatment is
+    checked against the ones already kept and against nothing else, so six
+    individually-safe zooms are six individually-safe zooms and possibly one
+    too many. `visuals report` flags that under "what might be overdone" and
+    stops there, because the judgement is a person's.
+43. **Screen shake, instant replay and crop pan cannot be expressed at all.**
+    The catalog has no primitive for a per-frame wobble, replaying a range is
+    a change to the cut rather than an overlay, and a crop pan needs a subject
+    position this system does not have. All three are listed as unsupported
+    with an alternative rather than approximated.
+44. **The style tables are opinions.** Which effects `cinematic_minecraft`
+    reaches for, what `fast_funny` never uses, the per-minute ceilings and the
+    intensity defaults are all numbers somebody chose. They are in two tables
+    in `treatments.py` and are meant to be edited.
 
 ---
 
@@ -1225,6 +1414,27 @@ features.
   what is actually said. Then read `polish show-rejected` and ask whether
   anything in the refusal list should have been kept. Twenty of those would
   calibrate the nine moment kinds better than any amount of further design.
+- **Read a visual plan over real footage and argue with it.** The cheapest
+  unanswered question in the newest layer:
+
+  ```cmd
+  python -m editing.cli auto run --folder D:\Footage\test --transcribe ^
+      --retention-cut --render-proxy --captions key_moments ^
+      --audio-polish placeholders --visual-layer balanced --no-premiere
+  python -m editing.cli visuals report --latest
+  python -m editing.cli visuals show-rejected --latest
+  ```
+
+  Read the accepted list against the proxy and the marker file beside it, then
+  read the refusal list and ask whether anything in it should have been kept.
+  Twenty of those would calibrate the twenty moment kinds better than any
+  amount of further design.
+- **Wire a preview render, or decide not to.** The filter fragments for the
+  burnable set are already recorded in the preview plan. Turning them into a
+  second-pass render is a real piece of work with real failure modes, and the
+  alternative -- executing the Premiere plan instead and watching that -- may
+  be the better answer. Either way the current state is honest and the
+  decision is open.
 - **Run a batch over a real library overnight.** `--dry-run` first, then
   without it. The property worth confirming is not that it works but that the
   summary is readable the next morning, and that the folders it skipped were
@@ -1353,6 +1563,9 @@ python -m editing.cli auto run --folder D:\Footage	est ^
     --captions key_moments --audio-polish placeholders --render-proxy --no-premiere
 python -m editing.cli polish show-rejected           REM every refused caption
 python -m editing.cli polish show-missing            REM the sound shopping list
+python -m editing.cli visuals report --latest        REM where it points
+python -m editing.cli visuals show-rejected --latest REM and what it refused
+python -m editing.cli visuals export-premiere-plan --latest
 python -m editing.cli auto show-checks               REM is the output usable?
 python -m editing.cli review summary --latest
 python -m editing.cli review open-latest
@@ -1397,6 +1610,12 @@ Useful flags on `auto run`:
 | `--audio-polish` | `off` (default), `placeholders`, `assets` |
 | `--max-sfx-per-minute` / `--no-music-bed` / `--no-ducking` | how much sound, and whether a bed is allowed |
 | `--no-review-package` | do not gather the run into a review folder (on by default) |
+| `--visual-layer` | `off` (default), `minimal`, `balanced`, `high` |
+| `--visual-mode` | `plan_only` (default), `proxy_preview`, `premiere_plan`, `hybrid` |
+| `--max-effects-per-minute` / `--max-callouts-per-minute` | override the style's own ceilings |
+| `--no-freeze-frames` / `--no-callouts` / `--no-replays` | turn a family off |
+| `--allow-screen-shake` | permit shake. Off by default, and usually refused anyway |
+| `--export-premiere-visual-plan` | write the operation plan even in a mode that would not |
 | `--asset-library <path>` | a library other than `<model dir>/assets` |
 | `--max-windows N` | cap analysis windows per file |
 | `--force-new-run` | a fresh run even if one exists for this footage+style |

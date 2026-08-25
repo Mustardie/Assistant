@@ -78,6 +78,8 @@ def run_config_for(
         render_proxy=batch.render_proxy,
         captions=batch.captions,
         audio_polish=batch.audio_polish,
+        visual_layer=batch.visual_layer,
+        visual_mode=batch.visual_mode,
     )
 
 

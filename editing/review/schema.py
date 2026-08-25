@@ -135,6 +135,9 @@ class ReviewPackage:
     warnings: list[str] = field(default_factory=list)
     #: The reliability report's own summary, so the index can lead with it.
     checks: dict = field(default_factory=dict)
+    #: The creative visual layer: what it planned, what it refused, and the
+    #: six questions the index has to answer about it.
+    visuals: dict = field(default_factory=dict)
     #: How to get back to the underlying commands.
     commands: list[str] = field(default_factory=list)
     schema_version: int = 1
@@ -167,6 +170,7 @@ class ReviewPackage:
             "weak_points": len(self.weak_points),
             "decisions_needed": len(self.decisions_needed),
             "checks_status": self.checks.get("status", "unknown"),
+            "visual_treatments": int(self.visuals.get("accepted") or 0),
         }
 
     def to_dict(self) -> dict:
@@ -192,6 +196,7 @@ class ReviewPackage:
             "decisions_needed": list(self.decisions_needed),
             "warnings": list(self.warnings),
             "checks": dict(self.checks),
+            "visuals": dict(self.visuals),
             "commands": list(self.commands),
             "items": [entry.to_dict() for entry in self.items],
         }
@@ -224,5 +229,6 @@ class ReviewPackage:
                 data.get("decisions_needed"), limit=40),
             warnings=as_text_list(data.get("warnings"), limit=80),
             checks=dict(data.get("checks") or {}),
+            visuals=dict(data.get("visuals") or {}),
             commands=as_text_list(data.get("commands"), limit=40),
         )

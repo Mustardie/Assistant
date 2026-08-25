@@ -107,6 +107,8 @@ class BatchConfig:
     transcribe: bool = False
     captions: str = "off"
     audio_polish: str = "off"
+    visual_layer: str = "off"
+    visual_mode: str = "plan_only"
 
     created_at: str = ""
     schema_version: int = 1

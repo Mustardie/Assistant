@@ -82,6 +82,28 @@ def render_index(package: ReviewPackage) -> str:
         add(f"- {line}")
     add("")
 
+    # -- 3b. the visual layer ----------------------------------------------
+    visuals = package.visuals or {}
+    if visuals.get("enabled"):
+        add("## 3b. What the edit points at")
+        add("")
+        for entry in visuals.get("answers") or []:
+            add(f"**{entry['question']}**")
+            add("")
+            add(entry["answer"])
+            add("")
+        # The sixth answer is already the first risk. Only list the rest,
+        # so a plan with one concern does not print it twice.
+        risks = list(visuals.get("overdone_risks") or [])[1:]
+        if risks:
+            add("The rest of what might be overdone:")
+            add("")
+            for line in risks:
+                add(f"- {line}")
+            add("")
+        add(f"> {visuals.get('not_rendered', '')}")
+        add("")
+
     # -- 4. weak points ----------------------------------------------------
     add("## 4. Weak points")
     add("")

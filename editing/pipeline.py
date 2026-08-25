@@ -74,6 +74,13 @@ from editing.polish.schema import (
     AudioPolishConfig, AudioPolishPlan, CaptionConfig, CaptionPlan,
     audio_defaults, caption_defaults,
 )
+from editing.visuals import run as visuals_run
+from editing.visuals import store as visuals_store
+from editing.visuals.execution import (
+    FinalEditPlan, PremiereVisualOperationPlan,
+)
+from editing.visuals.schema import VisualConfig, VisualLayerPlan
+from editing.visuals.treatments import visual_defaults
 from editing.retention import compare as retention_compare
 from editing.retention import report as retention_report
 from editing.retention import run as retention_run
@@ -2690,6 +2697,142 @@ class Pipeline:
         if plan is None:
             return None
         return polish_run.sidecar_beside(plan, video_path)
+
+    # ------------------------------------------------------------------
+    # The creative visual layer
+    # ------------------------------------------------------------------
+    #
+    # Where the edit points at something: a zoom onto the creeper, a card
+    # naming the objective, an arrow at the thing nobody would notice. Reads
+    # every plan the run produced and writes a FinalEditPlan. Executes
+    # nothing, draws nothing, and needs no Premiere.
+
+    def visual_config(self, style=None, *, layer: str = "off",
+                      mode: str = "plan_only", **overrides) -> VisualConfig:
+        """Visual settings: the style's taste, the layer's ceiling, then flags.
+
+        The style says what it is for and the layer says how much of it; both
+        only ever narrow. An explicit flag beats them, and nothing else does.
+        """
+        style = style or style_presets.get()
+        base = visual_defaults(style, layer, mode)
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        if clean:
+            from dataclasses import replace
+            base = replace(base, **clean)
+        return base.validated()
+
+    def plan_visuals(
+        self,
+        *,
+        name: str = "structure",
+        timeline: Optional[StructureTimeline] = None,
+        cut: Optional[RoughCutPlan] = None,
+        style=None,
+        settings: Optional[VisualConfig] = None,
+        director_plan=None,
+        retention_plan=None,
+        caption_plan=None,
+        audio_plan=None,
+        memory=None,
+        retention_findings=None,
+        base: str = "",
+        run_id: str = "",
+        save: bool = True,
+    ) -> tuple:
+        """Plan the visual layer and compose the final edit.
+
+        Returns ``(VisualLayerPlan, FinalEditPlan)``. Every input is read from
+        disk when it is not passed in, and a missing one is a *result* rather
+        than an exception: a run with no director and no retention pass still
+        produces a plan, built from what the vision and audio passes saw.
+        """
+        if timeline is None:
+            timeline = self.load_timeline(name=name)
+        # A caller that hands in a cut knows which one it is; this only
+        # decides when it has to. Recomputing it here would relabel a
+        # retention cut as a rough cut, which the report then prints.
+        if cut is None:
+            retention_cut = self.retention_roughcut_or_none(name=name)
+            if retention_cut is not None:
+                cut, base = retention_cut, (base or "retention")
+            else:
+                cut = self.load_rough_cut(name=name)
+                base = base or "roughcut"
+        base = base or "roughcut"
+        style = style or style_presets.get()
+        if caption_plan is None:
+            caption_plan = self.caption_plan_or_none(name=name)
+        if audio_plan is None:
+            audio_plan = self.audio_plan_or_none(name=name)
+        if memory is None:
+            memory = self._episode_memory_or_none(name)
+        if retention_findings is None:
+            retention_findings = self._retention_or_none(name)
+        if retention_plan is None:
+            retention_plan = self.retention_cut_plan_or_none(name=name)
+        if director_plan is None:
+            director_plan = self.director_plan_or_none(name=name)
+
+        return visuals_run.plan_visuals(
+            self.config,
+            timeline=timeline, cut=cut, style=style,
+            settings=settings or self.visual_config(style),
+            director_plan=director_plan,
+            retention_plan=retention_plan,
+            caption_plan=caption_plan,
+            audio_plan=audio_plan,
+            memory=memory,
+            retention_findings=retention_findings,
+            base=base, name=name, run_id=run_id,
+            save=save, say=self.say,
+        )
+
+    def load_visual_plan(self, *, name: str = "structure") -> VisualLayerPlan:
+        return visuals_store.load_plan(self.config, name=name)
+
+    def visual_plan_or_none(
+        self, *, name: str = "structure"
+    ) -> Optional[VisualLayerPlan]:
+        return visuals_store.plan_or_none(self.config, name=name)
+
+    def load_final_edit(self, *, name: str = "structure") -> FinalEditPlan:
+        return visuals_store.load_final(self.config, name=name)
+
+    def final_edit_or_none(
+        self, *, name: str = "structure"
+    ) -> Optional[FinalEditPlan]:
+        return visuals_store.final_or_none(self.config, name=name)
+
+    def export_visual_premiere_plan(
+        self, *, name: str = "structure", visuals=None, save: bool = True
+    ) -> PremiereVisualOperationPlan:
+        """The Premiere operation plan on its own, validated offline.
+
+        Separate from the pass so somebody who planned in ``plan_only`` mode
+        can get an operation plan without re-planning the visuals -- and so
+        the validation runs against what is on disk now.
+        """
+        return visuals_run.export_premiere_plan(
+            self.config, name=name, visuals=visuals, save=save)
+
+    def visual_markers_beside(
+        self, video_path: str, *, name: str = "structure",
+        visuals=None, final=None
+    ) -> Optional[Path]:
+        """Write the visual marker file next to a rendered video.
+
+        Separate from the render because nothing in this layer is ever burned
+        in: the marker file is the honest way to see where the effects would
+        land while watching the proxy, and it costs nothing to rewrite.
+        """
+        visuals = visuals or self.visual_plan_or_none(name=name)
+        if visuals is None:
+            return None
+        final = final or self.final_edit_or_none(name=name)
+        if final is None:
+            return None
+        return visuals_run.markers_beside(visuals, final, video_path)
 
     # ------------------------------------------------------------------
     # Proxy renders
