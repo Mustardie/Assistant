@@ -78,7 +78,60 @@ def collect(
     _from_retention(inputs, state, run)
     _from_render(inputs, state, run)
     _from_polish(inputs, state, run, caption_plan, audio_plan)
+    _from_conform(inputs, config, state, run)
     return inputs
+
+
+def _from_conform(inputs, config, state, run) -> None:
+    """What the conform pass built, executed and delivered.
+
+    Read partly from the stage summary and partly from the files on disk: the
+    execution and the delivery happen *after* the run, behind their own gates,
+    so a summary written when the stage finished cannot know about them.
+    """
+    import json
+
+    summary = _summary(state, "conform_build")
+    inputs.conform_enabled = getattr(run, "conform", "off") != "off"
+    inputs.conform_ran = _ok(state, "conform_build")
+    inputs.conform_operations = int(summary.get("operations") or 0)
+    inputs.conform_unconverted = int(summary.get("unconverted") or 0)
+    inputs.conform_contributions = dict(summary.get("contributions") or {})
+
+    gate_record = state.gate("conform")
+    if gate_record is not None:
+        inputs.conform_executed = bool(gate_record.executed)
+        inputs.conform_applied = int(gate_record.operations_succeeded or 0)
+
+    delivery = _read_json(
+        Path(config.output_dir) / "conform" / f"{run.name}.delivery.json")
+    if not delivery:
+        return
+    inputs.delivery_path = str(delivery.get("output_path") or "")
+    inputs.delivery_error = str((delivery.get("error") or {}).get("error", ""))
+    inputs.delivery_duration = float(delivery.get("duration") or 0.0)
+    inputs.delivery_size_mb = float(delivery.get("size_bytes") or 0.0) / (
+        1024 * 1024)
+    # Confirmed against the file system, not trusted from the record: the
+    # whole point of this check is that a run can claim a video it no longer
+    # has.
+    exists = False
+    if inputs.delivery_path:
+        try:
+            target = Path(inputs.delivery_path)
+            exists = target.is_file() and target.stat().st_size > 0
+        except OSError:
+            exists = False
+    inputs.delivered = exists
+
+
+def _read_json(path) -> dict:
+    try:
+        import json
+
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a missing record is not an error
+        return {}
 
 
 def _summary(state, stage: str) -> dict:

@@ -4,9 +4,13 @@
 
   Hosts a small Node HTTP server inside Premiere (see main.js) and forwards
   structured operations to the ExtendScript host (host/index.jsx). Node is
-  enabled via the CEFCommandLine parameters below; without --enable-nodejs the
-  panel loads but cannot open a socket, which is the single most common cause
-  of "bridge unreachable".
+  enabled via the CEFCommandLine parameters below; without the enable-nodejs
+  parameter the panel loads but cannot open a socket, which is the single
+  most common cause of "bridge unreachable".
+
+  Nothing in this file may contain a double hyphen: XML forbids one inside a
+  comment, and CEP silently discards a manifest it cannot parse, which is
+  invisible from Premiere and looks exactly like the panel never existing.
 
   The host version range is deliberately wide: the JSX side feature-detects
   every API it uses and reports what is missing through caps.probe, so a newer
@@ -44,8 +48,14 @@
             <Parameter>--allow-file-access-from-files</Parameter>
           </CEFCommandLine>
         </Resources>
+        <!-- The panel hosts the bridge server, so the server only exists
+             while the panel is loaded. StartOn makes Premiere load it at
+             launch, which is what allows an unattended end-to-end edit. -->
         <Lifecycle>
           <AutoVisible>true</AutoVisible>
+          <StartOn>
+            <Event>com.adobe.csxs.events.ApplicationActivate</Event>
+          </StartOn>
         </Lifecycle>
         <UI>
           <Type>Panel</Type>

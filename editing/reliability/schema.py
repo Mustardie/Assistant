@@ -61,6 +61,10 @@ GATE_NAMES = (
     "render_output",
     "render_size",
     "output_duration",
+    # The two that measure the *edit* rather than a plan. They come last
+    # because they depend on everything above having happened.
+    "conform_executed",
+    "delivered",
 )
 
 #: One line per gate, for ``show-checks`` and for the report's index.
@@ -80,6 +84,8 @@ GATE_TITLES = {
     "render_output": "The render produced the file it claims",
     "render_size": "The rendered file is big enough to be a video",
     "output_duration": "The output runtime is plausible",
+    "conform_executed": "The decisions reached a real timeline",
+    "delivered": "A finished video exists",
 }
 
 #: Said on every reliability report.
@@ -349,6 +355,28 @@ class GateInputs:
     render_size_mb: float = 0.0
     render_duration: float = 0.0
     render_planned_duration: float = 0.0
+
+    # -- conform and delivery ---------------------------------------------
+    #
+    # The difference between a run that decided things and a run that made
+    # them. Every field above describes a plan; these describe a timeline and
+    # a file.
+    conform_enabled: bool = False
+    conform_ran: bool = False
+    conform_operations: int = 0
+    conform_executed: bool = False
+    conform_applied: int = 0
+    #: Decisions that could not become an operation, with reasons recorded.
+    conform_unconverted: int = 0
+    #: layer -> operation count, so a report can say which layers reached the
+    #: timeline and which produced nothing.
+    conform_contributions: dict = field(default_factory=dict)
+
+    delivered: bool = False
+    delivery_path: str = ""
+    delivery_size_mb: float = 0.0
+    delivery_duration: float = 0.0
+    delivery_error: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

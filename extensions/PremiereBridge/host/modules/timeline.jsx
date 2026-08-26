@@ -19,7 +19,40 @@ var NovaTimeline = (function () {
         return (type === 'audio') ? sequence.audioTracks : sequence.videoTracks;
     }
 
+    /**
+     * Parse "V2" / "A3" into {type, index}.
+     *
+     * The Python layer normalises track references before sending, so the host
+     * used to assume the object form and quietly fall back to video track 0
+     * for anything else. That is the worst possible failure: a caller that
+     * sent the UI spelling got an operation applied to the programme track
+     * with no error at all. Accepting both spellings here means the host is
+     * correct on its own rather than only in company.
+     */
+    function parseTrack(value) {
+        var text = String(value === undefined || value === null ? '' : value)
+            .replace(/^\s+|\s+$/g, '').toUpperCase();
+        var letter = text.charAt(0);
+        var number = text.substring(1);
+        if ((letter !== 'V' && letter !== 'A') || !/^[0-9]+$/.test(number)) {
+            return null;
+        }
+        var index = parseInt(number, 10) - 1;   // "V1" is index 0
+        if (index < 0) { return null; }
+        return { type: (letter === 'A') ? 'audio' : 'video', index: index };
+    }
+
     function getTrack(sequence, spec) {
+        if (typeof spec === 'string') {
+            var parsed = parseTrack(spec);
+            if (!parsed) {
+                throw U.fail('Unrecognised track "' + spec + '"', {
+                    code: 'validation_error',
+                    hint: 'Use "V1"/"V2" for video or "A1"/"A2" for audio.'
+                });
+            }
+            spec = parsed;
+        }
         var type = (spec && spec.type) ? spec.type : 'video';
         var index = (spec && spec.index !== undefined) ? Number(spec.index) : 0;
         var tracks = trackCollection(sequence, type);
@@ -200,9 +233,21 @@ var NovaTimeline = (function () {
             return matches;
         }
 
-        var type = (selector.track && selector.track.type) || 'video';
-        var trackIndex = (selector.track && selector.track.index !== undefined)
-            ? Number(selector.track.index) : 0;
+        // Same reason as getTrack: accept the UI spelling rather than
+        // silently resolving to video track 0.
+        var spec = selector.track;
+        if (typeof spec === 'string') {
+            spec = parseTrack(spec);
+            if (!spec) {
+                throw U.fail('Unrecognised track "' + selector.track + '"', {
+                    code: 'validation_error',
+                    hint: 'Use "V1"/"V2" for video or "A1"/"A2" for audio.'
+                });
+            }
+        }
+        var type = (spec && spec.type) || 'video';
+        var trackIndex = (spec && spec.index !== undefined)
+            ? Number(spec.index) : 0;
         var track = getTrack(seq, { type: type, index: trackIndex });
         var count = track.clips.numItems;
 
@@ -471,34 +516,121 @@ var NovaTimeline = (function () {
         return result;
     }
 
+    /**
+     * Add video and/or audio tracks.
+     *
+     * Three routes, tried in order, because the scriptable API for this has
+     * changed and no single call works everywhere. On Premiere 25
+     * `Sequence.addTracks` is simply not a function, which is what stopped
+     * every overlay in this system from having a track to land on:
+     *
+     *   1. `Sequence.addTracks(...)` -- the documented call, present on older
+     *      builds.
+     *   2. the QE DOM's `addTracks(numVideo, videoIndex, numAudio,
+     *      audioIndex, ...)`, which is what Premiere's own UI drives.
+     *   3. `qe.addTracks(n)` per track type, the oldest spelling.
+     *
+     * Success is confirmed by counting tracks afterwards rather than by the
+     * absence of an exception: two of these routes return nothing at all, and
+     * one of them silently does nothing on a locked sequence.
+     */
     function addTracks(params) {
         var sequence = U.activeSequence();
-        var video = Number(params.video || 0);
-        var audio = Number(params.audio || 0);
+        var video = Math.max(0, Number(params.video || 0));
+        var audio = Math.max(0, Number(params.audio || 0));
+        if (!video && !audio) {
+            return { added: { video: 0, audio: 0 },
+                     video_tracks: sequence.videoTracks.numTracks,
+                     audio_tracks: sequence.audioTracks.numTracks,
+                     method: 'noop' };
+        }
+
         var before = {
             video: sequence.videoTracks.numTracks,
             audio: sequence.audioTracks.numTracks
         };
-        try {
-            // Sequence.addTracks(numVideo, videoIndex, numAudio, audioIndex,
-            //                    audioChannelType, numSubmix, submixIndex).
-            // audioChannelType 1 is stereo, which is what a YouTube edit wants;
-            // the submix arguments must be present or the call is rejected.
-            var videoIndex = (params.at !== undefined) ? Number(params.at)
-                                                       : before.video;
-            var audioIndex = (params.at !== undefined) ? Number(params.at)
-                                                       : before.audio;
-            sequence.addTracks(video, videoIndex, audio, audioIndex, 1, 0, 0);
-        } catch (e) {
-            throw U.fail('Could not add tracks: ' + e, {
-                hint: 'The sequence may be locked, or this build may not expose '
-                    + 'Sequence.addTracks'
-            });
+        var videoIndex = (params.at !== undefined) ? Number(params.at)
+                                                   : before.video;
+        var audioIndex = (params.at !== undefined) ? Number(params.at)
+                                                   : before.audio;
+        var errors = [];
+
+        function grew() {
+            return sequence.videoTracks.numTracks >= before.video + video
+                && sequence.audioTracks.numTracks >= before.audio + audio;
         }
+
+        // 1. The documented Sequence call. audioChannelType 1 is stereo; the
+        //    submix arguments must be present or the call is rejected.
+        try {
+            if (typeof sequence.addTracks === 'function') {
+                sequence.addTracks(video, videoIndex, audio, audioIndex, 1, 0, 0);
+                if (grew()) { return report(before, video, audio, 'sequence'); }
+                errors[errors.length] = 'Sequence.addTracks added no tracks';
+            } else {
+                errors[errors.length] = 'Sequence.addTracks is not a function';
+            }
+        } catch (e) {
+            errors[errors.length] = 'Sequence.addTracks: ' + (e.message || e);
+        }
+
+        // 2. The QE DOM, which is what the application's own menu item uses.
+        try {
+            var qeSeq = U.qeSequence();
+            if (qeSeq && typeof qeSeq.addTracks === 'function') {
+                qeSeq.addTracks(video, videoIndex, audio, audioIndex, 1, 0, 0);
+                if (grew()) { return report(before, video, audio, 'qe'); }
+                errors[errors.length] = 'qe addTracks added no tracks';
+            } else {
+                errors[errors.length] = 'the QE sequence has no addTracks';
+            }
+        } catch (e2) {
+            errors[errors.length] = 'qe addTracks: ' + (e2.message || e2);
+        }
+
+        // 3. The oldest QE spelling: one count, one type at a time.
+        try {
+            var dom = U.qeDom();
+            var qeSeq2 = dom ? dom.project.getActiveSequence() : null;
+            if (qeSeq2) {
+                if (video && typeof qeSeq2.addVideoTrack === 'function') {
+                    for (var v = 0; v < video; v++) { qeSeq2.addVideoTrack(); }
+                }
+                if (audio && typeof qeSeq2.addAudioTrack === 'function') {
+                    for (var a = 0; a < audio; a++) { qeSeq2.addAudioTrack(); }
+                }
+                if (grew()) { return report(before, video, audio, 'qe_single'); }
+                errors[errors.length] = 'per-track QE calls added no tracks';
+            }
+        } catch (e3) {
+            errors[errors.length] = 'per-track QE: ' + (e3.message || e3);
+        }
+
+        throw U.fail('Could not add tracks to "' + String(sequence.name) + '"', {
+            hint: 'The sequence may be locked, or this Premiere build may '
+                + 'expose no scriptable way to add a track. Add the tracks by '
+                + 'hand once and re-run: the plan is idempotent and will skip '
+                + 'this step when the sequence is already tall enough.',
+            detail: {
+                attempts: errors,
+                wanted: { video: video, audio: audio },
+                have: { video: sequence.videoTracks.numTracks,
+                        audio: sequence.audioTracks.numTracks }
+            }
+        });
+    }
+
+    function report(before, video, audio, method) {
+        var sequence = U.activeSequence();
         return {
-            added: { video: video, audio: audio },
+            added: {
+                video: sequence.videoTracks.numTracks - before.video,
+                audio: sequence.audioTracks.numTracks - before.audio
+            },
+            requested: { video: video, audio: audio },
             video_tracks: sequence.videoTracks.numTracks,
-            audio_tracks: sequence.audioTracks.numTracks
+            audio_tracks: sequence.audioTracks.numTracks,
+            method: method
         };
     }
 
@@ -580,6 +712,7 @@ var NovaTimeline = (function () {
     }
 
     return {
+        parseTrack: parseTrack,
         getTrack: getTrack,
         trackLabel: trackLabel,
         clipId: clipId,

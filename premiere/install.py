@@ -20,6 +20,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import xml.parsers.expat
 
 SOURCE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -47,10 +48,47 @@ def target_dir() -> str:
     return os.path.join(extensions_dir(), BUNDLE)
 
 
+def validate_manifest(path: str = "") -> dict:
+    """Whether CEP will accept the manifest.
+
+    Worth its own step because of how this fails: CEP parses every manifest
+    it finds, logs one DEBUG line when one is malformed, discards it, and
+    carries on. From inside Premiere that is indistinguishable from the
+    extension never having been installed -- no error, no menu entry, no
+    panel -- so a broken manifest can hide for a long time. Checking it here
+    turns that into a refusal at install time.
+
+    The specific trap: XML forbids a double hyphen inside a comment, and
+    command-line switches are the natural thing to write in a comment about
+    CEFCommandLine.
+    """
+    target = path or os.path.join(SOURCE, "CSXS", "manifest.xml")
+    if not os.path.isfile(target):
+        return {"ok": False, "path": target, "error": "manifest.xml is missing"}
+    try:
+        parser = xml.parsers.expat.ParserCreate()
+        with open(target, "rb") as handle:
+            parser.ParseFile(handle)
+    except xml.parsers.expat.ExpatError as exc:
+        return {
+            "ok": False,
+            "path": target,
+            "error": f"manifest.xml is not well-formed XML: {exc}",
+            "hint": "CEP discards a malformed manifest silently, so the panel "
+                    "would never appear in Premiere.",
+        }
+    return {"ok": True, "path": target}
+
+
 def install(force: bool = False) -> dict:
     if not os.path.isdir(SOURCE):
         return {"success": False,
                 "error": f"Extension source not found at {SOURCE}"}
+
+    manifest = validate_manifest()
+    if not manifest["ok"]:
+        return {"success": False, "error": manifest["error"],
+                "hint": manifest.get("hint", "")}
 
     destination = target_dir()
     if os.path.exists(destination):
@@ -144,6 +182,7 @@ def main(argv=None) -> int:
 
     if args.check:
         state = check()
+        state["manifest_valid"] = validate_manifest()
         for key, value in state.items():
             print(f"{key:18} {value}")
         return 0

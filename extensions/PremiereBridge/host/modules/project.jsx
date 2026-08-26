@@ -233,9 +233,10 @@ var NovaProject = (function () {
                     return String(child.getMediaPath());
                 }, '');
 
-                if (media && media === wanted) { found.path = child; }
+                if (media && U.samePath(media, wanted)) { found.path = child; }
                 if (!found.name && U.nameMatches(name, wanted)) { found.name = child; }
-                if (!found.base && media && basename(media) === basename(wanted)) {
+                if (!found.base && media &&
+                        U.basename(media) === U.basename(wanted)) {
                     found.base = child;
                 }
                 if (!found.loose &&

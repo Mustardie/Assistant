@@ -447,3 +447,63 @@ def test_gate_inputs_survive_a_round_trip(healthy):
     restored = GateInputs.from_dict(healthy.to_dict())
     assert restored.cut_duration == healthy.cut_duration
     assert restored.transcript_confidence == healthy.transcript_confidence
+
+
+# ---------------------------------------------------------------------------
+# The two gates that measure the edit rather than a plan
+# ---------------------------------------------------------------------------
+
+def test_conform_that_never_ran_is_skipped_not_passed():
+    """"The decisions reached a timeline" is not true of a run that had no
+    conform pass -- it is a question that does not apply."""
+    result = checks_module.check_conform_executed(GateInputs())
+    assert result.status == "skipped"
+
+
+def test_a_validated_but_unexecuted_conform_warns_with_the_command():
+    result = checks_module.check_conform_executed(GateInputs(
+        run_id="r1", conform_enabled=True, conform_operations=18,
+    ))
+    assert result.status == "warn"
+    assert "execute-stage conform" in result.suggested_fix
+
+
+def test_a_fully_applied_conform_passes_and_names_the_layers():
+    result = checks_module.check_conform_executed(GateInputs(
+        conform_enabled=True, conform_operations=18, conform_executed=True,
+        conform_applied=18,
+        conform_contributions={"captions": 3, "music": 6},
+    ))
+    assert result.status == "pass"
+    assert "captions 3" in result.reason
+
+
+def test_a_partly_applied_conform_says_how_many_failed():
+    result = checks_module.check_conform_executed(GateInputs(
+        conform_enabled=True, conform_operations=18, conform_executed=True,
+        conform_applied=15,
+    ))
+    assert result.status == "warn"
+    assert "3 failed" in result.reason
+
+
+def test_no_export_asked_for_is_skipped():
+    assert checks_module.check_delivered(GateInputs()).status == "skipped"
+
+
+def test_an_export_that_produced_no_file_fails():
+    result = checks_module.check_delivered(GateInputs(
+        delivery_path="out.mp4", delivered=False,
+        delivery_error="the preset did not match",
+    ))
+    assert result.status == "fail"
+    assert not result.can_continue
+
+
+def test_a_delivered_video_passes():
+    result = checks_module.check_delivered(GateInputs(
+        delivery_path="out.mp4", delivered=True, delivery_size_mb=32.2,
+        delivery_duration=20.2,
+    ))
+    assert result.status == "pass"
+    assert "out.mp4" in result.reason

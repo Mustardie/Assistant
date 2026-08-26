@@ -632,9 +632,9 @@ def executable(runner, auto_config):
     return run_once(runner, replace(auto_config, no_premiere=False))
 
 
-def test_gates_are_created_for_all_four_passes(executable):
+def test_gates_are_created_for_every_executable_pass(executable):
     assert {gate.stage for gate in executable.gates} == {
-        "roughcut", "review", "layers", "assets"
+        "roughcut", "review", "layers", "assets", "conform"
     }
 
 
@@ -996,7 +996,7 @@ def test_the_cli_shows_gates(config, executable, capsys):
     assert code == 0
     payload = json.loads(captured.out)
     assert {gate["stage"] for gate in payload["gates"]} == {
-        "roughcut", "review", "layers", "assets"
+        "roughcut", "review", "layers", "assets", "conform"
     }
 
 

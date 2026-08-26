@@ -36,7 +36,7 @@ would mean re-transcribing to get it back.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 from editing.schema import (
@@ -481,6 +481,87 @@ class TranscriptionFailure:
         )
 
 
+#: Punctuation that ends a spoken sentence. Whisper punctuates, so this is
+#: reliable enough to split on -- and where it is not, the length guard below
+#: catches the leftover.
+_SENTENCE_END = (".", "!", "?")
+
+#: A segment longer than this is a paragraph, not a line. Every pass
+#: downstream that puts text on screen refuses one, so a transcript full of
+#: them is a transcript nothing can caption.
+LONG_SEGMENT_SECONDS = 6.0
+
+#: Never split into a piece shorter than this: a two-word fragment with its
+#: own timestamp is noise, not a line.
+MIN_SPLIT_SECONDS = 0.6
+
+
+def split_at_sentences(segment: "TranscriptSegment") -> list:
+    """Break one long segment into sentence-length ones, using word timings.
+
+    Whisper returns whatever it decoded in one window as a single segment, so
+    real speech routinely arrives as an eight-second run-on: "Yeah, sure buddy.
+    I didn't do it. I didn't do anything." Every caption rule downstream
+    measures a *line*, so that arrives as one unreadable paragraph and is
+    refused -- which is why a perfectly good transcript can produce no captions
+    at all.
+
+    The word timings needed to fix it were already being collected and then
+    dropped on the way out. This uses them: each sentence keeps the timing of
+    its own first and last word, so the split pieces are as accurate as the
+    words were.
+
+    Returns ``[segment]`` unchanged when there is nothing to gain -- the
+    segment is short, has no word timings, or is a single sentence.
+    """
+    if segment.duration <= LONG_SEGMENT_SECONDS or not segment.words:
+        return [segment]
+
+    groups: list = []
+    current: list = []
+    for word in segment.words:
+        current.append(word)
+        if str(word.word).strip().endswith(_SENTENCE_END):
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+
+    if len(groups) < 2:
+        return [segment]
+
+    # Merge away pieces too short to stand on their own, so "No." does not
+    # become its own line with its own timestamp.
+    merged: list = []
+    for group in groups:
+        span = group[-1].end - group[0].start
+        if merged and span < MIN_SPLIT_SECONDS:
+            merged[-1].extend(group)
+        else:
+            merged.append(list(group))
+    if len(merged) < 2:
+        return [segment]
+
+    out: list = []
+    for index, group in enumerate(merged):
+        text = "".join(word.word for word in group).strip()
+        if not text:
+            continue
+        out.append(replace(
+            segment,
+            index=segment.index,
+            start=float(group[0].start),
+            end=float(group[-1].end),
+            text=text,
+            words=list(group),
+            warnings=list(segment.warnings) + [
+                f"split from a {segment.duration:.1f}s segment "
+                f"({index + 1} of {len(merged)})"
+            ],
+        ))
+    return out or [segment]
+
+
 @dataclass
 class TranscriptionResult:
     """Everything one transcription produced.
@@ -612,7 +693,11 @@ class TranscriptionResult:
             source="whisper",
             source_path=self.source_path,
             language=self.language,
-            entries=[segment.as_entry() for segment in self.segments],
+            entries=[
+                piece.as_entry()
+                for segment in self.segments
+                for piece in split_at_sentences(segment)
+            ],
             created_at=self.created_at or now(),
             note=note,
         )

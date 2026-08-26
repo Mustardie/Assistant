@@ -58,6 +58,10 @@ GATE_SPECS = {
         "Place music, effects and graphics from the library",
         "load_asset_plan", "run_assets", "execute",
     ),
+    "conform": (
+        "Make the decisions real: captions, sound, music, colour, mix",
+        "load_conform", "run_conform", "execute",
+    ),
 }
 
 #: Gates whose plan embeds a belief about whether the rough cut has been built
@@ -102,6 +106,19 @@ def _compute_one(
         gate.executed = previous.executed
         gate.executed_at = previous.executed_at
         gate.operations_succeeded = previous.operations_succeeded
+
+    # -- can this run execute anything at all? ----------------------------
+    # Checked first, before anything about the plan: a run created with
+    # ``--no-premiere`` may not execute regardless of how its stages went, and
+    # that is both the truest reason and the one with the clearest fix. Asking
+    # about the dry run first meant a stage blocked for an unrelated reason
+    # hid the fact that this run was never allowed to execute.
+    if state.config.no_premiere:
+        gate.blocked_reason = (
+            "this run was created with --no-premiere, so it may not execute "
+            "anything. Start a run without that flag to execute."
+        )
+        return gate
 
     # -- did the dry run stage pass in this run? --------------------------
     stage_result = state.stage(dry_run_stage)
@@ -155,13 +172,6 @@ def _compute_one(
     if not ok:
         gate.blocked_reason = reason
         return gate
-    if state.config.no_premiere:
-        gate.blocked_reason = (
-            "this run was created with --no-premiere, so it may not execute "
-            "anything. Start a run without that flag to execute."
-        )
-        return gate
-
     stale = _stale_reason(state, name, plan)
     if stale:
         gate.blocked_reason = stale
@@ -192,6 +202,7 @@ def _plan_path(config: EditingConfig, state: AutoRunState, name: str) -> str:
         "review": artifacts / "critic" / f"{run_name}.revision-plan.json",
         "layers": artifacts / "layers" / f"{run_name}.json",
         "assets": artifacts / "assets" / f"{run_name}.placement.json",
+        "conform": artifacts / "conform" / f"{run_name}.json",
     }[name])
 
 
@@ -224,6 +235,7 @@ def _scratch_safe(
         "review": "editing.critic.execute",
         "layers": "editing.style.execute",
         "assets": "editing.assets.execute",
+        "conform": "editing.conform.execute",
     }[name]
     executor = __import__(module, fromlist=["targets_scratch_sequence"])
     return executor.targets_scratch_sequence(plan, roughcut)
@@ -251,6 +263,7 @@ def _stale_reason(state: AutoRunState, name: str, plan) -> str:
         "review": "review_plan",
         "layers": "layers_build",
         "assets": "assets_plan",
+        "conform": "conform_build",
     }[name]
     roughcut_gate = state.gate("roughcut")
 
@@ -279,6 +292,7 @@ def execute(
     *,
     yes: bool = False,
     allow_active_sequence: bool = False,
+    again: bool = False,
     engine=None,
     bridge=None,
     say=None,
@@ -287,6 +301,12 @@ def execute(
 
     Never raises for a refusal: a refusal is an outcome with a reason and a
     command, and the caller wants the same shape whether or not anything ran.
+
+    ``again`` lifts the already-executed guard, and only that one. It exists
+    because the guard protects against the common accident -- running the same
+    gate twice and getting two copies of every caption -- but is wrong in the
+    ordinary case of rebuilding the sequence from scratch and re-running.
+    Making it explicit keeps the default safe.
     """
     say = say or (lambda message: None)
     if name not in GATE_SPECS:
@@ -313,11 +333,12 @@ def execute(
     if gate is None:  # pragma: no cover - GATE_SPECS covers every name
         return _refused(name, state, "no such gate.", code="unknown_gate")
 
-    if gate.executed:
+    if gate.executed and not again:
         return _refused(
             name, state,
             f"this stage was already executed at {gate.executed_at}. Running "
-            "it again would place a second copy of everything.",
+            "it again would place a second copy of everything. Pass --again if "
+            "the sequence has been rebuilt or deleted since.",
             code="already_executed",
             command=f"python -m editing.cli auto report --run {state.run_id}",
         )
@@ -471,3 +492,93 @@ def _next_after(state: AutoRunState, name: str, report) -> str:
             f"--run {state.run_id} --yes"
         )
     return f"python -m editing.cli auto report --run {state.run_id}"
+
+
+# ---------------------------------------------------------------------------
+# The whole last mile, in order
+# ---------------------------------------------------------------------------
+
+#: The gates that turn a planned run into a finished video, in the order they
+#: have to happen. The rough cut builds the sequence; the conform pass adds
+#: everything to it. ``review``, ``layers`` and ``assets`` are deliberately not
+#: here -- they are separate opinions about the same cut, each with its own
+#: risk profile, and this sequence is the shortest path to something watchable.
+FINISH_ORDER = ("roughcut", "conform")
+
+
+def finish(
+    config: EditingConfig,
+    state: AutoRunState,
+    *,
+    yes: bool = False,
+    again: bool = False,
+    deliver: bool = True,
+    output: str = "",
+    preset: str = "",
+    engine=None,
+    bridge=None,
+    say=None,
+) -> dict:
+    """Execute the last mile: build the sequence, conform it, export it.
+
+    One command because "give it footage and get a video" is the thing this
+    pipeline exists to do, and making a person type three commands in the right
+    order to get there was the last place it stopped short.
+
+    It is still one ``--yes`` for a known list of steps, not a switch that
+    approves everything: the risky passes (a revision that can ripple timing,
+    an asset pass that places clips) are not on this path and still need their
+    own approval. And it stops at the first step that refuses, because
+    conforming a sequence that was never built cannot work.
+    """
+    say = say or (lambda message: None)
+    steps: list = []
+    result = {"success": False, "steps": steps, "run_id": state.run_id}
+
+    if not yes:
+        result["refused_reason"] = (
+            "This builds a sequence in Premiere and renders a video. "
+            "Re-run with --yes."
+        )
+        return result
+
+    for name in FINISH_ORDER:
+        say(f"-- {name} --")
+        outcome = execute(
+            config, state, name,
+            yes=True, again=again, engine=engine, bridge=bridge, say=say,
+        )
+        steps.append({"stage": name, **outcome})
+        if not outcome.get("executed"):
+            result["refused_reason"] = (
+                f"the {name} stage did not execute: "
+                + str(outcome.get("refused_reason")
+                      or (outcome.get("error") or {}).get("error")
+                      or "no reason given")
+            )
+            return result
+        # The later plans record whether the sequence exists; executing the
+        # rough cut makes that belief stale, and ``execute`` already
+        # invalidates them. Re-read the state so the next gate sees it.
+        try:
+            state = store.load(config, state.run_id)
+        except Exception:  # noqa: BLE001 - keep the state we have
+            pass
+
+    if not deliver:
+        result["success"] = True
+        return result
+
+    from editing.auto.runner import build_run_pipeline
+
+    pipeline = build_run_pipeline(config, state.run_id, state.config,
+                                  say=say, bridge=bridge)
+    delivery = pipeline.deliver(
+        name=state.config.name, output=output, preset=preset,
+    )
+    result["delivery"] = delivery.to_dict()
+    result["success"] = bool(delivery.delivered)
+    if not delivery.delivered:
+        result["refused_reason"] = str(
+            (delivery.error or {}).get("error", "the export produced no file"))
+    return result

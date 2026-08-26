@@ -86,6 +86,9 @@ from editing.critic.revise import RevisionOptions
 from editing.roughcut import review as review_module
 from editing.roughcut.build import RoughCutOptions
 from editing.assets import report as assets_report
+from editing.conform import execute as conform_execute
+from editing.conform import report as conform_report
+from editing.conform.schema import COLOR_LOOKS, CONFORM_MODES
 from editing.auto import gates as auto_gates
 from editing.auto import report as auto_report
 from editing.auto import store as auto_store
@@ -662,6 +665,193 @@ def _roughcut_options(args) -> RoughCutOptions:
         preset=value("preset", "") or "",
         mode=value("mode", defaults.mode),
     )
+
+
+def cmd_conform(args) -> int:
+    """Build, validate, execute and deliver the finished edit.
+
+    The one command group where "it worked" means a file exists. Every other
+    pass in this CLI ends at a plan; this one is judged on frames.
+    """
+    pipeline = _pipeline(args)
+    command = args.conform_command
+
+    # -- build ----------------------------------------------------------
+    if command == "build":
+        style = style_presets.get(args.style) if args.style else style_presets.get()
+        config = pipeline.conform_config(
+            style=style,
+            mode=args.mode,
+            color_look=args.color or "",
+            color_strength=args.color_strength,
+            music_library=args.music_library or "",
+            target_lufs=args.target_lufs,
+            max_transitions=args.max_transitions,
+            captions=not args.no_captions,
+            sound=not args.no_sound,
+            music=not args.no_music,
+            visuals=not args.no_visuals,
+            color=not args.no_color,
+            transitions=not args.no_transitions,
+        )
+        plan = pipeline.conform(name=args.name, config=config, style=style)
+        if args.json:
+            _emit({"success": True, **plan.to_dict()})
+            return EXIT_OK
+        print(conform_report.render(plan, limit=args.limit))
+        return EXIT_OK
+
+    # -- dry-run --------------------------------------------------------
+    if command == "dry-run":
+        plan = pipeline.load_conform(name=args.name)
+        report = pipeline.run_conform(plan, mode="dry_run", name=args.name)
+        if args.json:
+            _emit({"success": True, "report": report.to_dict(),
+                   "dry_run_passed": plan.dry_run_passed,
+                   "explanation": plan.explanation})
+            return EXIT_OK
+        print(f"Dry run: {'PASSED' if plan.dry_run_passed else 'FAILED'}")
+        print(f"  operations : {plan.operation_count}")
+        print(f"  executed   : {report.executed}  <- nothing has been applied")
+        if plan.dry_run_error:
+            print(f"  error      : {plan.dry_run_error.get('error')}")
+            if plan.dry_run_error.get("hint"):
+                print(f"  hint       : {plan.dry_run_error['hint']}")
+        for line in plan.explanation[: args.limit]:
+            print(f"    {line}")
+        return EXIT_OK
+
+    # -- execute --------------------------------------------------------
+    if command == "execute":
+        plan = pipeline.load_conform(name=args.name)
+        if not args.yes:
+            raise EditingError(
+                "Execution needs an explicit confirmation",
+                hint="This writes to Premiere. Re-run with --yes once you "
+                     "have read the dry run.",
+            )
+        report = pipeline.run_conform(plan, mode="execute", name=args.name)
+        if args.json:
+            _emit({"success": report.executed,
+                   "by_layer": conform_execute.executed_by_layer(report, plan),
+                   **report.to_dict()})
+            return EXIT_OK if report.executed or report.refused_reason \
+                else EXIT_ERROR
+
+        print(f"Conform execution ({plan.sequence_name})")
+        print(f"  dry run    : {'passed' if report.dry_run_passed else 'FAILED'}")
+        print(f"  on scratch : {report.on_scratch}")
+        print(f"  executed   : {report.executed}")
+        print(f"  operations : {report.operations_succeeded}/"
+              f"{report.operations_attempted}")
+        for name, counts in conform_execute.executed_by_layer(
+            report, plan
+        ).items():
+            failed = f", {counts['failed']} failed" if counts["failed"] else ""
+            print(f"    {name:<22} {counts['ok']} applied{failed}")
+        if report.refused_reason:
+            print(f"  refused    : {report.refused_reason}")
+        if report.error:
+            print(f"  error      : {report.error.get('error')}")
+            for failure in (report.error.get("detail") or {}).get("failed", [])[:10]:
+                print(f"    - {failure.get('op')} #{failure.get('index')}: "
+                      f"{str(failure.get('error'))[:70]}")
+        return EXIT_OK if report.executed or report.refused_reason else EXIT_ERROR
+
+    # -- report ---------------------------------------------------------
+    if command == "report":
+        plan = pipeline.load_conform(name=args.name)
+        delivery = pipeline.delivery_or_none(name=args.name)
+        if args.json:
+            _emit({"success": True, "plan": plan.to_dict(),
+                   "delivery": delivery.to_dict() if delivery else None})
+            return EXIT_OK
+        print(conform_report.render(plan, delivery=delivery, limit=args.limit))
+        return EXIT_OK
+
+    # -- operations -----------------------------------------------------
+    if command == "operations":
+        plan = pipeline.load_conform(name=args.name)
+        if args.json:
+            _emit({"success": True, "ops": plan.ops})
+            return EXIT_OK
+        print(f"{plan.operation_count} operation(s) for '{plan.sequence_name}':")
+        for index, op in enumerate(plan.ops[: args.limit]):
+            note = str(op.get("note", ""))[:52]
+            where = op.get("time", op.get("track", ""))
+            print(f"  {index:>4}  {op.get('op', '?'):<20} {str(where):<10} {note}")
+        if plan.operation_count > args.limit:
+            print(f"  ... {plan.operation_count - args.limit} more")
+        return EXIT_OK
+
+    # -- verify ---------------------------------------------------------
+    if command == "verify":
+        plan = pipeline.load_conform(name=args.name)
+        result = pipeline.verify_conform(
+            name=args.name, plan=plan, limit=args.limit,
+            critique=args.critique,
+        )
+        if args.json:
+            _emit({"success": result.usable, **result.to_dict()})
+            return EXIT_OK if result.usable else EXIT_ERROR
+        print(f"Verification of '{result.sequence_name}'")
+        print(f"  source     : {result.source or '-'}")
+        print(f"  frames     : {len(result.exported)}/{len(result.frames)}")
+        if result.note:
+            print(f"  note       : {result.note}")
+        for frame in result.frames:
+            mark = "+" if frame.exported else "-"
+            print(f"  {mark} {frame.at:7.2f}  {frame.path}")
+            for claim in frame.expects[:3]:
+                print(f"        expects: {claim}")
+            if frame.error:
+                print(f"        ! {frame.error}")
+        return EXIT_OK if result.usable else EXIT_ERROR
+
+    # -- unconverted ----------------------------------------------------
+    if command == "unconverted":
+        plan = pipeline.load_conform(name=args.name)
+        if args.json:
+            _emit({"success": True, "unconverted": plan.unconverted})
+            return EXIT_OK
+        print(f"{len(plan.unconverted)} decision(s) did not become an operation:")
+        for entry in plan.unconverted[: args.limit]:
+            print(f"  {entry.get('at', 0.0):7.2f}  {entry.get('kind', '?'):<10} "
+                  f"{entry.get('reason', ''):<22} {entry.get('detail', '')}")
+        return EXIT_OK
+
+    raise EditingError(f"Unknown conform command '{command}'")
+
+
+def cmd_deliver(args) -> int:
+    """Render the finished sequence to a file."""
+    pipeline = _pipeline(args)
+    result = pipeline.deliver(
+        name=args.name,
+        sequence=args.sequence or "",
+        output=args.output or "",
+        preset=args.preset or "",
+        wait=args.wait,
+    )
+    if args.json:
+        _emit({"success": result.delivered, **result.to_dict()})
+        return EXIT_OK if result.delivered else EXIT_ERROR
+
+    print(f"Delivery of '{result.sequence_name}'")
+    print(f"  method     : {result.method or '-'}")
+    print(f"  path       : {result.output_path or result.requested_path}")
+    print(f"  exists     : {result.exists}")
+    if result.exists:
+        print(f"  size       : {result.size_bytes / 1_000_000:.1f} MB")
+        print(f"  duration   : {result.duration:.1f}s")
+    print(f"  waited     : {result.waited:.1f}s")
+    if result.error:
+        print(f"  error      : {result.error.get('error')}")
+        if result.error.get("hint"):
+            print(f"  hint       : {result.error['hint']}")
+    for warning in result.warnings:
+        print(f"  ! {warning}")
+    return EXIT_OK if result.delivered else EXIT_ERROR
 
 
 def cmd_roughcut(args) -> int:
@@ -1889,6 +2079,14 @@ def _auto_config(args) -> AutoRunConfig:
         allow_screen_shake=getattr(args, "allow_screen_shake", False),
         export_premiere_visual_plan=getattr(
             args, "export_premiere_visual_plan", False),
+        conform=getattr(args, "conform", "") or "full",
+        color_look=getattr(args, "color_look", "") or "",
+        music_library=str(getattr(args, "music_library", "") or ""),
+        target_lufs=float(getattr(args, "target_lufs", -14.0) or -14.0),
+        max_transitions=int(getattr(args, "max_transitions", 6) or 6),
+        deliver=getattr(args, "deliver", False),
+        deliver_output=str(getattr(args, "deliver_output", "") or ""),
+        deliver_preset=str(getattr(args, "deliver_preset", "") or ""),
     )
 
 
@@ -2006,6 +2204,37 @@ def cmd_auto(args) -> int:
             print()
         return EXIT_OK
 
+    # -- finish -----------------------------------------------------------
+    if command == "finish":
+        state = runner.resolve(args.run)
+        result = auto_gates.finish(
+            runner.config, state,
+            yes=args.yes, again=args.again,
+            deliver=not args.no_deliver,
+            output=args.output or "", preset=args.preset or "",
+            say=_reporter(args),
+        )
+        if args.json:
+            _emit(result)
+            return EXIT_OK if result.get("success") else EXIT_ERROR
+
+        print(f"Finish ({state.run_id})")
+        for step in result.get("steps", []):
+            print(f"  {step['stage']:<10} executed={step.get('executed')} "
+                  f"{step.get('operations_succeeded', 0)}/"
+                  f"{step.get('operations_attempted', 0)}")
+        delivery = result.get("delivery")
+        if delivery:
+            print(f"  delivered  {delivery.get('delivered')}  "
+                  f"{delivery.get('output_path')}")
+            if delivery.get("size_bytes"):
+                print(f"  size       "
+                      f"{delivery['size_bytes'] / 1_000_000:.1f} MB, "
+                      f"{delivery.get('duration', 0):.1f}s")
+        if result.get("refused_reason"):
+            print(f"  REFUSED    {result['refused_reason']}")
+        return EXIT_OK if result.get("success") else EXIT_ERROR
+
     # -- execute-stage ----------------------------------------------------
     if command == "execute-stage":
         state = runner.resolve(args.run)
@@ -2013,6 +2242,7 @@ def cmd_auto(args) -> int:
             runner.config, state, args.stage,
             yes=args.yes,
             allow_active_sequence=args.allow_active_sequence,
+            again=getattr(args, "again", False),
             say=_reporter(args),
         )
         if args.json:
@@ -3851,8 +4081,16 @@ def cmd_doctor(args) -> int:
         "ffmpeg": {"path": config.ffmpeg, "found": ff.have_tool(config.ffmpeg)},
         "ffprobe": {"path": config.ffprobe, "found": ff.have_tool(config.ffprobe)},
         "vision": qwen.health(config),
-        "premiere_transcript":
-            premiere_source.probe_support(pipeline.bridge).to_dict(),
+        # ``--no-premiere`` means never talk to Premiere, and a probe is
+        # talking to it. Reporting what a live host says under that flag made
+        # the doctor's answer depend on whether the user happened to have
+        # Premiere open, which is the opposite of what the flag promises.
+        "premiere_transcript": (
+            premiere_source.probe_support(pipeline.bridge).to_dict()
+            if config.use_premiere else
+            {"available": False, "readable": False,
+             "note": "--no-premiere was set, so Premiere was not asked."}
+        ),
         "output_dir": str(config.output_dir),
         "model": config.vision_model,
         "backend": config.vision_backend,
@@ -4110,6 +4348,45 @@ def _add_polish(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--no-ducking", dest="no_ducking", action="store_true",
         help="do not ask for the bed to duck under speech")
+
+
+def _add_conform(parser: argparse.ArgumentParser) -> None:
+    """Conform and delivery flags, shared by ``auto run`` and ``batch``.
+
+    Defined once for the same reason ``_add_visuals`` is: two spellings of the
+    same switch is a run nobody can reproduce by hand.
+    """
+    group = parser.add_argument_group("conform and delivery")
+    group.add_argument(
+        "--conform", dest="conform", default="full",
+        choices=list(CONFORM_MODES),
+        help="how much of the finished edit to build as real operations. "
+             "off leaves every decision as a plan, which is what this "
+             "pipeline did before the conform pass existed")
+    group.add_argument(
+        "--color-look", dest="color_look", default="",
+        choices=[""] + sorted(COLOR_LOOKS),
+        help="force a colour treatment instead of letting the footage decide")
+    group.add_argument(
+        "--music-library", dest="music_library", default="",
+        help="folder of music this edit may choose a bed from")
+    group.add_argument(
+        "--target-lufs", dest="target_lufs", type=float, default=-14.0,
+        help="loudness the finished mix is aimed at (default -14, which is "
+             "what streaming platforms normalise to)")
+    group.add_argument(
+        "--max-transitions", dest="max_transitions", type=int, default=6,
+        help="ceiling on deliberate transitions across the episode")
+    group.add_argument(
+        "--deliver", dest="deliver", action="store_true",
+        help="render the finished sequence to a file at the end of the run "
+             "(off by default: it renders a whole episode through Premiere)")
+    group.add_argument(
+        "--deliver-output", dest="deliver_output", default="",
+        help="where the finished file goes (default under delivered/)")
+    group.add_argument(
+        "--deliver-preset", dest="deliver_preset", default="",
+        help="an .epr export preset (default: a match-source H.264)")
 
 
 def _add_visuals(parser: argparse.ArgumentParser) -> None:
@@ -4468,6 +4745,112 @@ def build_parser() -> argparse.ArgumentParser:
     rc_report.add_argument("--limit", type=int, default=40)
     _add_common(rc_report)
     rc_report.set_defaults(func=cmd_roughcut)
+
+    # -- conform --------------------------------------------------------
+    # The pass that makes everything above real. Its subcommands mirror the
+    # rough cut's on purpose: build, dry-run, execute, and then one more that
+    # none of the others have -- a finished file.
+    conform = subparsers.add_parser(
+        "conform",
+        help="turn every decision into real Premiere operations")
+    conform_subs = conform.add_subparsers(dest="conform_command", required=True)
+
+    cf_build = conform_subs.add_parser(
+        "build", help="compose captions, sound, music, visuals, colour and mix")
+    cf_build.add_argument("--name", default="structure")
+    cf_build.add_argument("--style", default="",
+                          help="style preset; also seeds the colour look")
+    cf_build.add_argument("--mode", default="full",
+                          choices=list(CONFORM_MODES),
+                          help="how much of the edit to build (default full)")
+    cf_build.add_argument("--color", default="",
+                          help="force a colour look: "
+                               + ", ".join(sorted(COLOR_LOOKS)))
+    cf_build.add_argument("--color-strength", type=float, default=1.0,
+                          help="0-1; scales the look towards neutral")
+    cf_build.add_argument("--music-library", default="",
+                          help="folder of music this edit may choose from")
+    cf_build.add_argument("--target-lufs", type=float, default=-14.0,
+                          help="loudness target for the finished mix")
+    cf_build.add_argument("--max-transitions", type=int, default=6)
+    cf_build.add_argument("--no-captions", action="store_true")
+    cf_build.add_argument("--no-sound", action="store_true")
+    cf_build.add_argument("--no-music", action="store_true")
+    cf_build.add_argument("--no-visuals", action="store_true")
+    cf_build.add_argument("--no-color", action="store_true")
+    cf_build.add_argument("--no-transitions", action="store_true")
+    cf_build.add_argument("--limit", type=int, default=40)
+    _add_common(cf_build)
+    cf_build.set_defaults(func=cmd_conform)
+
+    cf_dry = conform_subs.add_parser(
+        "dry-run", help="validate the plan offline (executes nothing)")
+    cf_dry.add_argument("--name", default="structure")
+    cf_dry.add_argument("--limit", type=int, default=40)
+    _add_common(cf_dry)
+    cf_dry.set_defaults(func=cmd_conform)
+
+    cf_exec = conform_subs.add_parser(
+        "execute", help="apply the plan to the sequence -- needs --yes")
+    cf_exec.add_argument("--name", default="structure")
+    cf_exec.add_argument("--yes", action="store_true",
+                         help="required: confirms you have read the dry run")
+    cf_exec.add_argument("--limit", type=int, default=40)
+    _add_common(cf_exec)
+    cf_exec.set_defaults(func=cmd_conform)
+
+    cf_report = conform_subs.add_parser(
+        "report", help="what was built, executed and delivered")
+    cf_report.add_argument("--name", default="structure")
+    cf_report.add_argument("--limit", type=int, default=40)
+    _add_common(cf_report)
+    cf_report.set_defaults(func=cmd_conform)
+
+    cf_ops = conform_subs.add_parser(
+        "operations", help="every operation the plan will send")
+    cf_ops.add_argument("--name", default="structure")
+    cf_ops.add_argument("--limit", type=int, default=80)
+    _add_common(cf_ops)
+    cf_ops.set_defaults(func=cmd_conform)
+
+    cf_verify = conform_subs.add_parser(
+        "verify",
+        help="photograph the finished edit and (optionally) critique it")
+    cf_verify.add_argument("--name", default="structure")
+    cf_verify.add_argument(
+        "--critique", action="store_true",
+        help="run the vision critic over the frames. Unlike the review pass, "
+             "these are frames of the EDIT rather than of the raw footage")
+    cf_verify.add_argument("--limit", type=int, default=12,
+                           help="how many moments to photograph")
+    _add_common(cf_verify)
+    cf_verify.set_defaults(func=cmd_conform)
+
+    cf_unconv = conform_subs.add_parser(
+        "unconverted", help="decisions that could not become an operation")
+    cf_unconv.add_argument("--name", default="structure")
+    cf_unconv.add_argument("--limit", type=int, default=40)
+    _add_common(cf_unconv)
+    cf_unconv.set_defaults(func=cmd_conform)
+
+    # -- deliver --------------------------------------------------------
+    deliver_cmd = subparsers.add_parser(
+        "deliver",
+        help="render the finished sequence to a video file")
+    deliver_cmd.add_argument("--name", default="structure")
+    deliver_cmd.add_argument("--sequence", default="",
+                             help="sequence to export; defaults to the one "
+                                  "the conform plan targeted")
+    deliver_cmd.add_argument("--output", default="",
+                             help="output file; defaults to "
+                                  "data/editing/delivered/<sequence>-<time>.mp4")
+    deliver_cmd.add_argument("--preset", default="",
+                             help="an .epr path; defaults to a match-source "
+                                  "H.264 preset the host finds")
+    deliver_cmd.add_argument("--wait", type=float, default=900.0,
+                             help="seconds to wait for a Media Encoder render")
+    _add_common(deliver_cmd)
+    deliver_cmd.set_defaults(func=cmd_deliver)
 
     # -- review ---------------------------------------------------------
     # A subcommand group, but the bare `review` still works and means
@@ -4930,6 +5313,7 @@ def build_parser() -> argparse.ArgumentParser:
              "creates nothing new and is what makes a run inspectable")
     _add_polish(au_run)
     _add_visuals(au_run)
+    _add_conform(au_run)
     au_run.add_argument("--skip-assets", action="store_true",
                         help="skip the asset pass entirely")
     au_run.add_argument("--force-new-run", action="store_true",
@@ -4991,6 +5375,9 @@ def build_parser() -> argparse.ArgumentParser:
         "execute-stage",
         help="execute exactly one gated stage against Premiere -- needs --yes")
     au_exec.add_argument("stage", choices=auto_gates.gate_names())
+    au_exec.add_argument(
+        "--again", action="store_true",
+        help="re-run a stage that has already been executed. Only for a sequence that has been rebuilt or deleted since -- otherwise this places a second copy of everything")
     _add_run_ref(au_exec)
     au_exec.add_argument("--yes", action="store_true",
                          help="required: confirms you have read the dry run")
@@ -5001,6 +5388,27 @@ def build_parser() -> argparse.ArgumentParser:
     au_exec.add_argument("--limit", type=int, default=40)
     _add_common(au_exec)
     au_exec.set_defaults(func=cmd_auto)
+
+    au_finish = auto_subs.add_parser(
+        "finish",
+        help="build the sequence, conform it and export a video -- needs --yes")
+    _add_run_ref(au_finish)
+    au_finish.add_argument(
+        "--yes", action="store_true",
+        help="required: this writes to Premiere and renders a video")
+    au_finish.add_argument(
+        "--again", action="store_true",
+        help="re-run stages that have already been executed. Only for a "
+             "sequence that has been rebuilt or deleted since")
+    au_finish.add_argument(
+        "--no-deliver", action="store_true",
+        help="stop at the finished timeline instead of exporting a file")
+    au_finish.add_argument("--output", default="",
+                           help="where the finished video goes")
+    au_finish.add_argument("--preset", default="",
+                           help="an .epr export preset")
+    _add_common(au_finish)
+    au_finish.set_defaults(func=cmd_auto)
 
     au_checks = auto_subs.add_parser(
         "show-checks",
@@ -5053,6 +5461,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="render a watchable proxy for each folder")
     _add_polish(au_batch)
     _add_visuals(au_batch)
+    _add_conform(au_batch)
     _add_model(au_batch)
     _add_common(au_batch)
     au_batch.set_defaults(func=cmd_auto)

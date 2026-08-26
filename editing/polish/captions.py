@@ -43,6 +43,10 @@ from editing.style.captions import (
 )
 from editing.style.presets import StylePreset
 
+#: The shortest a caption can be on screen and still be read. Below this it
+#: is a flash, and the pass refuses rather than placing one.
+MIN_READABLE_SECONDS = 0.9
+
 _WORD = re.compile(r"[\w']+")
 _BRACKETED = re.compile(r"[\[\(][^\]\)]*[\]\)]")
 _ANNOTATION = re.compile(r"^\s*[\[\(][^\]\)]*[\]\)]\s*$")
@@ -277,6 +281,22 @@ def _consider(
             entry, segment, "cut_from_the_edit",
             "this line is not in the cut, and captioning footage nobody kept "
             "would put text over a moment that no longer exists", text=text)
+
+    # There has to be enough cut left after the line for somebody to read it.
+    #
+    # Mapping a source time onto the sequence answers "did this survive the
+    # cut", not "is there room for it". The first real episode accepted a
+    # caption at 20.12s of a 20.2s cut: on screen for two frames, unreadable,
+    # and past the last frame Premiere actually had once clip lengths were
+    # rounded to the sequence frame rate. Refusing here rather than downstream
+    # means the sidecar subtitle file agrees with the timeline.
+    remaining = cut.total_duration - start
+    if remaining < MIN_READABLE_SECONDS:
+        return _refused(
+            entry, segment, "no_room_left",
+            f"only {max(0.0, remaining):.2f}s of the cut remain after this "
+            f"line, and a caption needs {MIN_READABLE_SECONDS:.1f}s to be read",
+            text=text, start=start)
 
     blocked = _blocking_ui(segment)
     if blocked:

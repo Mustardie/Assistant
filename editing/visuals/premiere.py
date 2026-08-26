@@ -36,14 +36,17 @@ from typing import Sequence
 from editing.visuals.execution import (
     PremiereVisualOperation, PremiereVisualOperationPlan, UnsupportedTreatment,
 )
+from editing.tracks import DEFAULT_LAYOUT
 from editing.visuals.schema import VisualLayerPlan, VisualTreatment, now
 
 logger = logging.getLogger("nova.editing.visuals.premiere")
 
 #: The track visual overlays land on. Above V1 (the rough cut) and V2 (the
 #: style layer's captions and cards), so the whole visual pass can be removed
-#: by deleting one track.
-VISUAL_TRACK = "V3"
+#: by deleting one track. Taken from the shared layout rather than written
+#: out here: the asset pass used to name the same track independently, and
+#: the two silently overwrote each other.
+VISUAL_TRACK = DEFAULT_LAYOUT.treatments
 
 #: Where a card's plate sits, as a fraction of the frame.
 CARD_PLATE = {"position": [0.5, 0.5], "size": [1.0, 0.26]}

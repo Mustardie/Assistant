@@ -37,7 +37,7 @@ from editing.assets.place import PROTECTED_TRACKS
 from editing.assets.schema import AssetPlacementPlan
 from editing.errors import EditingError
 from editing.roughcut import execute as roughcut_execute
-from editing.roughcut.execute import DRY_RUN_FPS
+from editing.roughcut.execute import DRY_RUN_FPS, operation_succeeded
 from editing.roughcut.schema import ExecutionReport, RoughCutPlan
 
 MODES = ("plan_only", "dry_run", "execute")
@@ -395,7 +395,7 @@ def run(
     report.executed = bool(result.get("success"))
     report.results = list(result.get("results") or [])
     report.operations_succeeded = sum(
-        1 for entry in report.results if entry.get("ok")
+        1 for entry in report.results if operation_succeeded(entry)
     )
     if report.executed:
         plan.executed = True

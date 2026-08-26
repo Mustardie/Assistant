@@ -37,16 +37,25 @@ from typing import Optional, Sequence
 
 from editing.assets.schema import AssetItem, AssetPlacement
 from editing.style.presets import ZONE_POSITION, StylePreset
+from editing.tracks import DEFAULT_LAYOUT
 
 #: Tracks this pass writes to. Never V1/A1: those are the rough cut's.
+#:
+#: Read off the shared layout in ``editing.tracks`` rather than spelled out
+#: here. They used to be spelled out, and drifted: this pass put graphics on
+#: V3 while the visual pass put its treatments on the same track, so two
+#: independent passes silently overwrote each other's overlays. One table is
+#: the fix, and ``overlay`` (V4) is where additional picture belongs -- b-roll,
+#: picture-in-picture, facecam and library graphics all being the same kind of
+#: thing.
 DEFAULT_TRACKS = {
-    "sfx": "A2",
-    "music": "A3",
-    "visual": "V3",
+    "sfx": DEFAULT_LAYOUT.sfx,
+    "music": DEFAULT_LAYOUT.music,
+    "visual": DEFAULT_LAYOUT.overlay,
 }
 
 #: Tracks that belong to the rough cut and may never be written to.
-PROTECTED_TRACKS = frozenset({"V1", "A1"})
+PROTECTED_TRACKS = DEFAULT_LAYOUT.protected
 
 #: Bin the library's files are imported into, so they are removable as a group.
 ASSET_BIN = "Nova Assets"

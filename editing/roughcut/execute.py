@@ -38,6 +38,22 @@ MODES = ("plan_only", "dry_run", "execute", "execute_on_scratch")
 _SCRATCH_MARKERS = ("sequence.create", "sequence.activate")
 
 
+def operation_succeeded(entry) -> bool:
+    """Whether one per-operation result from the engine is a success.
+
+    A function rather than an inline ``entry.get("ok")`` because the two sides
+    of this boundary spell it differently and getting it wrong is invisible.
+    The CEP panel's batch envelope uses ``ok``; ``premiere.engine`` re-keys
+    every result to ``success`` on the way out. Four executors in this package
+    checked ``ok`` against the engine's output, so every real execution
+    reported "0 of 10 operations applied" while the timeline in front of the
+    user plainly had ten. Accepting both spellings, in one place, is the fix.
+    """
+    if not isinstance(entry, dict):
+        return False
+    return bool(entry.get("success", entry.get("ok", False)))
+
+
 def dry_run(plan: RoughCutPlan, *, fps: float = DRY_RUN_FPS) -> RoughCutPlan:
     """Validate the plan offline. Records the result on the plan.
 
@@ -203,7 +219,7 @@ def run(
     report.executed = bool(result.get("success"))
     report.results = list(result.get("results") or [])
     report.operations_succeeded = sum(
-        1 for entry in report.results if entry.get("ok")
+        1 for entry in report.results if operation_succeeded(entry)
     )
     if not report.executed:
         report.error = {

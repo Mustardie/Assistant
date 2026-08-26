@@ -27,6 +27,12 @@ from editing import align
 from editing.cache import Cache, build_cache
 from editing.audio.analyzer import AudioAnalyzer, AudioResult
 from editing.config import AudioConfig, EditingConfig, SamplingConfig
+from editing.conform import build as conform_build
+from editing.conform import deliver as conform_deliver
+from editing.conform import execute as conform_execute
+from editing.conform import verify as conform_verify
+from editing.conform import report as conform_report
+from editing.conform.schema import ConformConfig, ConformPlan, DeliveryResult
 from editing.critic import (
     critic as critic_module, execute as critic_execute, frames as critic_frames,
     plan as critic_plan, report as critic_report, revise as critic_revise,
@@ -2833,6 +2839,395 @@ class Pipeline:
         if final is None:
             return None
         return visuals_run.markers_beside(visuals, final, video_path)
+
+    # ------------------------------------------------------------------
+    # Conform: making every decision real
+    # ------------------------------------------------------------------
+    #
+    # Everything above produces plans. This is where they become operations
+    # against a Premiere timeline and, finally, a file.
+
+    def conform_config(self, style=None, **overrides) -> ConformConfig:
+        """Conform settings, with the style's own opinions folded in."""
+        clean = {k: v for k, v in overrides.items() if v is not None}
+        layout = clean.pop("layout", None)
+        config = ConformConfig(**clean) if clean else ConformConfig()
+        if layout is not None:
+            config.layout = layout
+        if style is not None and not config.color_look:
+            # A style may name a look; the footage can still overrule it.
+            named = str(getattr(style, "color_look", "") or "")
+            if named:
+                config.color_look = named
+        return config
+
+    def conform(
+        self,
+        *,
+        name: str = "structure",
+        config: Optional[ConformConfig] = None,
+        style=None,
+        roughcut: Optional[RoughCutPlan] = None,
+        timeline: Optional[StructureTimeline] = None,
+        captions=None,
+        audio=None,
+        visuals=None,
+        save: bool = True,
+    ) -> ConformPlan:
+        """Compose every decision this run made into one executable plan."""
+        if roughcut is None:
+            roughcut = self._retention_roughcut_or_cut(name)
+        if timeline is None:
+            timeline = self._timeline_or_none(name)
+        if captions is None:
+            captions = self.caption_plan_or_none(name=name)
+        if audio is None:
+            audio = self.audio_plan_or_none(name=name)
+        if visuals is None:
+            visuals = self.visual_plan_or_none(name=name)
+        preset = style if style is not None else style_presets.get()
+
+        plan = conform_build.build(
+            rough_cut=roughcut,
+            config=config or self.conform_config(style=preset),
+            caption_plan=captions,
+            audio_plan=audio,
+            visual_plan=visuals,
+            style=preset,
+            timeline=timeline,
+            name=name,
+            ffmpeg=self.config.ffmpeg,
+            ffprobe=self.config.ffprobe,
+            frames_dir=self.config.conform_dir / f"{name}.zones",
+        )
+        conform_execute.dry_run(plan)
+
+        stats = plan.stats()
+        self.say(
+            f"Conform '{plan.sequence_name}': {stats['operations']} "
+            f"operation(s) from {len(plan.contributions)} layer(s)."
+        )
+        for layer, count in sorted(plan.contributions.items()):
+            self.say(f"  {layer:<12} {count} operation(s)")
+        self.say(
+            f"  colour {stats['colour']}, music {stats['music']}, "
+            f"{stats['transitions']} transition(s), "
+            f"mix {'measured' if stats['mix_measured'] else 'partly assumed'}"
+        )
+        self.say("  dry run: " + ("passed" if plan.dry_run_passed else "FAILED"))
+        if plan.dry_run_error:
+            self.say(f"  ! {plan.dry_run_error.get('error')}")
+        for warning in plan.warnings:
+            self.say(f"  ! {warning}")
+        if plan.unconverted:
+            self.say(
+                f"  {len(plan.unconverted)} decision(s) could not become an "
+                "operation; the report says which and why."
+            )
+
+        if save:
+            self.write_conform(plan, name=name)
+            self.write_conform_report(plan, name=name)
+        return plan
+
+    def _retention_roughcut_or_cut(self, name: str) -> RoughCutPlan:
+        """The cut this run actually produced.
+
+        The retention pass reshapes the episode and writes its own rough cut.
+        When it ran, *that* is the cut the captions, sounds and visuals were
+        planned against, so conforming the original would put every overlay at
+        the wrong time.
+        """
+        reshaped = self.retention_roughcut_or_none(name=name)
+        return reshaped if reshaped is not None else self.load_rough_cut(name=name)
+
+    def write_conform(self, plan: ConformPlan, *, name: str = "structure") -> Path:
+        self.config.conform_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.conform_dir / f"{name}.json"
+        target.write_text(
+            json.dumps(plan.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_conform(self, *, name: str = "structure") -> ConformPlan:
+        target = self.config.conform_dir / f"{name}.json"
+        if not target.exists():
+            raise EditingError(
+                f"No conform plan named '{name}' has been built yet",
+                hint="Run `python -m editing.cli conform build` first.",
+            )
+        return ConformPlan.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def conform_plan_or_none(self, *, name: str = "structure"):
+        try:
+            return self.load_conform(name=name)
+        except EditingError:
+            return None
+
+    def write_conform_report(
+        self, plan: ConformPlan, *, name: str = "structure",
+        report=None, delivery=None,
+    ) -> Path:
+        text = conform_report.render(plan, report=report, delivery=delivery)
+        self.config.conform_dir.mkdir(parents=True, exist_ok=True)
+        return conform_report.write(self.config.conform_dir / f"{name}.txt", text)
+
+    def run_conform(
+        self,
+        plan: Optional[ConformPlan] = None,
+        *,
+        mode: str = "dry_run",
+        name: str = "structure",
+        roughcut: Optional[RoughCutPlan] = None,
+        engine=None,
+        allow_active_sequence: bool = False,
+        save: bool = True,
+    ) -> ExecutionReport:
+        """Execute a conform plan against Premiere, to the depth ``mode`` allows."""
+        if plan is None:
+            plan = self.load_conform(name=name)
+        if roughcut is None:
+            roughcut = self._retention_roughcut_or_cut(name)
+
+        report = conform_execute.run(
+            plan, mode=mode, rough_cut=roughcut,
+            bridge=self.bridge, engine=engine,
+            allow_active_sequence=allow_active_sequence,
+        )
+        summary = conform_execute.summarise(report, plan)
+        self.say(
+            f"Conform {report.mode}: "
+            + ("executed" if report.executed else "not executed")
+            + f", {report.operations_succeeded}/{report.operations_attempted} "
+            "operation(s) applied."
+        )
+        if report.refused_reason:
+            self.say(f"  refused: {report.refused_reason}")
+        if report.error:
+            self.say(f"  ! {report.error.get('error')}")
+        for op_name, counts in conform_execute.executed_by_layer(
+            report, plan
+        ).items():
+            self.say(
+                f"  {op_name:<20} {counts['ok']} ok"
+                + (f", {counts['failed']} failed" if counts["failed"] else "")
+            )
+
+        if save:
+            self.write_conform_execution(report, summary, name=name)
+            self.write_conform_report(plan, name=name, report=report)
+        return report
+
+    def write_conform_execution(
+        self, report: ExecutionReport, summary: dict, *,
+        name: str = "structure",
+    ) -> Path:
+        self.config.conform_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.conform_dir / f"{name}.execution.json"
+        target.write_text(
+            json.dumps(
+                {"summary": summary, "report": report.to_dict()},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return target
+
+    def verify_conform(
+        self,
+        *,
+        name: str = "structure",
+        plan: Optional[ConformPlan] = None,
+        limit: int = conform_verify.DEFAULT_FRAME_COUNT,
+        critique: bool = False,
+        save: bool = True,
+    ):
+        """Photograph the executed timeline, and optionally critique it.
+
+        The one place in this system where a model is shown the *edit* rather
+        than the footage. Every earlier critique looked at frames pulled from
+        the source files, which contain none of the captions, grade or
+        graphics the editor added -- so the critic was judging the raw material
+        and calling it a judgement of the cut.
+        """
+        if plan is None:
+            plan = self.load_conform(name=name)
+        folder = self.config.conform_dir / f"{name}.frames"
+
+        # The delivered render first: it is exactly what a viewer sees, and it
+        # does not depend on a Premiere API that this version removed.
+        delivery = self.delivery_or_none(name=name)
+        rendered = delivery.output_path if (
+            delivery is not None and delivery.delivered) else ""
+
+        result = conform_verify.verify(
+            plan, bridge=self._bridge_or_default(),
+            output_dir=folder, limit=limit,
+            rendered=rendered, ffmpeg=self.config.ffmpeg,
+        )
+        self.say("  " + result.line())
+        if result.note:
+            self.say(f"  ! {result.note}")
+
+        report = None
+        if critique and result.usable:
+            report = self.critique_verified(result, name=name, plan=plan)
+            if report is not None:
+                self.say(
+                    f"  critic: {len(report.findings)} finding(s) over "
+                    f"{report.frames_examined} frame(s) of the finished edit."
+                )
+
+        if save:
+            self.config.conform_dir.mkdir(parents=True, exist_ok=True)
+            target = self.config.conform_dir / f"{name}.verification.json"
+            payload = result.to_dict()
+            if report is not None:
+                payload["critique"] = (
+                    report.to_dict() if hasattr(report, "to_dict") else None
+                )
+            target.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return result
+
+    def critique_verified(self, result, *, name: str = "structure",
+                          plan=None):
+        """Run the existing critic over frames of the finished timeline.
+
+        A seam, not a second critic. ``self.critic()`` is the same model, the
+        same prompt and the same cache the review pass uses; the only thing
+        that changes is which pictures it is handed. Those frames are wrapped
+        in the ``ReviewSet`` the critic already takes, with the operations that
+        claimed each moment carried through as the frame's note -- so a finding
+        like "the text is unreadable here" can be traced to the caption that
+        put it there.
+        """
+        from editing.roughcut.review import ReviewFrame, ReviewSet
+
+        frames = [
+            ReviewFrame(
+                frame_id=f"verified_{index:02d}",
+                placement_id="",
+                path=frame.path,
+                sequence_time=frame.at,
+                source_time=frame.at,
+                source_file="",
+                asset_id="",
+                keep_reason="conformed",
+                sequence_name=getattr(plan, "sequence_name", ""),
+                note=("what the edit put here: " + "; ".join(frame.expects))[:500],
+            )
+            for index, frame in enumerate(result.exported)
+        ]
+        if not frames:
+            return None
+
+        review = ReviewSet(
+            sequence_name=getattr(plan, "sequence_name", ""),
+            frames=frames,
+            cut_duration=float(getattr(plan, "cut_duration", 0.0) or 0.0),
+            exported=True,
+            warnings=[
+                "These frames are of the FINISHED timeline, exported from "
+                "Premiere's program monitor. Unlike the review pass, they "
+                "contain the captions, colour and graphics the editor added."
+            ],
+        )
+        try:
+            return self.critic().critique(review)
+        except Exception as exc:  # noqa: BLE001 - a failed critique is a result
+            self.say(f"  ! the critic could not read the frames: {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Delivery: the finished video
+    # ------------------------------------------------------------------
+
+    def deliver(
+        self,
+        *,
+        name: str = "structure",
+        sequence: str = "",
+        output: str = "",
+        preset: str = "",
+        wait: float = conform_deliver.DEFAULT_WAIT,
+        plan: Optional[ConformPlan] = None,
+        save: bool = True,
+    ) -> DeliveryResult:
+        """Render the finished sequence to a file, and record where it went."""
+        if plan is None:
+            plan = self.conform_plan_or_none(name=name)
+        target_sequence = sequence or (
+            plan.sequence_name if plan is not None else ""
+        )
+        if not target_sequence:
+            cut = self._rough_cut_or_none(name)
+            target_sequence = getattr(cut, "sequence_name", "") if cut else ""
+
+        destination = Path(output) if output else conform_deliver.default_output_path(
+            self.config.output_dir, target_sequence
+        )
+        self.say(f"Exporting '{target_sequence}' to {destination} ...")
+
+        result = conform_deliver.deliver(
+            bridge=self._bridge_or_default(),
+            sequence_name=target_sequence,
+            output_path=str(destination),
+            preset=preset,
+            wait=wait,
+        )
+        self.say("  " + result.line())
+        if result.error:
+            self.say(f"  ! {result.error.get('error')}")
+            if result.error.get("hint"):
+                self.say(f"    {result.error['hint']}")
+
+        if save:
+            self.write_delivery(result, name=name)
+            if plan is not None:
+                self.write_conform_report(plan, name=name, delivery=result)
+        return result
+
+    def _bridge_or_default(self):
+        if self.bridge is not None:
+            return self.bridge
+        from premiere.bridge import bridge as default_bridge
+
+        return default_bridge
+
+    def write_delivery(
+        self, result: DeliveryResult, *, name: str = "structure"
+    ) -> Path:
+        self.config.conform_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config.conform_dir / f"{name}.delivery.json"
+        target.write_text(
+            json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def load_delivery(self, *, name: str = "structure") -> DeliveryResult:
+        target = self.config.conform_dir / f"{name}.delivery.json"
+        if not target.exists():
+            raise EditingError(
+                f"Nothing has been delivered for '{name}' yet",
+                hint="Run `python -m editing.cli deliver` after executing "
+                     "the conform pass.",
+            )
+        return DeliveryResult.from_dict(
+            json.loads(target.read_text(encoding="utf-8"))
+        )
+
+    def delivery_or_none(self, *, name: str = "structure"):
+        try:
+            return self.load_delivery(name=name)
+        except EditingError:
+            return None
 
     # ------------------------------------------------------------------
     # Proxy renders

@@ -29,7 +29,7 @@ from typing import Optional
 
 from editing.critic.schema import RevisionPlan
 from editing.errors import EditingError
-from editing.roughcut.execute import DRY_RUN_FPS
+from editing.roughcut.execute import DRY_RUN_FPS, operation_succeeded
 from editing.roughcut.schema import ExecutionReport, RoughCutPlan
 from editing.roughcut import execute as roughcut_execute
 
@@ -290,7 +290,7 @@ def run(
     report.executed = bool(result.get("success"))
     report.results = list(result.get("results") or [])
     report.operations_succeeded = sum(
-        1 for entry in report.results if entry.get("ok")
+        1 for entry in report.results if operation_succeeded(entry)
     )
     if report.executed:
         plan.executed = True

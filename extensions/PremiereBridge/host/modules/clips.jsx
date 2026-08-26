@@ -88,15 +88,43 @@ var NovaClips = (function () {
         return end;
     }
 
-    function findClipAt(track, seconds) {
+    /**
+     * The clip covering `seconds`, with a frame of tolerance.
+     *
+     * The tolerance is not politeness, it is correctness. Premiere snaps every
+     * edit to a frame boundary, and the sequence frame rate is whatever the
+     * source footage turned out to be -- 29.80 fps for a screen recording, not
+     * 30. So a caller asking for a clip "at 20.12" is asking about a time that
+     * cannot exist on the timeline, and an exact comparison answers "there is
+     * nothing here" about a clip that is plainly there. That failure mode
+     * looked exactly like a bug in the placement rather than in the lookup.
+     *
+     * Two frames of slack either side covers the rounding without being loose
+     * enough to return a neighbouring clip: no clip this system places is
+     * shorter than that.
+     */
+    function findClipAt(track, seconds, tolerance) {
+        var slack = (tolerance === undefined)
+            ? Math.max(0.04, 2.0 / U.sequenceFps(null))
+            : Number(tolerance);
+        var best = null;
+        var bestGap = Infinity;
+
         for (var i = 0; i < track.clips.numItems; i++) {
             var clip = track.clips[i];
-            if (U.secondsOf(clip.start) <= seconds + 0.001 &&
-                U.secondsOf(clip.end) > seconds + 0.001) {
+            var start = U.secondsOf(clip.start);
+            var end = U.secondsOf(clip.end);
+            if (start <= seconds + 0.001 && end > seconds + 0.001) {
                 return { clip: clip, index: i };
             }
+            // How far outside this clip the requested time falls.
+            var gap = (seconds < start) ? (start - seconds) : (seconds - end);
+            if (gap <= slack && gap < bestGap) {
+                best = { clip: clip, index: i };
+                bestGap = gap;
+            }
         }
-        return null;
+        return best;
     }
 
     function insert(params) { return place(params, 'insert'); }

@@ -18,3 +18,11 @@ __pycache__/
 data/premiere_assets/
 data/premiere_history.json
 data/premiere_styles.json
+
+# Editing: run artifacts, transcripts, plans, renders and delivered episodes.
+# All of it is derived from the footage and can be rebuilt; the delivered
+# videos in particular are hundreds of megabytes each.
+data/editing/
+
+# A third-party tool writes and holds this open; it is not part of the project.
+gude-*.log

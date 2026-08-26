@@ -36,6 +36,23 @@ DEFAULT_TIMEOUT = 120.0
 
 _RETRY_DELAYS = (0.5, 1.5, 3.0)
 
+#: Operations that routinely take longer than ``DEFAULT_TIMEOUT``, with the
+#: time they are actually given. Premiere blocks on all of these, so a caller
+#: that hits the default timeout has not learned that anything is wrong -- it
+#: has learned that the default was too short, and then reports a "bridge did
+#: not respond" error for an operation that was working.
+_SLOW_OPS = {
+    # Closing a project can force Premiere to finish conforming audio and
+    # flushing preview files first, and opening one re-links every asset.
+    "project.new": 600.0,
+    "project.open": 600.0,
+    "project.save": 300.0,
+    # A direct export renders the whole sequence inside Premiere.
+    "sequence.export": 3600.0,
+    # Importing large media triggers conforming.
+    "project.import": 600.0,
+}
+
 _SETUP_HELP = (
     "Premiere bridge unreachable. Check:\n"
     "  1. Adobe Premiere Pro is running with a project open\n"
@@ -124,8 +141,11 @@ class PremiereBridge:
         Raises ``HostError``/``UnsupportedError`` on a Premiere-side failure so
         the engine can classify it; transport problems become ``BridgeError``.
         """
-        return self._post("/exec", {"op": op, "params": params or {}},
-                          timeout=timeout)
+        return self._post(
+            "/exec", {"op": op, "params": params or {}},
+            timeout=timeout if timeout is not None
+            else _SLOW_OPS.get(op, self.timeout),
+        )
 
     def call_batch(self, operations: list, *, on_error: str = "abort",
                    timeout: Optional[float] = None) -> Any:
@@ -142,6 +162,16 @@ class PremiereBridge:
             {"ops": operations, "on_error": on_error},
             timeout=timeout or max(self.timeout, 30.0 + 0.5 * len(operations)),
         )
+
+    def reload_host(self, *, timeout: float = 30.0) -> Any:
+        """Re-evaluate the ExtendScript host inside the running Premiere.
+
+        CEP loads the host script once, at panel start, so without this every
+        change to a ``.jsx`` file costs a full Premiere restart. That cost is
+        what makes host-side bugs expensive to fix, and expensive-to-fix host
+        bugs are how a bridge ends up shipped but never actually exercised.
+        """
+        return self._post("/reload", {}, timeout=timeout)
 
     # ------------------------------------------------------------------
 

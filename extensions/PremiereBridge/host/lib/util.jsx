@@ -225,6 +225,30 @@ var NovaUtil = (function () {
         return normalise(candidate) === normalise(wanted);
     }
 
+    /**
+     * The filename part of a path, lower-cased.
+     *
+     * Both halves matter on Windows, which is where this runs: Premiere
+     * reports media paths with backslashes and whatever case the file system
+     * gave it, while the Python side sends the path it was configured with.
+     * Comparing those raw makes an asset lookup fail on a file that is plainly
+     * there.
+     */
+    function basename(value) {
+        var text = String(value === undefined || value === null ? '' : value);
+        var cut = Math.max(text.lastIndexOf('/'), text.lastIndexOf('\\'));
+        return (cut >= 0 ? text.substring(cut + 1) : text).toLowerCase();
+    }
+
+    /** A path comparable across separator and case differences. */
+    function samePath(a, b) {
+        function flat(value) {
+            return String(value === undefined || value === null ? '' : value)
+                .split('\\').join('/').toLowerCase();
+        }
+        return flat(a) === flat(b);
+    }
+
     return {
         TICKS_PER_SECOND: TICKS_PER_SECOND,
         fail: fail,
@@ -243,6 +267,8 @@ var NovaUtil = (function () {
         isArray: isArray,
         defined: defined,
         normalise: normalise,
-        nameMatches: nameMatches
+        nameMatches: nameMatches,
+        basename: basename,
+        samePath: samePath
     };
 }());

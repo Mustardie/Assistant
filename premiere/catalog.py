@@ -135,6 +135,55 @@ _op(OpSpec(
 ))
 
 _op(OpSpec(
+    "project.new", category="project", mutating=True, needs_sequence=False,
+    summary="Create a new project at a path and open it, replacing whatever is "
+            "open. This is how an unattended run gets somewhere to work: "
+            "without it the whole system depends on a person having opened a "
+            "project first.",
+    fields={
+        "path": F("string", required=True,
+                  doc="absolute path ending in .prproj"),
+        "overwrite": F("boolean", default=False,
+                       doc="delete an existing file at that path first"),
+    },
+    notes="Destructive to the editing session, not to media: an open project "
+          "with unsaved changes is left behind. Save first if that matters.",
+))
+
+_op(OpSpec(
+    "caps.presets", category="caps", mutating=False, needs_sequence=False,
+    summary="Every export preset (.epr) installed on this machine. Export "
+            "needs one and Premiere will not choose a default, so this is how "
+            "the editor finds out what it may render with.",
+    fields={"match": F("string", doc="only presets whose name contains this")},
+))
+
+_op(OpSpec(
+    "sequence.export", category="sequence", mutating=False, needs_sequence=False,
+    summary="Render a sequence to a video file. This is the finished artifact: "
+            "the point where an edit stops being a timeline and becomes "
+            "something somebody can watch.",
+    fields={
+        "path": F("string", required=True,
+                  doc="absolute output path, extension matching the preset"),
+        "sequence": F("string", doc="sequence name; omit for the active one"),
+        "preset": F("string",
+                    doc="absolute path to an .epr; omit to let the host pick a "
+                        "match-source H.264 preset"),
+        "range": F("enum", choices=["entire", "in_to_out", "work_area"],
+                   default="entire"),
+        "overwrite": F("boolean", default=True),
+    },
+    notes="Two render routes exist and they differ in an important way. The "
+          "direct export blocks until the file is written, so the result says "
+          "complete=True. The Media Encoder route hands the job to another "
+          "application and returns immediately, so it says complete=False and "
+          "the caller must wait for the file. The result always says which "
+          "one ran -- reporting a render as finished when it has not started "
+          "is the one failure mode worth engineering against here.",
+))
+
+_op(OpSpec(
     "sequence.list", category="sequence", mutating=False, needs_sequence=False,
     summary="Every sequence in the project with id, name, fps, resolution, duration.",
     fields={},

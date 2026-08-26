@@ -26,6 +26,35 @@ from editing.visual.frames import ExtractedFrames
 # Config and cache
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def never_reach_a_real_premiere(monkeypatch):
+    """Point the default bridge at a port nothing listens on.
+
+    The docstring above says this suite never touches Premiere, and that was
+    true only as long as nobody happened to have Premiere open with the panel
+    running. On a machine where it *is* open, tests that assert "this refuses
+    without Premiere" instead executed against the user's live project and
+    built scratch sequences in it. A promise about external edges has to be
+    enforced, not documented.
+    """
+    monkeypatch.setenv("PREMIERE_BRIDGE_PORT", "1")
+    # Same reasoning for the two model endpoints. A developer running a local
+    # model server on the default port turned "this stage blocks when the
+    # model is unreachable" into a test that quietly sent it real requests.
+    monkeypatch.setenv("EDITING_VISION_BASE_URL", "http://127.0.0.1:1/v1")
+    monkeypatch.setenv("EDITING_DIRECTOR_BASE_URL", "http://127.0.0.1:1/v1")
+    import premiere.bridge as bridge_module
+
+    monkeypatch.setattr(bridge_module, "DEFAULT_PORT", 1, raising=False)
+    monkeypatch.setattr(
+        bridge_module.bridge, "base_url", "http://127.0.0.1:1", raising=False
+    )
+    monkeypatch.setattr(
+        bridge_module.bridge, "_client", None, raising=False
+    )
+    yield
+
+
 @pytest.fixture
 def config(tmp_path) -> EditingConfig:
     """A config rooted in a temp dir, with Premiere and the network off."""

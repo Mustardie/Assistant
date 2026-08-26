@@ -627,6 +627,94 @@ def check_output_duration(inputs: GateInputs) -> GateResult:
 
 #: Gate name -> the function that answers it. Kept as a table so the report,
 #: the CLI and the tests all iterate the same list and a new gate is one entry.
+def check_conform_executed(inputs: GateInputs) -> GateResult:
+    """Did the decisions reach a timeline, or stop at a plan?
+
+    The check this whole system was missing. Every gate above it can pass on a
+    run that produced nothing anybody can watch, because they measure plans.
+    This one measures whether the plans became operations and whether Premiere
+    accepted them.
+    """
+    if not inputs.conform_enabled:
+        return skipped(
+            "conform_executed",
+            "The conform pass did not run, so every decision this run made is "
+            "still a plan.")
+    if not inputs.conform_operations:
+        return gate(
+            "conform_executed", "warn",
+            "The conform pass ran and produced no operations, so nothing from "
+            "the caption, sound or visual passes can reach the timeline.",
+            evidence={"unconverted": inputs.conform_unconverted},
+            fix="python -m editing.cli conform unconverted --run "
+                + (inputs.run_id or "<run_id>"),
+        )
+    if not inputs.conform_executed:
+        return gate(
+            "conform_executed", "warn",
+            f"{inputs.conform_operations} operation(s) are validated and "
+            "waiting; nothing has been applied to a timeline yet.",
+            evidence={"operations": inputs.conform_operations,
+                      "contributions": dict(inputs.conform_contributions)},
+            fix="python -m editing.cli auto execute-stage conform --run "
+                + (inputs.run_id or "<run_id>") + " --yes",
+        )
+    if inputs.conform_applied < inputs.conform_operations:
+        missed = inputs.conform_operations - inputs.conform_applied
+        return gate(
+            "conform_executed", "warn",
+            f"{inputs.conform_applied} of {inputs.conform_operations} "
+            f"operation(s) landed; {missed} failed inside Premiere.",
+            evidence={"applied": inputs.conform_applied,
+                      "attempted": inputs.conform_operations},
+            fix="python -m editing.cli conform report --run "
+                + (inputs.run_id or "<run_id>"),
+        )
+    return gate(
+        "conform_executed", "pass",
+        f"All {inputs.conform_applied} operation(s) are on the timeline: "
+        + ", ".join(f"{layer} {count}" for layer, count
+                    in sorted(inputs.conform_contributions.items())),
+        evidence={"applied": inputs.conform_applied,
+                  "contributions": dict(inputs.conform_contributions)},
+    )
+
+
+def check_delivered(inputs: GateInputs) -> GateResult:
+    """Is there a finished video, and is it really there?"""
+    if not inputs.delivery_path:
+        return skipped(
+            "delivered",
+            "No export was asked for, so there is no finished video to check.")
+    if not inputs.delivered:
+        return gate(
+            "delivered", "fail",
+            "An export was attempted and no usable file exists.",
+            evidence={"path": inputs.delivery_path,
+                      "error": inputs.delivery_error},
+            fix="python -m editing.cli deliver --run "
+                + (inputs.run_id or "<run_id>"),
+            can_continue=False,
+        )
+    if inputs.delivery_size_mb < TINY_RENDER_MB:
+        return gate(
+            "delivered", "warn",
+            f"The exported file is {inputs.delivery_size_mb:.1f} MB, which is "
+            "small enough to suspect an empty or failed render.",
+            evidence={"path": inputs.delivery_path,
+                      "size_mb": round(inputs.delivery_size_mb, 2)},
+        )
+    return gate(
+        "delivered", "pass",
+        f"A finished video exists at {inputs.delivery_path} "
+        f"({inputs.delivery_size_mb:.1f} MB, "
+        f"{inputs.delivery_duration:.1f}s).",
+        evidence={"path": inputs.delivery_path,
+                  "size_mb": round(inputs.delivery_size_mb, 2),
+                  "duration": round(inputs.delivery_duration, 2)},
+    )
+
+
 CHECKS = {
     "footage": check_footage,
     "transcript": check_transcript,
@@ -643,4 +731,6 @@ CHECKS = {
     "render_output": check_render_output,
     "render_size": check_render_size,
     "output_duration": check_output_duration,
+    "conform_executed": check_conform_executed,
+    "delivered": check_delivered,
 }

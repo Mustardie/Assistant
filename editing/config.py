@@ -493,6 +493,27 @@ class EditingConfig:
         return self.output_dir / "polish"
 
     @property
+    def conform_dir(self) -> Path:
+        """The conform plan, its report, and the delivery record.
+
+        Its own directory because it is the one place that holds the *result*
+        rather than an opinion: what was actually executed into Premiere, and
+        where the finished file was written. Somebody looking for "what did
+        this run actually produce" should have one folder to open.
+        """
+        return self.output_dir / "conform"
+
+    @property
+    def delivered_dir(self) -> Path:
+        """Finished, rendered episodes.
+
+        Separate from ``render_dir`` on purpose. That folder holds disposable
+        proxies of a rough cut; this one holds the export somebody asked for.
+        Deleting a proxy is free, deleting a delivery is not.
+        """
+        return self.output_dir / "delivered"
+
+    @property
     def frames_dir(self) -> Path:
         return self.output_dir / "frames"
 
@@ -509,6 +530,7 @@ class EditingConfig:
             self.layers_dir, self.asset_library_dir, self.episode_dir,
             self.feedback_dir, self.render_dir, self.director_dir,
             self.retention_dir, self.polish_dir, self.visuals_dir,
+            self.conform_dir, self.delivered_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
 

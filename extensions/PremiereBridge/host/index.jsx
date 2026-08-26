@@ -23,6 +23,7 @@
 #include "modules/markers.jsx"
 #include "modules/transcript.jsx"
 #include "modules/caps.jsx"
+#include "modules/export.jsx"
 
 var NovaBridge = (function () {
     var U = NovaUtil;
@@ -45,6 +46,7 @@ var NovaBridge = (function () {
         'project.assets':    function (p) { return NovaProject.assets(p); },
         'project.import':    function (p) { return NovaProject.importFiles(p); },
         'project.bin':       function (p) { return NovaProject.createBin(p); },
+        'project.new':       function (p) { return NovaExport.newProject(p); },
 
         // -- sequences ---------------------------------------------------
         'sequence.list':     function (p) { return NovaProject.listSequences(p); },
@@ -122,7 +124,19 @@ var NovaBridge = (function () {
         'caps.probe':        function (p) { return NovaCaps.probe(p); },
         'caps.params':       function (p) { return NovaCaps.params(p); },
         'caps.effects':      function (p) { return NovaEffects.listEffects(p); },
-        'caps.transitions':  function (p) { return NovaEffects.listTransitions(p); }
+        'caps.transitions':  function (p) { return NovaEffects.listTransitions(p); },
+        'caps.presets':      function (p) { return NovaExport.presets(p); },
+
+        // -- delivery ----------------------------------------------------
+        'sequence.export':   function (p) { return NovaExport.exportSequence(p); }
+    };
+
+    /** Operations that are legal with no project open. */
+    var NO_PROJECT_OPS = {
+        'project.new': true,
+        'project.open': true,
+        'project.info': true,
+        'caps.presets': true
     };
 
     function knownOps() {
@@ -171,12 +185,16 @@ var NovaBridge = (function () {
             });
         }
 
-        if (!app || !app.project) {
+        // Most operations are meaningless without a project, but the ones
+        // that *make* a project obviously cannot require one -- and neither can
+        // reading what the installation supports. Requiring it for those was
+        // what stopped an unattended run from ever getting started.
+        if (!app || (!app.project && !NO_PROJECT_OPS[op])) {
             return JSON.stringify({
                 ok: false,
                 error: { code: 'no_project',
                          message: 'No project is open in Premiere',
-                         hint: 'Open a project, then retry.' }
+                         hint: 'Open a project, or run project.new, then retry.' }
             });
         }
 

@@ -806,7 +806,10 @@ def test_a_graphic_is_placed_in_a_safe_zone(config, stocked):
     placement = plan.placements[0]
 
     assert placement.status == "placed"
-    assert placement.track == "V3"
+    # V4 is the overlay track in the shared layout: additional picture --
+    # b-roll, picture-in-picture, library graphics -- sits above the visual
+    # pass's own treatments on V3, which the two used to share by accident.
+    assert placement.track == "V4"
     assert placement.payload["zone"] != "center"
     op = placement.premiere_ops[0]
     assert op["op"] == "graphic.image"

@@ -88,6 +88,7 @@ CAPTION_REJECT_REASONS = (
     "repeated_filler",
     "duplicate_line",
     "cut_from_the_edit",
+    "no_room_left",
     "blocked_by_ui",
     "style_forbids_text",
     "no_safe_zone",
@@ -227,7 +228,22 @@ class CaptionConfig:
     #: A line must score at least this to be a candidate at all.
     min_priority: float = 0.55
     #: ASR confidence a line needs, when the transcript carries one.
-    min_confidence: float = 0.6
+    #:
+    #: Measured, not guessed. The first real episode put through this pipeline
+    #: was gameplay commentary transcribed by faster-whisper ``small``; every
+    #: line came back between 0.59 and 0.65, and all of them were correct
+    #: transcriptions. At the old default of 0.60 that refused eleven of
+    #: sixteen lines -- so the caption layer produced nothing at all on footage
+    #: it had understood perfectly well.
+    #:
+    #: Two things make 0.60 the wrong number. Whisper's ``avg_logprob`` runs
+    #: low whenever there is music or game audio under the voice, which is
+    #: most of the footage this system exists for; and the value it reports
+    #: barely varies within a file, so a threshold near the typical value acts
+    #: as a per-*file* switch rather than a per-line filter. 0.45 keeps its
+    #: real job -- refusing lines the model was genuinely unsure of -- without
+    #: refusing an entire episode for being noisy.
+    min_confidence: float = 0.45
     #: Refuse a line whose transcript has no confidence figure at all. Off:
     #: a hand-written SRT has no confidence and is usually more trustworthy
     #: than a machine one.
@@ -248,7 +264,7 @@ class CaptionConfig:
             max_seconds=max(0.5, min(12.0, as_float(self.max_seconds, 3.5))),
             max_words=max(1, min(14, int(as_float(self.max_words, 7)))),
             min_priority=clamp01(self.min_priority, 0.55),
-            min_confidence=clamp01(self.min_confidence, 0.6),
+            min_confidence=clamp01(self.min_confidence, 0.45),
             max_total=max(0, min(500, int(as_float(self.max_total, 40)))),
             style=_slug(self.style),
         )

@@ -337,6 +337,33 @@
       return;
     }
 
+    // Re-evaluate the ExtendScript host without restarting Premiere.
+    //
+    // Worth a route of its own: the host script is loaded once, by CEP, at
+    // panel start, so every change to a .jsx file otherwise costs a full
+    // application restart. Debugging a real-host failure means iterating on
+    // that code, and a forty-second restart per iteration is the difference
+    // between fixing a host bug and giving up on it.
+    if (req.method === 'POST' && req.url === '/reload') {
+      // Forward slashes: the path is about to be embedded in an ExtendScript
+      // string literal, where a Windows backslash is an escape character.
+      var hostScript = path.join(__dirname, 'host', 'index.jsx').split('\\').join('/');
+      cs.evalScript('$.evalFile("' + hostScript + '"); '
+                    + 'typeof NovaBridge === "object" ? NovaBridge.ops().length : -1',
+        function (raw) {
+          var count = parseInt(raw, 10);
+          var ok = !isNaN(count) && count > 0;
+          log(ok ? ('host reloaded: ' + count + ' operations')
+                 : ('host reload failed: ' + raw), !ok);
+          send(res, 200, ok
+            ? { ok: true, result: { reloaded: true, operations: count } }
+            : { ok: false, error: { code: 'host_error',
+                                    message: 'Reloading the host script failed',
+                                    detail: { response: String(raw) } } });
+        });
+      return;
+    }
+
     if (req.method === 'POST' && (req.url === '/exec' || req.url === '/batch')) {
       var isBatch = req.url === '/batch';
       readBody(req, function (err, body) {

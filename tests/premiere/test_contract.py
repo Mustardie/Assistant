@@ -128,6 +128,57 @@ class TestPanelIntegrity:
                         encoding="utf-8").read()
         assert "--enable-nodejs" in manifest
 
+    def test_manifest_is_well_formed_xml(self):
+        """The single most expensive bug this suite can catch.
+
+        CEP parses every manifest it finds, discards a malformed one with a
+        line in a log file nobody reads, and carries on. From inside Premiere
+        that is indistinguishable from the extension never having been
+        installed: no error, no menu entry, no panel. This project shipped a
+        manifest whose header comment contained a double hyphen -- illegal
+        inside an XML comment -- and as a result the panel had never once
+        loaded, which meant the entire Premiere integration had never been
+        executed against a real host.
+        """
+        import xml.parsers.expat
+
+        path = os.path.join(HOST_DIR, "CSXS", "manifest.xml")
+        parser = xml.parsers.expat.ParserCreate()
+        with open(path, "rb") as handle:
+            parser.ParseFile(handle)
+
+    def test_the_installer_refuses_a_malformed_manifest(self, tmp_path):
+        """And the installer has to notice, not just the test suite."""
+        from premiere import install as installer
+
+        broken = tmp_path / "manifest.xml"
+        broken.write_text(
+            "\n".join([
+                "<?xml version='1.0'?>",
+                # A double hyphen, which XML forbids inside a comment. This is
+                # the exact shape of the bug: a comment about a command-line
+                # switch.
+                "<!-- needs the " + "--" + "enable-nodejs parameter -->",
+                "<Root/>",
+            ]),
+            encoding="utf-8",
+        )
+        outcome = installer.validate_manifest(str(broken))
+        assert not outcome["ok"]
+        assert "well-formed" in outcome["error"]
+
+    def test_the_panel_starts_itself(self):
+        """The bridge server only exists while the panel is loaded.
+
+        Without a StartOn event somebody has to open Window > Extensions by
+        hand before anything in this system can reach Premiere, which makes an
+        unattended end-to-end edit impossible.
+        """
+        manifest = open(os.path.join(HOST_DIR, "CSXS", "manifest.xml"),
+                        encoding="utf-8").read()
+        assert "<StartOn>" in manifest
+        assert "ApplicationActivate" in manifest
+
     def test_manifest_and_bridge_agree_on_the_port(self):
         from premiere.bridge import DEFAULT_PORT
         main_js = open(os.path.join(HOST_DIR, "main.js"), encoding="utf-8").read()

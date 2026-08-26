@@ -67,6 +67,11 @@ STAGE_ORDER = (
     # caption is a refusal it can only make once both exist.
     "visual_plan",
     "final_edit_plan",
+    # Conform turns every decision above into operations. It reads the
+    # captions, the sound, the visuals and the cut, so it comes after all
+    # four -- and before the proxy, so the proxy is of the finished shape.
+    "conform_build",
+    "conform_dry_run",
     "render_proxy",
     # The checks look at the output, so they come after the thing that
     # produces it.
@@ -75,6 +80,8 @@ STAGE_ORDER = (
     "feedback_queue",
     "feedback_report",
     "review_package",
+    # Delivery is last: it is the only stage whose success means a file.
+    "deliver",
     "report",
 )
 
@@ -90,6 +97,7 @@ GATE_STAGES = {
     "review": "review_dry_run",
     "layers": "layers_dry_run",
     "assets": "assets_dry_run",
+    "conform": "conform_dry_run",
 }
 
 #: How dangerous each operation is, worst first. Used to answer "what is the
@@ -312,6 +320,27 @@ class AutoRunConfig:
     #: fraction of a second, and is the difference between a run somebody can
     #: inspect and forty files they have to learn the layout of.
     review_package: bool = True
+
+    #: How much of the finished edit the conform pass builds. ``off`` leaves
+    #: every decision as a plan, which is what this pipeline used to do.
+    conform: str = "full"
+    #: Force a colour look by name instead of letting the footage decide.
+    color_look: str = ""
+    #: Folder of music the edit may choose a bed from.
+    music_library: str = ""
+    #: Loudness the finished mix is aimed at, in LUFS.
+    target_lufs: float = -14.0
+    #: Ceiling on deliberate transitions across the episode.
+    max_transitions: int = 6
+
+    #: Render the finished sequence to a file once the conform pass has been
+    #: executed. Off by default for the same reason the proxy is: it costs
+    #: minutes and produces a large file. Unlike the proxy, it needs Premiere.
+    deliver: bool = False
+    #: Where the finished file goes. Empty means under ``delivered/``.
+    deliver_output: str = ""
+    #: An .epr export preset. Empty lets the host choose a match-source H.264.
+    deliver_preset: str = ""
 
     created_at: str = ""
     schema_version: int = 1

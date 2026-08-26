@@ -299,6 +299,32 @@ STAGES = (
         manual_command="python -m editing.cli visuals report --latest",
     ),
     AutoStage(
+        name="conform_build",
+        summary="Turn captions, sound, music, visuals, colour and the mix "
+                "into real operations",
+        # Reads everything above it. The rough cut is the only hard
+        # requirement: a conform pass over a cut with no captions and no
+        # sound still places the colour, the mix and the transitions.
+        requires=("roughcut_build",),
+        config_keys=("name", "style", "conform", "color_look",
+                     "music_library", "target_lufs", "max_transitions",
+                     "captions", "audio_polish", "visual_layer",
+                     "retention_cut", "retention_mode"),
+        artifacts=("conform/structure.json",),
+        requires_ffmpeg=True,      # the mix and the colour pass measure media
+        critical=False,
+        manual_command="python -m editing.cli conform build",
+    ),
+    AutoStage(
+        name="conform_dry_run",
+        summary="Validate the conform plan offline",
+        requires=("conform_build",),
+        config_keys=("name", "style", "conform"),
+        resumable=False,
+        critical=False,
+        manual_command="python -m editing.cli conform dry-run",
+    ),
+    AutoStage(
         name="render_proxy",
         summary="Render a watchable proxy of the rough cut with FFmpeg",
         requires=("roughcut_build",),
@@ -371,6 +397,21 @@ STAGES = (
         manual_command="python -m editing.cli review package --run <run_id>",
     ),
     AutoStage(
+        name="deliver",
+        summary="Render the finished sequence to a video file",
+        # Requires only the conform build: whether the sequence exists in
+        # Premiere is a question this stage asks Premiere, not one it can
+        # infer from a checkpoint.
+        requires=("conform_build",),
+        config_keys=("name", "deliver_output", "deliver_preset"),
+        # Never resumable: a delivery's whole claim is that a file exists
+        # right now, and a cached "yes" over a deleted file is the one answer
+        # this stage must never give.
+        resumable=False,
+        critical=False,
+        manual_command="python -m editing.cli deliver",
+    ),
+    AutoStage(
         name="report",
         summary="Write the JSON and human-readable run reports",
         requires=("roughcut_build",),
@@ -410,6 +451,15 @@ DIRECTOR_STAGES = ("director_plan",)
 #: The retention wiring, on its own. Opt-in via ``--retention-cut``: it
 #: reshapes the episode, and reshaping somebody's episode is not a default.
 RETENTION_STAGES = ("retention_cut",)
+
+#: The conform pass. Opt-*out*: it is the stage that makes the rest of the
+#: pipeline mean anything, and a run that plans everything and conforms nothing
+#: is exactly the state this pass exists to end. It executes nothing by itself
+#: -- like every other pass it stops at a validated plan behind a gate.
+CONFORM_STAGES = ("conform_build", "conform_dry_run")
+
+#: Delivery, on its own. Opt-in via ``--deliver``: it renders a full episode.
+DELIVER_STAGES = ("deliver",)
 
 #: The proxy render, on its own. Opt-in via ``--render-proxy``: it is the
 #: only stage that produces a file measured in hundreds of megabytes, and a
@@ -1197,6 +1247,149 @@ def run_assets_dry_run(pipeline, run, context) -> tuple:
 
 #: Stage name -> runner. ``report`` is absent on purpose: the orchestrator
 #: writes it after every other stage has settled, because it summarises them.
+def run_conform_build(pipeline, run, context) -> tuple:
+    """Compose every decision this run made into one executable plan.
+
+    Non-critical for the same reason the polish passes are: a run that could
+    not measure loudness because FFmpeg is missing still produced every plan
+    above it. What it loses is the part that makes those plans real, and the
+    report says so rather than failing the whole run.
+    """
+    from editing.style import presets as style_presets
+
+    style = style_presets.get(run.style)
+    config = pipeline.conform_config(
+        style=style,
+        mode=run.conform or "full",
+        color_look=run.color_look or "",
+        music_library=run.music_library or "",
+        target_lufs=run.target_lufs,
+        max_transitions=run.max_transitions,
+    )
+    plan = pipeline.conform(
+        name=run.name,
+        config=config,
+        style=style,
+        roughcut=context.get("retention_roughcut") or context.get("roughcut"),
+        timeline=context.get("timeline"),
+        captions=context.get("caption_plan"),
+        audio=context.get("audio_plan"),
+        visuals=context.get("visual_plan"),
+    )
+    context["conform"] = plan
+    stats = plan.stats()
+    return (
+        [str(pipeline.config.conform_dir / f"{run.name}.json")],
+        {
+            "mode": plan.config.mode,
+            "operations": stats["operations"],
+            "contributions": stats["contributions"],
+            "colour": stats["colour"],
+            "music": stats["music"],
+            "transitions": stats["transitions"],
+            "mix_measured": stats["mix_measured"],
+            "unconverted": stats["unconverted"],
+            "layout": plan.layout.to_dict(),
+        },
+        list(plan.warnings),
+    )
+
+
+def run_conform_dry_run(pipeline, run, context) -> tuple:
+    """Validate the conform plan offline.
+
+    ``save=False`` for the same reason the layer pass does it: writing here
+    would overwrite the execution report a real execution left, and every
+    later gate reads that file to decide whether the work has been done.
+    """
+    plan = context.get("conform") or pipeline.load_conform(name=run.name)
+    report = pipeline.run_conform(
+        plan, mode="dry_run", name=run.name, save=False
+    )
+    context["conform"] = plan
+
+    if not plan.dry_run_passed:
+        error = plan.dry_run_error or {}
+        if error.get("code") == "empty_plan":
+            return (
+                [],
+                {"dry_run_passed": False, "operations": 0, "empty": True},
+                ["Nothing from the earlier passes converted into an "
+                 "operation. Run `conform unconverted` to see why."],
+            )
+        raise StageBlocked(
+            "could not validate the conform plan",
+            error.get("error", "the plan did not validate."),
+            code=str(error.get("code") or "dry_run_failed"),
+            next_command="python -m editing.cli conform dry-run",
+            detail={"hint": error.get("hint", "")},
+        )
+    return (
+        [str(pipeline.config.conform_dir / f"{run.name}.json")],
+        {"dry_run_passed": True, "operations": plan.operation_count,
+         "executed": report.executed},
+        list(report.warnings),
+    )
+
+
+def run_deliver(pipeline, run, context) -> tuple:
+    """Render the finished sequence to a file.
+
+    The only stage in this pipeline whose success condition is a file on disk.
+    It blocks rather than fails when there is nothing to export, because "the
+    conform pass was never executed" is a state with an obvious next command
+    rather than a broken run.
+    """
+    plan = context.get("conform") or pipeline.conform_plan_or_none(name=run.name)
+    sequence = getattr(plan, "sequence_name", "") if plan is not None else ""
+    if not sequence:
+        cut = context.get("roughcut")
+        sequence = getattr(cut, "sequence_name", "") if cut is not None else ""
+    if not sequence:
+        raise StageBlocked(
+            "could not deliver a finished video",
+            "No sequence has been built, so there is nothing to export.",
+            code="no_sequence",
+            next_command=(
+                f"python -m editing.cli auto execute-stage roughcut "
+                f"--run {getattr(run, 'name', '')} --yes"
+            ),
+        )
+
+    result = pipeline.deliver(
+        name=run.name,
+        sequence=sequence,
+        output=run.deliver_output or "",
+        preset=run.deliver_preset or "",
+    )
+    context["delivery"] = result
+
+    if not result.delivered:
+        error = result.error or {}
+        raise StageBlocked(
+            "could not deliver a finished video",
+            error.get("error", "the export produced no file."),
+            code=str(error.get("code") or "export_failed"),
+            next_command="python -m editing.cli deliver",
+            detail={"hint": error.get("hint", ""),
+                    "sequence": result.sequence_name,
+                    "path": result.requested_path},
+        )
+    return (
+        [result.output_path],
+        {
+            "sequence": result.sequence_name,
+            "path": result.output_path,
+            "size_bytes": result.size_bytes,
+            "duration": round(result.duration, 2),
+            "method": result.method,
+            "preset": result.preset,
+            "waited": result.waited,
+        },
+        list(result.warnings),
+    )
+
+
 RUNNERS = {
     "doctor": run_doctor,
     "discover": run_discover,
@@ -1921,6 +2114,9 @@ RUNNERS["caption_polish"] = run_caption_polish
 RUNNERS["audio_polish"] = run_audio_polish
 RUNNERS["visual_plan"] = run_visual_plan
 RUNNERS["final_edit_plan"] = run_final_edit_plan
+RUNNERS["conform_build"] = run_conform_build
+RUNNERS["conform_dry_run"] = run_conform_dry_run
+RUNNERS["deliver"] = run_deliver
 RUNNERS["render_proxy"] = run_render_proxy
 RUNNERS["reliability_gates"] = run_reliability_gates
 RUNNERS["feedback_start"] = run_feedback_start

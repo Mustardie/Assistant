@@ -549,6 +549,15 @@ class AutoRunner:
         # things is not something to do because nobody said otherwise.
         if run.visual_layer == "off" and name in stages_module.VISUAL_STAGES:
             return "--visual-layer was not set"
+        # Opt-*out*, unlike the passes above it. The conform pass is what
+        # turns every plan in this pipeline into something on a timeline, and
+        # a run that plans everything and conforms nothing is the exact state
+        # it exists to end. It still executes nothing by itself.
+        if run.conform == "off" and name in stages_module.CONFORM_STAGES:
+            return "--conform off was set"
+        # Inverted again: delivering renders a whole episode through Premiere.
+        if not run.deliver and name in stages_module.DELIVER_STAGES:
+            return "--deliver was not set"
         # The one late addition that is opt-*out*: it creates nothing, costs a
         # fraction of a second, and is what makes a run inspectable.
         if (not run.review_package

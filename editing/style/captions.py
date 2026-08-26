@@ -36,10 +36,11 @@ from editing.roughcut.select import map_to_sequence
 from editing.schema import StructureTimeline, TimelineSegment, TranscriptEntry
 from editing.style.presets import ZONE_POSITION, StylePreset
 from editing.style.schema import LayerEvidence, LayerItem, item_id_for
+from editing.tracks import DEFAULT_LAYOUT
 
 #: The video track styled overlays land on. V1 is the rough cut's assembly, so
 #: everything this layer draws goes above it and can be deleted as a unit.
-OVERLAY_TRACK = "V2"
+OVERLAY_TRACK = DEFAULT_LAYOUT.captions
 
 #: Words that mark a line as a reaction. Deliberately short and literal: this
 #: is a keyword list, not sentiment analysis, and pretending otherwise would
