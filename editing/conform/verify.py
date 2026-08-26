@@ -301,22 +301,3 @@ def _verify_from_premiere(
         )
     result.elapsed = time.time() - started
     return result
-
-
-def critic_frames(result: VerificationResult) -> list[dict]:
-    """The exported frames in the shape the critic's prompt builder expects.
-
-    Deliberately the same shape the source-frame path produces, so the critic
-    itself needs no knowledge of where a frame came from -- only the caller
-    decides whether it is judging the material or the edit.
-    """
-    return [
-        {
-            "path": frame.path,
-            "at": frame.at,
-            "sequence_time": frame.at,
-            "source": result.source,
-            "expects": list(frame.expects),
-        }
-        for frame in result.exported
-    ]

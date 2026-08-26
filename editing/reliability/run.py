@@ -103,8 +103,14 @@ def _from_conform(inputs, config, state, run) -> None:
         inputs.conform_executed = bool(gate_record.executed)
         inputs.conform_applied = int(gate_record.operations_succeeded or 0)
 
-    delivery = _read_json(
-        Path(config.output_dir) / "conform" / f"{run.name}.delivery.json")
+    # The run's own artifacts folder, not the shared output root. Every
+    # artifact a run produces is hermetic to that run, and reading the shared
+    # root here would report on whichever run happened to write last.
+    from editing.auto import store as auto_store
+
+    artifacts = Path(state.artifacts_dir or auto_store.artifacts_dir(
+        config, state.run_id))
+    delivery = _read_json(artifacts / "conform" / f"{run.name}.delivery.json")
     if not delivery:
         return
     inputs.delivery_path = str(delivery.get("output_path") or "")

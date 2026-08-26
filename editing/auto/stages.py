@@ -1366,13 +1366,22 @@ def run_deliver(pipeline, run, context) -> tuple:
 
     if not result.delivered:
         error = result.error or {}
+        code = str(error.get("code") or "export_failed")
+        # The common case, and it is not a failure: the sequence exists as a
+        # plan and has not been built in Premiere yet, because building it
+        # happens behind a gate after this run's stages.
+        next_command = (
+            "python -m editing.cli auto finish --run <run_id> --yes"
+            if code == "sequence_not_found"
+            else "python -m editing.cli deliver"
+        )
         raise StageBlocked(
             "could not deliver a finished video",
             error.get("error", "the export produced no file."),
-            code=str(error.get("code") or "export_failed"),
-            next_command="python -m editing.cli deliver",
+            code=code,
+            next_command=next_command,
             detail={"hint": error.get("hint", ""),
-                    "sequence": result.sequence_name,
+                    "sequence": sequence,
                     "path": result.requested_path},
         )
     return (
