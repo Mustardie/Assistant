@@ -1,0 +1,28 @@
+{
+  "_comment": "Copy this next to a file and rename it to match: impact_boom.wav -> impact_boom.asset.json. Every field is optional; anything absent is inferred from the folder and the filename. Delete the keys you do not need.",
+  "category": "sfx",
+  "tags": [
+    "impact",
+    "boom",
+    "heavy"
+  ],
+  "intensity": "high",
+  "mood": [
+    "dramatic",
+    "dark"
+  ],
+  "bpm": null,
+  "loopable": false,
+  "safe_for_auto": true,
+  "preferred_styles": [
+    "cinematic_minecraft"
+  ],
+  "avoid_styles": [
+    "minimal_clean"
+  ],
+  "license_notes": "Bought from <somewhere>, licence covers YouTube use.",
+  "start_offset": 0.0,
+  "end_offset": null,
+  "volume_adjust_db": -3.0,
+  "notes": "Long tail -- leave room after it."
+}

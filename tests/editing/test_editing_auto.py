@@ -1966,3 +1966,96 @@ def test_the_retention_flags_reach_the_run_config():
     assert run.cold_open is False
     assert run.max_cold_open_seconds == 15.0
     assert run.dead_air_aggressiveness == "high"
+
+
+# ---------------------------------------------------------------------------
+# A stage must not pass while its whole purpose failed
+# ---------------------------------------------------------------------------
+
+def test_vision_coverage_counts_failed_windows():
+    """The analyze stage once reported "passed" over a run in which every
+    vision window had failed, so every later pass behaved as though the
+    footage had been looked at and found unremarkable."""
+    from editing.auto.stages import _vision_coverage
+    from editing.schema import StructureTimeline, TimelineSegment, VisualEvent
+
+    timeline = StructureTimeline()
+    timeline.segments = [
+        TimelineSegment(segment_id="s1", asset_id="a1",
+                        source_file="a.mp4", start=0.0, end=4.0,
+                        events=[
+                            VisualEvent(event_id="e1", asset_id="a1",
+                                        source_file="a.mp4",
+                                        start=0.0, end=4.0),
+                            VisualEvent(event_id="e2", asset_id="a1",
+                                        source_file="a.mp4",
+                                        start=4.0, end=8.0,
+                                        error="HTTP 400"),
+                        ]),
+    ]
+    looked, failed, reasons = _vision_coverage(timeline)
+    assert (looked, failed) == (2, 1)
+    assert reasons == ["HTTP 400"]
+
+
+def test_vision_coverage_of_a_clean_run_is_zero_failures():
+    from editing.auto.stages import _vision_coverage
+    from editing.schema import StructureTimeline, TimelineSegment, VisualEvent
+
+    timeline = StructureTimeline()
+    timeline.segments = [
+        TimelineSegment(segment_id="s1", asset_id="a1",
+                        source_file="a.mp4", start=0.0, end=4.0,
+                        events=[VisualEvent(event_id="e1", asset_id="a1",
+                                            source_file="a.mp4",
+                                            start=0.0, end=4.0)]),
+    ]
+    assert _vision_coverage(timeline) == (1, 0, [])
+
+
+def test_a_server_that_refuses_response_format_is_retried_without_it():
+    """LM Studio accepts only json_schema or text and 400s the whole request.
+
+    Silently losing every window to that was how an entire run's vision
+    analysis came back empty while the stage reported success.
+    """
+    from editing.config import EditingConfig
+    from editing.visual.qwen import OpenAICompatibleVision, _HttpVision
+
+    class Response:
+        def __init__(self, status, text, payload=None):
+            self.status_code = status
+            self.text = text
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    sent = []
+
+    class Session:
+        headers = {}
+
+        def post(self, url, json=None, timeout=None):
+            sent.append(json)
+            if "response_format" in json:
+                # The exact body LM Studio returns.
+                return Response(400, "response_format.type must be "
+                                     "json_schema or text")
+            return Response(200, "", {
+                "choices": [{"message": {"content": '{"importance": "setup"}'}}]
+            })
+
+    previous = _HttpVision._json_object_unsupported
+    _HttpVision._json_object_unsupported = False
+    try:
+        model = OpenAICompatibleVision(EditingConfig())
+        model._session = Session()
+        result = model.analyze([], system="s", user="u")
+        assert result["importance"] == "setup"
+        assert "response_format" in sent[0]
+        assert "response_format" not in sent[1]
+        # And it remembers, so four hundred windows do not each pay for it.
+        assert _HttpVision._json_object_unsupported
+    finally:
+        _HttpVision._json_object_unsupported = previous

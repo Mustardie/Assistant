@@ -91,6 +91,7 @@ def build(
     ffmpeg: str = "ffmpeg",
     ffprobe: str = "ffprobe",
     frames_dir=None,
+    asset_library_root: str = "",
     measure_fn=None,
 ) -> ConformPlan:
     """Every decision the run made, as one executable plan."""
@@ -176,7 +177,7 @@ def build(
     # -- music ------------------------------------------------------------
     if config.enabled("music"):
         plan.music = music_module.plan_bed(
-            library_root=config.music_library,
+            library_root=_music_root(config, asset_library_root),
             cut_duration=plan.cut_duration,
             track=layout.music,
             gain_db=config.music_under_dialogue_db,
@@ -547,6 +548,23 @@ def _visual_ops(plan: ConformPlan, visual_plan, layout: TrackLayout) -> list[dic
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def _music_root(config: ConformConfig, asset_library_root: str) -> str:
+    """Where the music bed may be chosen from.
+
+    An explicit ``--music-library`` wins. Otherwise the asset library's own
+    ``music/`` folder, which is where ``assets init`` tells people to put
+    music and therefore where they put it. Requiring a second flag to point at
+    the folder the system itself created was a good way to make a stocked
+    library look empty.
+    """
+    if config.music_library:
+        return config.music_library
+    if not asset_library_root:
+        return ""
+    candidate = Path(asset_library_root) / "music"
+    return str(candidate) if candidate.is_dir() else ""
+
 
 def _contribute(plan: ConformPlan, layer: str, ops: Sequence[dict]) -> None:
     plan.contributions[layer] = len(ops)

@@ -739,6 +739,36 @@ def run_analyze(pipeline, run, context) -> tuple:
     # reliability checks read this, so "no transcript" means no words in the
     # timeline rather than "the Whisper stage did not run".
     words = sum(len(segment.said.split()) for segment in timeline.segments)
+
+    # How many windows the vision model actually answered.
+    #
+    # The analyzer records a per-window error and carries on, which is right --
+    # one bad window should not lose an hour of work. But the *stage* then
+    # reported "passed" over a run in which every single window had failed,
+    # and every later pass quietly behaved as though the footage had been
+    # looked at and found unremarkable. A stage that succeeds while its whole
+    # purpose failed is the most expensive kind of dishonest report, because
+    # nothing downstream has any way to notice.
+    looked, failed, reasons = _vision_coverage(timeline)
+    warnings = list(timeline.warnings)
+    if looked and failed == looked:
+        raise StageBlocked(
+            "the vision model answered nothing",
+            f"All {failed} analysis window(s) failed, so nothing in this run "
+            "has actually looked at the footage. "
+            + (f"The server said: {reasons[0]}" if reasons else ""),
+            code="vision_failed",
+            next_command="python -m editing.cli doctor",
+            detail={"windows": looked, "failed": failed,
+                    "reasons": reasons[:3]},
+        )
+    if failed:
+        warnings.append(
+            f"{failed} of {looked} analysis window(s) failed, so parts of the "
+            "footage were never looked at."
+            + (f" First reason: {reasons[0]}" if reasons else "")
+        )
+
     return (
         [str(target)],
         {
@@ -749,9 +779,33 @@ def run_analyze(pipeline, run, context) -> tuple:
             "segments_with_speech": stats["segments_with_speech"],
             "transcript_words": words,
             "model": timeline.model,
+            # The number that says whether the vision half of this run means
+            # anything. Read by the reliability checks.
+            "vision_windows": looked,
+            "vision_failed": failed,
         },
-        list(timeline.warnings),
+        warnings,
     )
+
+
+def _vision_coverage(timeline) -> tuple:
+    """``(windows, failed, reasons)`` for the vision pass.
+
+    A window that errored keeps its error on the event, so this counts what
+    is on the timeline rather than trusting a separate tally.
+    """
+    looked = 0
+    failed = 0
+    reasons: list[str] = []
+    for segment in getattr(timeline, "segments", ()) or ():
+        for event in getattr(segment, "events", ()) or ():
+            looked += 1
+            error = str(getattr(event, "error", "") or "")
+            if error:
+                failed += 1
+                if error not in reasons:
+                    reasons.append(error)
+    return looked, failed, reasons
 
 
 def run_recommend(pipeline, run, context) -> tuple:

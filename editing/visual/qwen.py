@@ -156,6 +156,12 @@ def encode_image(path: str | Path) -> str:
 class _HttpVision:
     """Shared retry loop and error typing for the HTTP backends."""
 
+    #: Set once, for the process, when a server rejects ``response_format``.
+    #: Class-level rather than per-instance because the answer is a property
+    #: of the server, and re-learning it on every one of four hundred windows
+    #: would mean four hundred wasted round trips.
+    _json_object_unsupported = False
+
     def __init__(self, config: EditingConfig):
         self.config = config
         self.name = config.vision_model
@@ -205,6 +211,28 @@ class _HttpVision:
                             detail={"reason": str(exc),
                                     "body": (response.text or "")[:300]},
                         ) from None
+                if (response.status_code == 400
+                        and "response_format" in (response.text or "")
+                        and "response_format" in body):
+                    # Not every OpenAI-compatible server takes the same
+                    # response_format. vLLM and llama.cpp accept
+                    # ``json_object``; LM Studio accepts only ``json_schema``
+                    # or ``text`` and rejects the whole request with a 400.
+                    #
+                    # Dropping it costs nothing here: the system prompt already
+                    # demands a JSON object and ``extract_json`` handles a
+                    # fenced or prefixed reply. What it saves is the entire
+                    # analysis silently degrading to empty events on a server
+                    # that could have answered perfectly well.
+                    logger.warning(
+                        "The vision server does not accept response_format; "
+                        "retrying without it and relying on the prompt. "
+                        "Server said: %s", (response.text or "")[:160],
+                    )
+                    _HttpVision._json_object_unsupported = True
+                    body = dict(body)
+                    body.pop("response_format", None)
+                    continue
                 if response.status_code not in _RETRYABLE:
                     raise ModelError(
                         f"The vision server rejected the request "
@@ -286,6 +314,9 @@ class OpenAICompatibleVision(_HttpVision):
         headers_key = self.config.vision_api_key
         if headers_key and headers_key != "not-needed":
             self.session.headers.update({"Authorization": f"Bearer {headers_key}"})
+
+        if _HttpVision._json_object_unsupported:
+            body.pop("response_format", None)
 
         payload = self._post(self._url("/chat/completions"), body)
         return extract_json(self._text_of(payload))

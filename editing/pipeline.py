@@ -2899,6 +2899,7 @@ class Pipeline:
             ffmpeg=self.config.ffmpeg,
             ffprobe=self.config.ffprobe,
             frames_dir=self.config.conform_dir / f"{name}.zones",
+            asset_library_root=str(asset_library.default_root(self.config)),
         )
         conform_execute.dry_run(plan)
 

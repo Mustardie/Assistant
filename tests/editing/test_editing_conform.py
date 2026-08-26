@@ -871,6 +871,29 @@ class TestVerification:
         assert "frame export" in result.note
 
 
+class TestMusicLibraryRoot:
+    def test_an_explicit_library_wins(self, tmp_path):
+        from editing.conform.build import _music_root
+
+        config = ConformConfig(music_library=str(tmp_path))
+        assert _music_root(config, "/somewhere/assets") == str(tmp_path)
+
+    def test_the_asset_librarys_music_folder_is_the_fallback(self, tmp_path):
+        """`assets init` creates music/ and tells people to fill it. Needing a
+        second flag to point at it made a stocked library look empty."""
+        from editing.conform.build import _music_root
+
+        music = tmp_path / "music"
+        music.mkdir()
+        assert _music_root(ConformConfig(), str(tmp_path)) == str(music)
+
+    def test_no_library_at_all_is_empty_not_a_guess(self, tmp_path):
+        from editing.conform.build import _music_root
+
+        assert _music_root(ConformConfig(), str(tmp_path / "missing")) == ""
+        assert _music_root(ConformConfig(), "") == ""
+
+
 class TestCaptionPlacement:
     def test_busyness_comes_from_the_luma_spread(self):
         text = chr(10).join([
