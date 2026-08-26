@@ -247,6 +247,22 @@ class AutoRunner:
                 continue
 
             self._execute_stage(state, pipeline, stage, result, context)
+
+            # A stage that actually ran may have produced different output
+            # from the checkpointed run, so everything downstream of it is
+            # stale -- whatever the reason it ran.
+            #
+            # ``--refresh`` already propagated to dependents, but that only
+            # covers the stages somebody named. A stage can also re-run on its
+            # own: because it is non-resumable (the director is), because its
+            # config fingerprint changed, or because its artifacts were
+            # deleted. The director re-deciding a cut while ``conform_build``
+            # kept a checkpoint built from the *previous* cut is exactly that,
+            # and it produces a plan whose timings refer to a timeline that no
+            # longer exists.
+            if result.status == "passed" and not result.from_checkpoint:
+                self._invalidate_dependents(state, stage.name)
+
             store.save(self.config, state)
 
             if result.status == "failed" and stage.critical:
@@ -396,6 +412,26 @@ class AutoRunner:
         result.ended_at = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     # -- checkpoints -----------------------------------------------------
+
+    def _invalidate_dependents(self, state: AutoRunState, name: str) -> None:
+        """Drop the checkpoints of everything downstream of ``name``.
+
+        Only the checkpoints, not the stage results: a stage later in this
+        same pass will simply find no checkpoint and run, and a stage earlier
+        in the order (there are none, since dependents come after) is
+        untouched.
+        """
+        for dependent in stages_module.dependents(name):
+            checkpoint = store.read_checkpoint(
+                self.config, state.run_id, dependent
+            )
+            if checkpoint is None:
+                continue
+            store.clear_checkpoint(self.config, state.run_id, dependent)
+            store.append_log(
+                self.config, state.run_id,
+                f"stage {dependent}: checkpoint dropped because {name} re-ran",
+            )
 
     def _valid_checkpoint(
         self, state: AutoRunState, stage

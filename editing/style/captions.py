@@ -415,26 +415,67 @@ def _duration_for(
     return round(max(0.4, duration), 3)
 
 
+#: Splits a line into sentences, keeping the punctuation on the sentence it
+#: belongs to. Whisper punctuates, so this is reliable on real transcripts.
+_SENTENCE = re.compile(r"[^.!?]+[.!?]*")
+
+
+def sentences_in(text: str) -> list[str]:
+    """The line's sentences, punctuation intact, empties dropped."""
+    return [
+        piece.strip() for piece in _SENTENCE.findall(str(text or ""))
+        if piece.strip()
+    ]
+
+
 def condense(text: str, max_words: int) -> tuple:
     """Cut a line down to its strongest phrase.
 
-    Returns ``(text, was_condensed)``. The window with the most keyword hits
-    wins; ties go to the earliest window, because a viewer reads the start of a
-    line and the speaker usually front-loads the point. Falling back to the
-    first ``max_words`` would keep "okay so anyway I think that was" and throw
-    away "a creeper", which is the only part worth reading.
+    Returns ``(text, was_condensed)``.
+
+    **A whole sentence beats a window of words**, and that is the first thing
+    tried. The word-window fallback below reads straight across a sentence
+    boundary and drops the punctuation on the way -- on the first real episode
+    it turned "I fell off. What do you mean?" into "I fell off What do...",
+    which is on screen, ungrammatical, and cut in the middle of a thought. If
+    any sentence in the line fits the budget, it is a better caption than any
+    window can be: it is a complete thing somebody said.
+
+    Only when no sentence fits does the window logic run. Then the window with
+    the most keyword hits wins, ties going to the earliest, because a viewer
+    reads the start of a line and speakers front-load the point. Falling back
+    to the first ``max_words`` would keep "okay so anyway I think that was" and
+    throw away "a creeper", which is the only part worth reading.
     """
-    words = _WORD.findall(text)
+    cleaned = str(text or "").strip()
+    words = _WORD.findall(cleaned)
     if len(words) <= max_words:
-        return text.strip(), False
+        return cleaned, False
 
     keywords = REACTION_WORDS + DANGER_WORDS + EXPLANATORY_WORDS
+
+    def score_of(phrase: str) -> int:
+        lowered = phrase.lower()
+        return sum(1 for word in keywords if word in lowered)
+
+    # 1. A whole sentence that fits, most keyword hits first.
+    candidates = [
+        sentence for sentence in sentences_in(cleaned)
+        if len(_WORD.findall(sentence)) <= max_words
+    ]
+    if candidates:
+        best = max(
+            range(len(candidates)),
+            # Negative index breaks ties towards the earlier sentence.
+            key=lambda i: (score_of(candidates[i]), -i),
+        )
+        return candidates[best], True
+
+    # 2. No sentence fits: the strongest window of words.
     best_index, best_score = 0, -1
     for index in range(0, len(words) - max_words + 1):
-        window = " ".join(words[index:index + max_words]).lower()
-        score = sum(1 for word in keywords if word in window)
-        # Prefer earlier windows on a tie: the front of a line is what a
-        # viewer's eye lands on first.
+        window = " ".join(words[index:index + max_words])
+        score = score_of(window)
         if score > best_score:
             best_index, best_score = index, score
 

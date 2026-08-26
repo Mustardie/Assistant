@@ -1416,3 +1416,49 @@ def test_the_cli_can_build_a_markers_only_pass(staged, capsys):
     payload = json.loads(captured.out)
     ops = {op["op"] for op in payload["plan"]["ops"]}
     assert ops <= {"sequence.activate", "marker.add"}
+
+
+# ---------------------------------------------------------------------------
+# Condensing: a caption has to be a thing somebody said
+# ---------------------------------------------------------------------------
+
+class TestCondenseKeepsSentences:
+    def test_a_sentence_that_fits_is_used_whole(self):
+        """The window logic read straight across a sentence boundary and
+        dropped the punctuation on the way. On the first real episode that put
+        "I fell off What do..." on screen -- ungrammatical, and cut in the
+        middle of a thought."""
+        from editing.style.captions import condense
+
+        text, condensed = condense("I fell off. What do you mean?", 5)
+        assert condensed
+        assert text == "What do you mean?"
+        assert "..." not in text
+
+    def test_the_strongest_fitting_sentence_wins(self):
+        from editing.style.captions import condense
+
+        text, _ = condense(
+            "Yeah, sure buddy. I did not do it. I did not do anything.", 5)
+        assert text in ("Yeah, sure buddy.", "I did not do it.")
+        assert text.endswith((".", "!", "?"))
+
+    def test_a_line_that_already_fits_is_untouched(self):
+        from editing.style.captions import condense
+
+        assert condense("short line", 7) == ("short line", False)
+
+    def test_no_sentence_fits_so_a_window_is_taken(self):
+        from editing.style.captions import condense
+
+        text, condensed = condense(
+            "okay so anyway I think that was actually a creeper right there", 4)
+        assert condensed
+        assert "creeper" in text
+        assert "..." in text
+
+    def test_sentence_splitting_keeps_punctuation(self):
+        from editing.style.captions import sentences_in
+
+        assert sentences_in("One. Two! Three?") == ["One.", "Two!", "Three?"]
+        assert sentences_in("   ") == []

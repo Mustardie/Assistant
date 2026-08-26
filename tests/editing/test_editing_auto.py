@@ -2059,3 +2059,57 @@ def test_a_server_that_refuses_response_format_is_retried_without_it():
         assert _HttpVision._json_object_unsupported
     finally:
         _HttpVision._json_object_unsupported = previous
+
+
+def test_a_stage_that_reruns_invalidates_its_dependents(config, tmp_path,
+                                                        footage, fake_probe):
+    """--refresh propagated to dependents; a stage re-running on its own did not.
+
+    The director is non-resumable, so a resume re-decides the cut. The conform
+    plan downstream then kept a checkpoint built from the *previous* cut, and
+    its timings referred to a timeline that no longer existed.
+    """
+    from editing.auto import stages as stages_module
+    from editing.auto import store as auto_store
+    from editing.auto.schema import AutoCheckpoint
+
+    runner = AutoRunner(config)
+    state = run_once(runner, AutoRunConfig(
+        footage_folder=str(footage), mock=True, no_premiere=True,
+    ))
+
+    downstream = stages_module.dependents("roughcut_build")
+    assert "conform_build" in downstream, downstream
+
+    # Written directly so the test is about the invalidation rule rather than
+    # about which stages happen to checkpoint in a mocked run.
+    for name in ("conform_build", "layers_build"):
+        auto_store.write_checkpoint(config, state.run_id, AutoCheckpoint(
+            stage=name, config_fingerprint="x", artifacts={}, summary={}))
+        assert auto_store.read_checkpoint(config, state.run_id, name)
+
+    runner._invalidate_dependents(state, "roughcut_build")
+
+    for name in ("conform_build", "layers_build"):
+        assert auto_store.read_checkpoint(config, state.run_id, name) is None, (
+            f"{name} kept a checkpoint after the rough cut re-ran"
+        )
+
+
+def test_invalidation_leaves_unrelated_stages_alone(config, tmp_path, footage,
+                                                    fake_probe):
+    """``discover`` runs before the rough cut, so nothing about a rebuilt cut
+    makes it stale."""
+    from editing.auto import store as auto_store
+    from editing.auto.schema import AutoCheckpoint
+
+    runner = AutoRunner(config)
+    state = run_once(runner, AutoRunConfig(
+        footage_folder=str(footage), mock=True, no_premiere=True,
+    ))
+    auto_store.write_checkpoint(config, state.run_id, AutoCheckpoint(
+        stage="discover", config_fingerprint="x", artifacts={}, summary={}))
+
+    runner._invalidate_dependents(state, "roughcut_build")
+
+    assert auto_store.read_checkpoint(config, state.run_id, "discover")
