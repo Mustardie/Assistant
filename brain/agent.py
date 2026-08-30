@@ -85,6 +85,12 @@ class Agent:
         cannot break task execution.
         """
         self._event_callback = callback
+        try:
+            from capabilities.service import default_capability_service
+
+            default_capability_service().set_event_sink(self._emit_event)
+        except Exception:
+            logger.exception("Unable to connect capability events")
 
     def _emit_event(self, event_type: str, payload: dict | None = None) -> None:
         callback = getattr(self, "_event_callback", None)

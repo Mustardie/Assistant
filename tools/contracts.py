@@ -99,6 +99,7 @@ class ToolDecisionLayer:
         "desktop_monitor_start", "desktop_monitor_stop",
         "desktop_startup_enable_confirmed", "desktop_startup_disable",
         "desktop_habit_delete", "desktop_activity_clear",
+        "capability_delete",
         "type_text", "press_key", "hotkey", "left_click", "double_click",
         "right_click", "scroll", "move_mouse",
     }
@@ -140,6 +141,33 @@ class ToolDecisionLayer:
                 return ToolAssessment(False, tool, normalized, f"Missing required arguments: {', '.join(missing)}")
 
         explicit = confirmed or any(bool(normalized.get(key)) for key in self._CONFIRMATION_KEYS)
+        if tool in {"capability_execute", "capability_validate", "learned_skill_execute"} and not explicit:
+            try:
+                from capabilities.service import default_capability_service
+
+                service = default_capability_service()
+                if tool == "learned_skill_execute":
+                    skill = service.store.get_skill(str(normalized.get("skill_id") or ""))
+                    dynamic_permissions = list(skill.permissions) if skill else []
+                    dynamic_confirmation = bool(set(dynamic_permissions) & service.permission_policy.APPROVAL_REQUIRED)
+                else:
+                    dynamic_confirmation, dynamic_permissions = service.requires_confirmation(
+                        str(normalized.get("capability_id") or "")
+                    )
+                if dynamic_confirmation:
+                    return ToolAssessment(
+                        False, tool, normalized,
+                        "Synthesized capability requires approval for: " + ", ".join(dynamic_permissions),
+                        requires_confirmation=True,
+                    )
+            except Exception:
+                # The capability facade repeats the permission check. A
+                # lookup error here must never turn into authorization.
+                return ToolAssessment(
+                    False, tool, normalized,
+                    "Could not resolve synthesized capability permissions",
+                    requires_confirmation=True,
+                )
         if tool in {"file_move", "move_file"} and not explicit:
             source = normalized.get("source") or normalized.get("path")
             if source:

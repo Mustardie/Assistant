@@ -943,6 +943,70 @@ def connector_action_plan(request):
     return ConnectorActionPlanner().choose(str(request)).to_dict()
 
 
+# ---------------- Self-discovered / learned capabilities ---------------- #
+
+def capability_search(request, limit=6):
+    """Return a compact semantic shortlist across all capability sources."""
+    from capabilities.service import default_capability_service
+    return {
+        "success": True,
+        "request": request,
+        "candidates": default_capability_service().search(str(request or ""), limit=int(limit)),
+    }
+
+
+def capability_discover(description, required_inputs=None, expected_effect="read_only", context=None, limit=8):
+    """Create declarative temporary adapters from specs or conservative local metadata."""
+    from capabilities.service import default_capability_service
+    candidates = default_capability_service().discover_capabilities(
+        str(description or ""),
+        required_inputs=required_inputs if isinstance(required_inputs, dict) else {},
+        expected_effect=str(expected_effect or "read_only"),
+        context=context if isinstance(context, dict) else {},
+        limit=int(limit),
+    )
+    return {"success": True, "candidates": candidates, "count": len(candidates)}
+
+
+def capability_validate(capability_id, inputs=None, confirm=False):
+    from capabilities.service import default_capability_service
+    return default_capability_service().validate(
+        str(capability_id), inputs if isinstance(inputs, dict) else {}, confirm=bool(confirm)
+    )
+
+
+def capability_execute(capability_id, inputs=None, confirm=False):
+    from capabilities.service import default_capability_service
+    return default_capability_service().execute(
+        str(capability_id), inputs if isinstance(inputs, dict) else {}, confirm=bool(confirm)
+    )
+
+
+def capability_inspect(capability_id):
+    from capabilities.service import default_capability_service
+    item = default_capability_service().get(str(capability_id))
+    return item.to_dict() if item else {"success": False, "error": "Capability not found"}
+
+
+def capability_invalidate(capability_id, reason="manually invalidated"):
+    from capabilities.service import default_capability_service
+    return default_capability_service().invalidate(str(capability_id), str(reason))
+
+
+def capability_delete(capability_id, confirm=False):
+    if not confirm:
+        return {"success": False, "requires_confirmation": True, "error": "Deleting a learned capability requires confirmation"}
+    from capabilities.service import default_capability_service
+    return default_capability_service().delete(str(capability_id))
+
+
+def learned_skill_execute(skill_id, inputs=None, confirm=False):
+    from capabilities.service import default_capability_service
+    return default_capability_service().execute_skill(
+        str(skill_id), inputs if isinstance(inputs, dict) else {}, confirm=bool(confirm)
+    )
+
+
 _inbox_service_instance = None
 
 
@@ -1493,6 +1557,17 @@ TOOLS = {
     "connector_action_plan": connector_action_plan,
     "connector_execute": connector_execute,
     "connector_test": connector_test,
+
+    # Capability discovery/learning facade. Synthesized operations stay
+    # declarative behind these fixed trusted entry points.
+    "capability_search": capability_search,
+    "capability_discover": capability_discover,
+    "capability_validate": capability_validate,
+    "capability_execute": capability_execute,
+    "capability_inspect": capability_inspect,
+    "capability_invalidate": capability_invalidate,
+    "capability_delete": capability_delete,
+    "learned_skill_execute": learned_skill_execute,
 
     "inbox_scan_downloads": inbox_scan_downloads,
     "inbox_ingest_file": inbox_ingest_file,

@@ -1893,6 +1893,12 @@ class AgentLoop:
                 self._consecutive_guard_firings = 0
                 if self.task_state:
                     self.task_state.mark_complete()
+                try:
+                    from capabilities.service import default_capability_service
+
+                    default_capability_service().learn_from_history(goal, self._tool_history)
+                except Exception:
+                    logger.exception("Unable to learn verified capability workflow")
                 logger.info("[Agent] Goal marked complete on iteration %s", iteration)
                 return None
 
